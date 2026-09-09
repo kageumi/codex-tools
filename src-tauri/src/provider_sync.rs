@@ -3,7 +3,7 @@ use crate::{
     platform,
     storage::{atomic_write, atomic_write_if_unchanged},
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, backup::Backup};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -13,7 +13,7 @@ use std::{
     io::{BufRead, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use walkdir::WalkDir;
 
@@ -522,7 +522,70 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
     target: &str,
     manifest_path: Option<&Path>,
     configured_app: Option<&str>,
+    may_write: impl FnMut() -> Result<bool, AppError>,
+) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
+    repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app_impl(
+        codex_home,
+        target,
+        manifest_path,
+        configured_app,
+        may_write,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RepairTestStage {
+    AfterBackup(PathBuf),
+    AfterRolloutWrite(PathBuf),
+    BeforeDatabaseCommit(PathBuf),
+    AfterHistoryModeCommitted,
+    AfterMigration,
+}
+
+#[cfg(test)]
+type RepairTestHook<'a> = dyn FnMut(RepairTestStage) -> anyhow::Result<()> + 'a;
+
+#[cfg(test)]
+type MigrationTestRunner = for<'path, 'app, 'plans> fn(
+    &'path Path,
+    Option<&'app str>,
+    &'plans [LogicalThreadHistoryRecoveryPlan],
+) -> anyhow::Result<MigrationReport>;
+
+#[cfg(test)]
+fn repair_after_connection_switch_preserving_history_with_test_hooks(
+    codex_home: &Path,
+    target: &str,
+    manifest_path: Option<&Path>,
+    configured_app: Option<&str>,
+    may_write: impl FnMut() -> Result<bool, AppError>,
+    test_hook: &mut RepairTestHook<'_>,
+    migration_runner: Option<MigrationTestRunner>,
+) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
+    repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app_impl(
+        codex_home,
+        target,
+        manifest_path,
+        configured_app,
+        may_write,
+        Some(test_hook),
+        migration_runner,
+    )
+}
+
+fn repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app_impl(
+    codex_home: &Path,
+    target: &str,
+    manifest_path: Option<&Path>,
+    configured_app: Option<&str>,
     mut may_write: impl FnMut() -> Result<bool, AppError>,
+    #[cfg(test)] mut test_hook: Option<&mut RepairTestHook<'_>>,
+    #[cfg(test)] migration_runner: Option<MigrationTestRunner>,
 ) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
     let started = Instant::now();
     let target = SessionRoutingTarget::parse(target)?;
@@ -649,8 +712,30 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
             }
         }
     }
-    let recovery_plans = preflight_paginated_history_recovery(codex_home, &scope, &rollouts)
-        .map_err(|error| AppError::Internal(format!("会话历史恢复：{error}")))?;
+    // provider 标识长度变化会移动后续 JSONL 字节。分页历史库保存的是这些字节偏移，
+    // 因此即使现有投影在写入前有效，也必须在同一事务中要求 Codex 重建它。
+    let length_changing_rollouts = repair_plans
+        .iter()
+        .filter_map(|plan| match plan {
+            RolloutPlan::Repair {
+                path,
+                write_mode: RolloutWriteMode::RewriteAndReproject,
+                ..
+            } => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let recovery_plans = preflight_paginated_history_recovery(
+        codex_home,
+        &scope,
+        &rollouts,
+        &length_changing_rollouts,
+    )
+    .map_err(|error| AppError::Internal(format!("会话历史恢复：{error}")))?;
+    if !recovery_plans.is_empty() {
+        ensure_migration_uses_backed_up_databases(codex_home)
+            .map_err(|error| AppError::Internal(format!("会话历史恢复：{error}")))?;
+    }
     let history_database = codex_home.join(THREAD_HISTORY_FILE);
     let history_database_hash = history_database
         .is_file()
@@ -678,11 +763,92 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
             .collect::<Vec<_>>();
         let stable_expected_rollouts = expected_rollouts
             .iter()
-            .filter(|(path, _)| !recovery_plans.iter().any(|plan| plan.path == *path))
+            .filter(|(path, _)| {
+                !recovery_plans
+                    .iter()
+                    .any(|plan| plan.rollouts.iter().any(|rollout| rollout.path == *path))
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut backed_paths = HashSet::new();
+        let mut write_started = false;
+        let mut written_paths = HashSet::new();
         let commit = (|| -> anyhow::Result<()> {
+            // 所有目标在首次写入前完成哈希守卫和备份；后续阶段不得再把“刚写过的
+            // 文件”当作备份源。
+            for plan in &repair_plans {
+                let RolloutPlan::Repair {
+                    path,
+                    original_sha256,
+                    ..
+                } = plan
+                else {
+                    continue;
+                };
+                let current = fs::read(path)?;
+                if file_sha256_bytes(&current) != *original_sha256 {
+                    anyhow::bail!("Codex 正在更新会话 {}，切换已终止并回滚。", path.display());
+                }
+                backup.add_bytes(path, &current)?;
+                backed_paths.insert(path.clone());
+                #[cfg(test)]
+                run_repair_test_hook(&mut test_hook, RepairTestStage::AfterBackup(path.clone()))?;
+            }
+            for (path, _, expected_hash) in &database_plans {
+                if &file_sha256(path)? != expected_hash {
+                    anyhow::bail!(
+                        "Codex 正在更新会话数据库 {}，切换已终止并回滚。",
+                        path.display()
+                    );
+                }
+                backup.add_sqlite_database(path)?;
+                backed_paths.insert(path.clone());
+                #[cfg(test)]
+                run_repair_test_hook(&mut test_hook, RepairTestStage::AfterBackup(path.clone()))?;
+            }
+            if !recovery_plans.is_empty() {
+                if let Some(expected_hash) = history_database_hash.as_ref()
+                    && file_sha256(&history_database)? != *expected_hash
+                {
+                    anyhow::bail!("Codex 正在更新历史投影，切换已终止并回滚。");
+                }
+                if backed_paths.insert(history_database.clone()) {
+                    backup.add_sqlite_database(&history_database)?;
+                    #[cfg(test)]
+                    run_repair_test_hook(
+                        &mut test_hook,
+                        RepairTestStage::AfterBackup(history_database.clone()),
+                    )?;
+                }
+                let state_database = codex_home.join("state_5.sqlite");
+                if backed_paths.insert(state_database.clone()) {
+                    backup.add_sqlite_database(&state_database)?;
+                    #[cfg(test)]
+                    run_repair_test_hook(
+                        &mut test_hook,
+                        RepairTestStage::AfterBackup(state_database.clone()),
+                    )?;
+                }
+                for logical_plan in &recovery_plans {
+                    for plan in &logical_plan.rollouts {
+                        let current = fs::read(&plan.path)?;
+                        if file_sha256_bytes(&current) != plan.original_sha256 {
+                            anyhow::bail!(
+                                "Codex 正在更新会话 {}，历史恢复已终止并回滚。",
+                                plan.path.display()
+                            );
+                        }
+                        if backed_paths.insert(plan.path.clone()) {
+                            backup.add_bytes(&plan.path, &current)?;
+                            #[cfg(test)]
+                            run_repair_test_hook(
+                                &mut test_hook,
+                                RepairTestStage::AfterBackup(plan.path.clone()),
+                            )?;
+                        }
+                    }
+                }
+            }
             for plan in repair_plans.drain(..) {
                 let RolloutPlan::Repair {
                     path,
@@ -709,16 +875,32 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
                 {
                     anyhow::bail!("Codex 正在更新会话 {}，切换已终止并回滚。", path.display());
                 }
-                backup.add_bytes(&path, &write.original)?;
-                backed_paths.insert(path.clone());
-                if !atomic_write_if_unchanged(&path, &write.original, &write.repaired)? {
+                let changed = match atomic_write_if_unchanged_and_track(
+                    &path,
+                    &write.original,
+                    &write.repaired,
+                    &mut written_paths,
+                ) {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        write_started |= written_paths.contains(&path);
+                        return Err(error);
+                    }
+                };
+                if !changed {
                     anyhow::bail!("Codex 正在更新会话 {}，切换已终止并回滚。", path.display());
                 }
+                write_started = true;
+                #[cfg(test)]
+                run_repair_test_hook(
+                    &mut test_hook,
+                    RepairTestStage::AfterRolloutWrite(path.clone()),
+                )?;
                 result.files_modified += 1;
                 result.session_meta_updated += meta_count;
                 affected_paths.push(path);
             }
-            for (path, _, expected_hash) in &database_plans {
+            for (path, expected_rows, expected_hash) in &database_plans {
                 if !may_write()? {
                     anyhow::bail!("Codex 已重新运行或修复目标已变化，切换已终止并回滚。");
                 }
@@ -728,62 +910,92 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
                         path.display()
                     );
                 }
-                backup.add_sqlite_database(path)?;
-                backed_paths.insert(path.clone());
-                let rows = repair_database_commit(path, target_provider, &scope, &mut may_write)?;
+                #[cfg(test)]
+                run_repair_test_hook(
+                    &mut test_hook,
+                    RepairTestStage::BeforeDatabaseCommit(path.clone()),
+                )?;
+                let rows = repair_database_commit(
+                    path,
+                    target_provider,
+                    &scope,
+                    *expected_rows,
+                    &mut may_write,
+                )?;
+                write_started = true;
+                written_paths.insert(path.clone());
                 result.rows_updated += rows;
                 result.databases_updated += 1;
                 affected_paths.push(path.clone());
             }
             if !recovery_plans.is_empty() {
-                if let Some(expected_hash) = history_database_hash.as_ref()
-                    && file_sha256(&history_database)? != *expected_hash
-                {
-                    anyhow::bail!("Codex 正在更新历史投影，切换已终止并回滚。");
-                }
-                if backed_paths.insert(history_database.clone()) {
-                    backup.add_sqlite_database(&history_database)?;
-                }
                 let state_database = codex_home.join("state_5.sqlite");
-                if backed_paths.insert(state_database.clone()) {
-                    backup.add_sqlite_database(&state_database)?;
-                }
-                for plan in &recovery_plans {
-                    if !may_write()? {
-                        anyhow::bail!("Codex 已重新运行或修复目标已变化，历史恢复已终止并回滚。");
+                for logical_plan in &recovery_plans {
+                    for plan in &logical_plan.rollouts {
+                        if !may_write()? {
+                            anyhow::bail!(
+                                "Codex 已重新运行或修复目标已变化，历史恢复已终止并回滚。"
+                            );
+                        }
+                        let current = fs::read(&plan.path)?;
+                        let current_sha256 = file_sha256_bytes(&current);
+                        if current_sha256 != plan.original_sha256
+                            && !expected_rollouts.iter().any(|(path, expected)| {
+                                path == &plan.path && expected == &current_sha256
+                            })
+                        {
+                            anyhow::bail!(
+                                "Codex 正在更新会话 {}，历史恢复已终止并回滚。",
+                                plan.path.display()
+                            );
+                        }
+                        let legacy =
+                            mark_rollout_history_legacy(&current, &plan.logical_thread_id)?;
+                        let changed = match atomic_write_if_unchanged_and_track(
+                            &plan.path,
+                            &current,
+                            &legacy,
+                            &mut written_paths,
+                        ) {
+                            Ok(changed) => changed,
+                            Err(error) => {
+                                write_started |= written_paths.contains(&plan.path);
+                                return Err(error);
+                            }
+                        };
+                        if !changed {
+                            anyhow::bail!(
+                                "Codex 正在更新会话 {}，历史恢复已终止并回滚。",
+                                plan.path.display()
+                            );
+                        }
+                        write_started = true;
+                        affected_paths.push(plan.path.clone());
                     }
-                    let current = fs::read(&plan.path)?;
-                    let current_sha256 = file_sha256_bytes(&current);
-                    if current_sha256 != plan.original_sha256
-                        && !expected_rollouts.iter().any(|(path, expected)| {
-                            path == &plan.path && expected == &current_sha256
-                        })
-                    {
-                        anyhow::bail!(
-                            "Codex 正在更新会话 {}，历史恢复已终止并回滚。",
-                            plan.path.display()
-                        );
-                    }
-                    if backed_paths.insert(plan.path.clone()) {
-                        backup.add_bytes(&plan.path, &current)?;
-                    }
-                    let legacy = mark_rollout_history_legacy(&current, &plan.thread_id)?;
-                    if !atomic_write_if_unchanged(&plan.path, &current, &legacy)? {
-                        anyhow::bail!(
-                            "Codex 正在更新会话 {}，历史恢复已终止并回滚。",
-                            plan.path.display()
-                        );
-                    }
-                    affected_paths.push(plan.path.clone());
                 }
                 mark_database_history_legacy(&state_database, &recovery_plans, &mut may_write)?;
+                write_started = true;
+                written_paths.insert(state_database.clone());
+                written_paths.insert(history_database.clone());
+                #[cfg(test)]
+                run_repair_test_hook(&mut test_hook, RepairTestStage::AfterHistoryModeCommitted)?;
+                #[cfg(test)]
+                let migration_report = if let Some(runner) = migration_runner {
+                    runner(codex_home, configured_app, &recovery_plans)?
+                } else {
+                    run_codex_history_migration(codex_home, configured_app, &recovery_plans)?
+                };
+                #[cfg(not(test))]
                 let migration_report =
                     run_codex_history_migration(codex_home, configured_app, &recovery_plans)?;
+                #[cfg(test)]
+                run_repair_test_hook(&mut test_hook, RepairTestStage::AfterMigration)?;
                 verify_paginated_history_recovery(
                     &state_database,
                     &history_database,
                     &recovery_plans,
                     &migration_report,
+                    target_provider,
                 )?;
                 affected_paths.push(state_database);
                 affected_paths.push(history_database.clone());
@@ -797,15 +1009,42 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
             Ok(())
         })();
         if let Err(error) = commit {
-            let restore_error = backup.restore();
-            let _ = backup.cleanup();
+            if !write_started {
+                let _ = backup.cleanup();
+                return Err(AppError::Internal(format!(
+                    "会话归属修复未完成，写入前预检或备份失败：{error}"
+                )));
+            }
+            let restore_error = backup.restore_selected(&written_paths);
+            let residue_error = cleanup_known_migration_residue(codex_home, &recovery_plans);
             return match restore_error {
-                Ok(()) => Err(AppError::Internal(format!(
-                    "会话归属修复未完成，已回滚全部修改：{error}"
-                ))),
-                Err(restore) => Err(AppError::Internal(format!(
-                    "会话归属修复未完成且回滚失败：{error}（恢复错误：{restore}）"
-                ))),
+                Ok(()) => {
+                    if let Err(residue) = residue_error {
+                        return Err(AppError::Internal(format!(
+                            "会话归属修复未完成且迁移副产物清理失败：{error}（清理错误：{residue}；备份保留在 {}）",
+                            backup.dir.display()
+                        )));
+                    }
+                    backup.cleanup().map_err(|cleanup| {
+                        AppError::Internal(format!(
+                            "会话归属修复未完成，已回滚全部修改，但无法清理备份 {}：{cleanup}",
+                            backup.dir.display()
+                        ))
+                    })?;
+                    Err(AppError::Internal(format!(
+                        "会话归属修复未完成，已回滚全部修改：{error}"
+                    )))
+                }
+                Err(restore) => {
+                    let residue = residue_error
+                        .err()
+                        .map(|residue| format!("；迁移副产物清理错误：{residue}"))
+                        .unwrap_or_default();
+                    Err(AppError::Internal(format!(
+                        "会话归属修复未完成且回滚失败：{error}（恢复错误：{restore}{residue}；备份保留在 {}）",
+                        backup.dir.display()
+                    )))
+                }
             };
         }
         let _ = backup.cleanup();
@@ -828,6 +1067,92 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
     result.repair_complete = result.verification_passed;
     result.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     Ok((result, affected_paths))
+}
+
+#[cfg(test)]
+fn run_repair_test_hook(
+    hook: &mut Option<&mut RepairTestHook<'_>>,
+    stage: RepairTestStage,
+) -> anyhow::Result<()> {
+    if let Some(hook) = hook.as_deref_mut() {
+        hook(stage)?;
+    }
+    Ok(())
+}
+
+fn atomic_write_if_unchanged_and_track(
+    path: &Path,
+    expected: &[u8],
+    replacement: &[u8],
+    written_paths: &mut HashSet<PathBuf>,
+) -> anyhow::Result<bool> {
+    track_atomic_write_result(path, replacement, written_paths, || {
+        atomic_write_if_unchanged(path, expected, replacement)
+    })
+}
+
+fn track_atomic_write_result(
+    path: &Path,
+    replacement: &[u8],
+    written_paths: &mut HashSet<PathBuf>,
+    write: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
+    match write() {
+        Ok(true) => {
+            written_paths.insert(path.to_path_buf());
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(error) => {
+            // `replace_temporary` may report a post-rename durability error.  Only
+            // register a target when it now contains this engine's exact bytes;
+            // an Ok(false) CAS conflict and unrelated external bytes remain untouched.
+            if fs::read(path).is_ok_and(|current| current == replacement) {
+                written_paths.insert(path.to_path_buf());
+            }
+            Err(error)
+        }
+    }
+}
+
+fn cleanup_known_migration_residue(
+    codex_home: &Path,
+    plans: &[LogicalThreadHistoryRecoveryPlan],
+) -> anyhow::Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let journals = codex_home.join("rollout-migrations");
+    for plan in plans {
+        let pending = journals.join(format!("{}.pending", plan.logical_thread_id));
+        remove_known_migration_file(&pending)?;
+        for rollout in &plan.rollouts {
+            let name = rollout
+                .path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("rollout 路径缺少文件名"))?
+                .to_string_lossy();
+            let temporary = rollout
+                .path
+                .with_file_name(format!(".{name}.paginated.tmp"));
+            remove_known_migration_file(&temporary)?;
+        }
+    }
+    if journals.is_dir() && fs::read_dir(&journals)?.next().is_none() {
+        fs::remove_dir(&journals)?;
+    }
+    Ok(())
+}
+
+fn remove_known_migration_file(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if !path.is_file() {
+        anyhow::bail!("已知迁移副产物路径不是普通文件：{}", path.display());
+    }
+    fs::remove_file(path)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -918,28 +1243,125 @@ fn file_sha256_bytes(bytes: &[u8]) -> String {
 }
 
 #[derive(Clone, Debug)]
-struct PaginatedHistoryRecoveryPlan {
-    thread_id: String,
+struct PhysicalRolloutRecoveryPlan {
+    logical_thread_id: String,
+    rollout_id: String,
     path: PathBuf,
     original_sha256: String,
+    semantic_sha256: String,
+    recovery_reason: Option<HistoryRecoveryReason>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistoryRecoveryReason {
+    ProjectionInvalid,
+    RewriteAndReproject { projection_was_healthy: bool },
+}
+
+#[derive(Clone, Debug)]
+struct LogicalThreadHistoryRecoveryPlan {
+    logical_thread_id: String,
+    rollouts: Vec<PhysicalRolloutRecoveryPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryPosition {
+    rollout_id: String,
+    end_ordinal_exclusive: u64,
+    end_byte_offset: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RolloutRecoveryInfo {
+    logical_thread_id: String,
+    rollout_id: String,
+    history_mode: Option<String>,
+    first_projectable_end_offset: Option<u64>,
+    is_subagent: bool,
+    history_base: Option<HistoryPosition>,
+    first_ordinal: u64,
+    #[cfg(test)]
+    last_ordinal: u64,
+    next_ordinal: u64,
+    first_ordinal_gap: Option<(u64, u64, u64)>,
+    record_start_offsets: BTreeMap<u64, u64>,
+    record_end_offsets: BTreeMap<u64, u64>,
+}
+
+#[derive(Clone, Debug)]
+struct RolloutMetadataSummary {
+    logical_thread_id: String,
+    history_mode: Option<String>,
     is_subagent: bool,
 }
 
-#[derive(Debug)]
-struct RolloutRecoveryInfo {
-    thread_id: String,
+#[derive(Default)]
+struct ForcedPaginationEvidence {
     history_mode: Option<String>,
-    has_history: bool,
-    is_subagent: bool,
+    has_non_null_history_base: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedLineageRollout {
+    plan: PhysicalRolloutRecoveryPlan,
+    history_base: Option<HistoryPosition>,
 }
 
 fn preflight_paginated_history_recovery(
     codex_home: &Path,
     scope: &SessionScope,
     rollouts: &[PathBuf],
-) -> anyhow::Result<Vec<PaginatedHistoryRecoveryPlan>> {
+    force_recovery_rollouts: &HashSet<PathBuf>,
+) -> anyhow::Result<Vec<LogicalThreadHistoryRecoveryPlan>> {
+    // 等长 provider 原位替换不会移动任何 rollout 字节或 ordinal，也不需要
+    // 修复既有 projection。分页恢复仅服务于确实改变记录宽度的 rollout；
+    // 否则旧数据中可继续消费的 projection 前缀或既有瑕疵会错误阻断连接切换。
+    if force_recovery_rollouts.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 变长 provider 写入会移动后续记录的字节偏移。写入前必须综合 session_meta
+    // history_mode/history_base、state_5.sqlite 与已有 projection 库判定是否存在分页
+    // 证据；不能把缺省 history_mode 一律当作 legacy。
+    let mut forced_evidence = HashMap::new();
+    for path in force_recovery_rollouts {
+        let original = fs::read(path)?;
+        forced_evidence.insert(path.clone(), forced_pagination_evidence(&original)?);
+    }
+    if !force_recovery_rollouts.is_empty() {
+        ensure_migration_uses_backed_up_databases(codex_home)?;
+    }
+    let history_path = codex_home.join(THREAD_HISTORY_FILE);
+    let mut history = if !force_recovery_rollouts.is_empty() && history_path.is_file() {
+        Some(Connection::open_with_flags(
+            &history_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?)
+    } else {
+        None
+    };
+    let history_has_projection_evidence = history
+        .as_ref()
+        .map(history_connection_has_projection_evidence)
+        .transpose()?
+        .unwrap_or(false);
+    let forced_has_pagination_evidence = !force_recovery_rollouts.is_empty()
+        && (history_has_projection_evidence
+            || forced_evidence.values().any(|evidence| {
+                evidence.history_mode.as_deref() == Some("paginated")
+                    || evidence.has_non_null_history_base
+            }));
     let state_path = codex_home.join("state_5.sqlite");
     if !state_path.is_file() {
+        if forced_has_pagination_evidence {
+            anyhow::bail!(
+                "变长 rollout 存在分页证据，需要 state_5.sqlite 才能安全重建历史：{}",
+                force_recovery_rollouts
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("；")
+            );
+        }
         return Ok(Vec::new());
     }
     let state = Connection::open_with_flags(
@@ -948,18 +1370,26 @@ fn preflight_paginated_history_recovery(
     )?;
     let columns = table_columns(&state, "threads")?;
     if !columns.contains("id") || !columns.contains("history_mode") {
+        if forced_has_pagination_evidence {
+            anyhow::bail!(
+                "变长 rollout 存在分页证据，需要 state_5.sqlite.threads 的 id/history_mode 列才可安全重建"
+            );
+        }
         return Ok(Vec::new());
     }
+    let forced_logical_thread_ids = force_recovery_rollouts
+        .iter()
+        .map(|path| {
+            rollout_metadata_summary(&fs::read(path)?).map(|summary| summary.logical_thread_id)
+        })
+        .collect::<anyhow::Result<HashSet<_>>>()?;
 
-    let history_path = codex_home.join(THREAD_HISTORY_FILE);
-    let history = if history_path.is_file() {
-        Some(Connection::open_with_flags(
+    if history.is_none() && history_path.is_file() {
+        history = Some(Connection::open_with_flags(
             &history_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?)
-    } else {
-        None
-    };
+        )?);
+    }
     if let Some(history) = history.as_ref() {
         for (table, required) in [
             (
@@ -994,91 +1424,502 @@ fn preflight_paginated_history_recovery(
         }
     }
 
-    let mut plans = Vec::new();
+    let mut grouped =
+        BTreeMap::<String, Vec<(PhysicalRolloutRecoveryPlan, RolloutRecoveryInfo)>>::new();
+    let mut state_modes = HashMap::<String, Option<String>>::new();
     for path in rollouts {
         if !scope.rollout_is_eligible(path) {
             continue;
         }
         let original = fs::read(path)?;
-        let info = rollout_recovery_info(&original)?;
-        if !scope.eligible.contains(&info.thread_id) || !info.has_history {
+        let summary = rollout_metadata_summary(&original)?;
+        if !scope.eligible.contains(&summary.logical_thread_id) {
             continue;
         }
-        let state_mode = state
-            .query_row(
-                "SELECT history_mode FROM threads WHERE id=?1",
-                [&info.thread_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if state_mode.as_deref() != Some("paginated") {
+        if !forced_logical_thread_ids.contains(&summary.logical_thread_id) {
             continue;
         }
-        if info
+        let state_mode = match state_modes.get(&summary.logical_thread_id) {
+            Some(mode) => mode.clone(),
+            None => {
+                let mode = state
+                    .query_row(
+                        "SELECT history_mode FROM threads WHERE id=?1",
+                        [&summary.logical_thread_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                state_modes.insert(summary.logical_thread_id.clone(), mode.clone());
+                mode
+            }
+        };
+        let forced = forced_evidence.get(path);
+        let forced_has_history_base =
+            forced.is_some_and(|evidence| evidence.has_non_null_history_base);
+        let forced_declares_paginated =
+            forced.is_some_and(|evidence| evidence.history_mode.as_deref() == Some("paginated"));
+        let state_is_paginated = state_mode.as_deref() == Some("paginated");
+        if force_recovery_rollouts.contains(path)
+            && summary.history_mode.as_deref() == Some("legacy")
+            && (state_is_paginated || forced_has_history_base)
+        {
+            anyhow::bail!(
+                "rollout {} 的 legacy history_mode 与分页证据冲突，拒绝变长改写",
+                path.display()
+            );
+        }
+        if !state_is_paginated {
+            if force_recovery_rollouts.contains(path)
+                && (forced_declares_paginated
+                    || forced_has_history_base
+                    || history_has_projection_evidence)
+            {
+                anyhow::bail!(
+                    "变长 rollout {} 与 state_5.sqlite/history 投影的分页状态不一致，拒绝变长改写",
+                    path.display()
+                );
+            }
+            continue;
+        }
+        if summary
             .history_mode
             .as_deref()
             .is_some_and(|mode| mode != "paginated")
         {
             continue;
         }
-        if paginated_projection_is_valid(
-            history.as_ref(),
-            &info.thread_id,
-            original.len() as u64,
-            info.is_subagent,
-        )? {
+        let info = rollout_recovery_info(path, &original)
+            .map_err(|error| anyhow::anyhow!("rollout {}：{error}", path.display()))?;
+        if info.is_subagent != summary.is_subagent
+            || info.logical_thread_id != summary.logical_thread_id
+        {
+            anyhow::bail!("rollout 元数据预检前后不一致，拒绝恢复");
+        }
+        let projection_was_healthy = paginated_projection_is_valid(history.as_ref(), &info)?;
+        // 旧版跳号历史只能沿用已验证的投影。当前官方迁移器不能保证重放缺号
+        // 记录时保持原边界；变长改写和损坏投影都必须在任何写入前拒绝。
+        if (force_recovery_rollouts.contains(path) || !projection_was_healthy)
+            && let Some((previous, ordinal, offset)) = info.first_ordinal_gap
+        {
+            anyhow::bail!(
+                "rollout {} 在字节 {offset} 的 ordinal {previous}→{ordinal} 存在缺号；{}，无法安全重投影，已在写入前拒绝恢复",
+                path.display(),
+                if force_recovery_rollouts.contains(path) {
+                    "provider 变长改写需要重投影"
+                } else {
+                    "现有 projection 或记录边界不健康"
+                }
+            );
+        }
+        let recovery_reason = if force_recovery_rollouts.contains(path) {
+            Some(HistoryRecoveryReason::RewriteAndReproject {
+                projection_was_healthy,
+            })
+        } else if !projection_was_healthy {
+            Some(HistoryRecoveryReason::ProjectionInvalid)
+        } else {
+            None
+        };
+        grouped
+            .entry(info.logical_thread_id.clone())
+            .or_default()
+            .push((
+                PhysicalRolloutRecoveryPlan {
+                    logical_thread_id: info.logical_thread_id.clone(),
+                    rollout_id: info.rollout_id.clone(),
+                    path: path.clone(),
+                    original_sha256: file_sha256_bytes(&original),
+                    semantic_sha256: rollout_semantic_sha256(&original)?,
+                    recovery_reason,
+                },
+                info,
+            ));
+    }
+    let mut plans = Vec::new();
+    let all_entries = grouped
+        .values()
+        .flat_map(|entries| entries.iter().cloned())
+        .collect::<Vec<_>>();
+    for (logical_thread_id, entries) in grouped {
+        if !entries
+            .iter()
+            .any(|(plan, _)| plan.recovery_reason.is_some())
+        {
             continue;
         }
-        plans.push(PaginatedHistoryRecoveryPlan {
-            thread_id: info.thread_id,
-            path: path.clone(),
-            original_sha256: file_sha256_bytes(&original),
-            is_subagent: info.is_subagent,
+        let rollouts =
+            resolve_complete_paginated_lineage(&logical_thread_id, entries, &all_entries)?;
+        if rollouts.len() != 1
+            || rollouts[0].history_base.is_some()
+            || rollouts[0].plan.rollout_id != logical_thread_id
+        {
+            let paths = rollouts
+                .iter()
+                .map(|plan| plan.plan.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("；");
+            anyhow::bail!(
+                "会话 {logical_thread_id} 的分页历史不兼容当前 Codex 按 logical thread 的迁移器；已在写入前拒绝恢复（{} 个 rollout）：{paths}",
+                rollouts.len()
+            );
+        }
+        plans.push(LogicalThreadHistoryRecoveryPlan {
+            logical_thread_id,
+            rollouts: rollouts.into_iter().map(|entry| entry.plan).collect(),
         });
     }
     Ok(plans)
 }
 
-fn rollout_recovery_info(original: &[u8]) -> anyhow::Result<RolloutRecoveryInfo> {
-    let mut thread_id = None;
+fn rollout_metadata_summary(original: &[u8]) -> anyhow::Result<RolloutMetadataSummary> {
+    for segment in original.split_inclusive(|byte| *byte == b'\n') {
+        let line = segment.strip_suffix(b"\n").unwrap_or(segment);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let logical_thread_id = record
+            .pointer("/payload/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("session_meta 缺少 logical thread ID"))
+            .and_then(|value| {
+                uuid::Uuid::parse_str(value)
+                    .map(|value| value.to_string())
+                    .map_err(|_| anyhow::anyhow!("session_meta logical thread ID 不合法"))
+            })?;
+        return Ok(RolloutMetadataSummary {
+            logical_thread_id,
+            history_mode: record
+                .pointer("/payload/history_mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            is_subagent: session_meta_parent_thread_id(&record).is_some(),
+        });
+    }
+    anyhow::bail!("未找到可验证的 session_meta.id")
+}
+
+fn forced_pagination_evidence(original: &[u8]) -> anyhow::Result<ForcedPaginationEvidence> {
+    for segment in original.split_inclusive(|byte| *byte == b'\n') {
+        let line = segment.strip_suffix(b"\n").unwrap_or(segment);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) == Some("session_meta") {
+            return Ok(ForcedPaginationEvidence {
+                history_mode: record
+                    .pointer("/payload/history_mode")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                has_non_null_history_base: record
+                    .pointer("/payload/history_base")
+                    .is_some_and(|value| !value.is_null()),
+            });
+        }
+    }
+    Ok(ForcedPaginationEvidence::default())
+}
+
+fn history_connection_has_projection_evidence(history: &Connection) -> anyhow::Result<bool> {
+    let columns = table_columns(history, "thread_history_projection_state")?;
+    if !columns.contains("thread_id")
+        || !columns.contains("next_rollout_byte_offset")
+        || !columns.contains("next_rollout_ordinal")
+    {
+        return Ok(false);
+    }
+    let count: i64 = history.query_row(
+        "SELECT COUNT(*) FROM thread_history_projection_state",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn rollout_recovery_info(path: &Path, original: &[u8]) -> anyhow::Result<RolloutRecoveryInfo> {
+    let (path_logical_thread_id, rollout_id) = rollout_ids_from_path(path)?;
+    let mut metadata_thread_id = None;
     let mut history_mode = None;
-    let mut has_history = false;
+    let mut first_projectable_end_offset = None;
     let mut is_subagent = false;
-    for line in std::str::from_utf8(original)?.lines() {
-        let record: Value = serde_json::from_str(line)?;
+    let mut history_base = None;
+    let mut saw_primary_session_meta = false;
+    let mut first_ordinal = None;
+    let mut previous_ordinal: Option<u64> = None;
+    let mut next_ordinal = 0;
+    let mut first_ordinal_gap = None;
+    let mut record_start_offsets = BTreeMap::new();
+    let mut record_end_offsets = BTreeMap::new();
+    let mut byte_offset = 0_u64;
+    for segment in original.split_inclusive(|byte| *byte == b'\n') {
+        let record_start = byte_offset;
+        byte_offset = byte_offset
+            .checked_add(u64::try_from(segment.len())?)
+            .ok_or_else(|| anyhow::anyhow!("rollout 字节长度溢出"))?;
+        let line = segment.strip_suffix(b"\n").unwrap_or(segment);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            anyhow::bail!("rollout 包含空记录，无法验证 lineage");
+        }
+        let record: Value = serde_json::from_slice(line)?;
+        let ordinal = record
+            .get("ordinal")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("rollout 缺少可验证的 ordinal"))?;
+        if let Some(previous) = previous_ordinal {
+            if ordinal <= previous {
+                anyhow::bail!(
+                    "rollout 字节 {record_start} 的 ordinal {previous}→{ordinal} 重复或倒退，无法验证 lineage"
+                );
+            }
+            if ordinal != next_ordinal {
+                first_ordinal_gap.get_or_insert((previous, ordinal, record_start));
+            }
+        }
+        // 与官方 read_projection_steps 的 next_line_ordinal 一致：cursor 是
+        // 已处理记录的 exclusive ordinal，不是行数；同时要求 SQLite 可表示。
+        next_ordinal = ordinal
+            .checked_add(1)
+            .filter(|next| i64::try_from(*next).is_ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("rollout 字节 {record_start} 的 ordinal 超出 SQLite 整数范围")
+            })?;
+        first_ordinal.get_or_insert(ordinal);
+        previous_ordinal = Some(ordinal);
+        record_start_offsets.insert(ordinal, record_start);
+        record_end_offsets.insert(ordinal, byte_offset);
         match record.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
-                thread_id = record
-                    .pointer("/payload/id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                // 官方 fork/subagent rollout 可能把父会话的 session_meta 作为第
+                // 二条及后续历史记录带入。只有首条 session_meta 描述当前物理文件；
+                // 后续记录仍参与 ordinal/字节边界，但不能覆盖当前文件的身份和 lineage。
+                if saw_primary_session_meta {
+                    continue;
+                }
+                saw_primary_session_meta = true;
+                metadata_thread_id = Some(
+                    record
+                        .pointer("/payload/id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("首条 session_meta 缺少 logical thread ID"))
+                        .and_then(|value| {
+                            uuid::Uuid::parse_str(value)
+                                .map(|value| value.to_string())
+                                .map_err(|_| {
+                                    anyhow::anyhow!("首条 session_meta logical thread ID 不合法")
+                                })
+                        })?,
+                );
                 history_mode = record
                     .pointer("/payload/history_mode")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 is_subagent = session_meta_parent_thread_id(&record).is_some();
+                history_base = record
+                    .pointer("/payload/history_base")
+                    .filter(|value| !value.is_null())
+                    .map(parse_history_position)
+                    .transpose()?;
             }
             Some("event_msg")
                 if record.pointer("/payload/type").and_then(Value::as_str)
                     == Some("task_started") =>
             {
-                has_history = true;
+                first_projectable_end_offset.get_or_insert(byte_offset);
+            }
+            Some("event_msg")
+                if record.pointer("/payload/type").and_then(Value::as_str)
+                    == Some("user_message") =>
+            {
+                first_projectable_end_offset.get_or_insert(byte_offset);
             }
             Some("response_item")
                 if record.pointer("/payload/type").and_then(Value::as_str) == Some("message")
                     && record.pointer("/payload/role").and_then(Value::as_str) == Some("user") =>
             {
-                has_history = true;
+                first_projectable_end_offset.get_or_insert(byte_offset);
             }
             _ => {}
         }
     }
+    let logical_thread_id =
+        metadata_thread_id.ok_or_else(|| anyhow::anyhow!("未找到可验证的 session_meta.id"))?;
+    if logical_thread_id != path_logical_thread_id {
+        anyhow::bail!("rollout 文件名 logical ID 与 session_meta.id 不一致，拒绝猜测物理 ID");
+    }
     Ok(RolloutRecoveryInfo {
-        thread_id: thread_id.ok_or_else(|| anyhow::anyhow!("未找到可验证的 session_meta.id"))?,
+        logical_thread_id,
+        rollout_id,
         history_mode,
-        has_history,
+        first_projectable_end_offset,
         is_subagent,
+        history_base,
+        first_ordinal: first_ordinal
+            .ok_or_else(|| anyhow::anyhow!("rollout 不包含可验证的记录"))?,
+        #[cfg(test)]
+        last_ordinal: previous_ordinal
+            .ok_or_else(|| anyhow::anyhow!("rollout 不包含可验证的记录"))?,
+        next_ordinal,
+        first_ordinal_gap,
+        record_start_offsets,
+        record_end_offsets,
     })
+}
+
+fn rollout_ids_from_path(path: &Path) -> anyhow::Result<(String, String)> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("rollout 文件名不是有效 UTF-8"))?;
+    let stem = name
+        .strip_prefix("rollout-")
+        .and_then(|value| value.strip_suffix(".jsonl"))
+        .ok_or_else(|| anyhow::anyhow!("rollout 文件名不符合官方格式"))?;
+    let timestamp = stem
+        .get(..19)
+        .ok_or_else(|| anyhow::anyhow!("rollout 文件名缺少时间戳"))?;
+    chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H-%M-%S")
+        .map_err(|_| anyhow::anyhow!("rollout 文件名时间戳不合法"))?;
+    let ids = stem
+        .get(19..)
+        .and_then(|value| value.strip_prefix('-'))
+        .ok_or_else(|| anyhow::anyhow!("rollout 文件名缺少 UUID"))?;
+    let (logical, physical) = match ids.split_once('_') {
+        Some((logical, physical)) if !physical.contains('_') => (logical, physical),
+        Some(_) => anyhow::bail!("rollout 文件名包含歧义的物理 UUID"),
+        None => (ids, ids),
+    };
+    let logical = uuid::Uuid::parse_str(logical)
+        .map_err(|_| anyhow::anyhow!("rollout 文件名 logical UUID 不合法"))?
+        .to_string();
+    let physical = uuid::Uuid::parse_str(physical)
+        .map_err(|_| anyhow::anyhow!("rollout 文件名 physical UUID 不合法"))?
+        .to_string();
+    Ok((logical, physical))
+}
+
+fn parse_history_position(value: &Value) -> anyhow::Result<HistoryPosition> {
+    Ok(HistoryPosition {
+        rollout_id: value
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("history_base 缺少物理 rollout ID"))
+            .and_then(|value| {
+                uuid::Uuid::parse_str(value)
+                    .map(|value| value.to_string())
+                    .map_err(|_| anyhow::anyhow!("history_base 物理 rollout ID 不合法"))
+            })?,
+        end_ordinal_exclusive: value
+            .get("end_ordinal_exclusive")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("history_base 缺少结束 ordinal"))?,
+        end_byte_offset: value
+            .get("end_byte_offset")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("history_base 缺少结束字节偏移"))?,
+    })
+}
+
+fn resolve_complete_paginated_lineage(
+    logical_thread_id: &str,
+    entries: Vec<(PhysicalRolloutRecoveryPlan, RolloutRecoveryInfo)>,
+    all_entries: &[(PhysicalRolloutRecoveryPlan, RolloutRecoveryInfo)],
+) -> anyhow::Result<Vec<ResolvedLineageRollout>> {
+    let mut by_rollout = BTreeMap::new();
+    let mut children = BTreeMap::<String, String>::new();
+    for (plan, info) in entries {
+        if by_rollout
+            .insert(info.rollout_id.clone(), (plan, info))
+            .is_some()
+        {
+            anyhow::bail!("会话 {logical_thread_id} 存在重复物理 rollout ID");
+        }
+    }
+    for (_, external_info) in all_entries {
+        let Some(base) = external_info.history_base.as_ref() else {
+            continue;
+        };
+        if by_rollout.contains_key(&base.rollout_id)
+            && external_info.logical_thread_id != logical_thread_id
+        {
+            anyhow::bail!(
+                "会话 {logical_thread_id} 的物理 rollout 被其他 logical thread 的 history_base 引用，拒绝迁移"
+            );
+        }
+    }
+    for (rollout_id, (_, info)) in &by_rollout {
+        let Some(base) = info.history_base.as_ref() else {
+            continue;
+        };
+        let Some((_, parent)) = by_rollout.get(&base.rollout_id) else {
+            anyhow::bail!(
+                "会话 {logical_thread_id} 的 rollout {rollout_id} 缺少 history_base 父文件"
+            );
+        };
+        if parent.history_mode.as_deref() != Some("paginated")
+            || parent.record_end_offsets.get(
+                &base
+                    .end_ordinal_exclusive
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("history_base 结束 ordinal 非法"))?,
+            ) != Some(&base.end_byte_offset)
+            || info.first_ordinal != base.end_ordinal_exclusive
+        {
+            anyhow::bail!(
+                "会话 {logical_thread_id} 的 rollout {rollout_id} history_base 不指向真实 paginated 记录边界"
+            );
+        }
+        if children
+            .insert(base.rollout_id.clone(), rollout_id.clone())
+            .is_some()
+        {
+            anyhow::bail!("会话 {logical_thread_id} 存在分叉 rollout lineage，拒绝猜测恢复顺序");
+        }
+    }
+    let roots = by_rollout
+        .iter()
+        .filter_map(|(rollout_id, (_, info))| {
+            info.history_base.is_none().then_some(rollout_id.to_owned())
+        })
+        .collect::<Vec<_>>();
+    if roots.len() != 1 {
+        anyhow::bail!("会话 {logical_thread_id} 的 rollout lineage 缺少唯一根");
+    }
+    let mut resolved = Vec::with_capacity(by_rollout.len());
+    let mut current = roots[0].clone();
+    loop {
+        let (plan, _) = by_rollout
+            .get(&current)
+            .ok_or_else(|| anyhow::anyhow!("rollout lineage 内部状态不一致"))?;
+        let (_, info) = by_rollout
+            .get(&current)
+            .ok_or_else(|| anyhow::anyhow!("rollout lineage 内部状态不一致"))?;
+        resolved.push(ResolvedLineageRollout {
+            plan: plan.clone(),
+            history_base: info.history_base.clone(),
+        });
+        let Some(next) = children.get(&current) else {
+            break;
+        };
+        current = next.clone();
+        if resolved.len() > by_rollout.len() {
+            anyhow::bail!("会话 {logical_thread_id} 的 rollout lineage 存在循环");
+        }
+    }
+    if resolved.len() != by_rollout.len() {
+        anyhow::bail!("会话 {logical_thread_id} 的 rollout lineage 存在断链");
+    }
+    Ok(resolved)
 }
 
 /// 只识别 Codex 已知的子代理父线程字段。未知形态一律按根会话校验，避免把
@@ -1098,9 +1939,7 @@ fn session_meta_parent_thread_id(record: &Value) -> Option<&str> {
 
 fn paginated_projection_is_valid(
     history: Option<&Connection>,
-    thread_id: &str,
-    rollout_length: u64,
-    is_subagent: bool,
+    info: &RolloutRecoveryInfo,
 ) -> anyhow::Result<bool> {
     let Some(history) = history else {
         return Ok(false);
@@ -1109,29 +1948,50 @@ fn paginated_projection_is_valid(
         .query_row(
             "SELECT next_rollout_byte_offset, next_rollout_ordinal
              FROM thread_history_projection_state WHERE thread_id=?1",
-            [thread_id],
+            [&info.rollout_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
     let Some((next_offset, next_ordinal)) = state else {
         return Ok(false);
     };
-    if next_offset < 0 || next_ordinal <= 0 || next_offset as u64 > rollout_length {
+    if next_offset < 0 || next_ordinal < 0 {
+        return Ok(false);
+    }
+    let next_offset = u64::try_from(next_offset)?;
+    let next_ordinal_u64 = u64::try_from(next_ordinal)?;
+    let rollout_end_offset = *info
+        .record_end_offsets
+        .values()
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("rollout 不包含记录边界"))?;
+    // projection state 可以是 EOF，也可以是尚未投影完的健康前缀。前缀 cursor
+    // 必须精确指向下一条真实记录的起始字节及 ordinal；等长 provider 改写不会
+    // 移动该边界，Codex 可在下次启动时继续投影剩余记录。
+    let cursor_matches_real_boundary = if next_offset == rollout_end_offset {
+        next_ordinal_u64 == info.next_ordinal
+    } else {
+        info.record_start_offsets.get(&next_ordinal_u64) == Some(&next_offset)
+    };
+    if !cursor_matches_real_boundary {
         return Ok(false);
     }
     let item_count: i64 = history.query_row(
         "SELECT COUNT(*) FROM thread_items WHERE thread_id=?1",
-        [thread_id],
+        [&info.rollout_id],
         |row| row.get(0),
     )?;
     let (turn_count, max_end): (i64, Option<i64>) = history.query_row(
         "SELECT COUNT(*), MAX(rollout_end_byte_offset)
          FROM thread_turns WHERE thread_id=?1",
-        [thread_id],
+        [&info.rollout_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if item_count == 0 && turn_count == 0 {
-        return Ok(is_subagent);
+        let projected_projectable_content = info
+            .first_projectable_end_offset
+            .is_some_and(|offset| offset <= next_offset);
+        return Ok(!projected_projectable_content || info.is_subagent);
     }
     if item_count <= 0 || turn_count <= 0 {
         return Ok(false);
@@ -1147,11 +2007,87 @@ fn paginated_projection_is_valid(
                OR rollout_byte_offset > ?2
                OR rollout_end_byte_offset > ?2
            )",
-        (thread_id, i64::try_from(rollout_length)?),
+        (&info.rollout_id, i64::try_from(next_offset)?),
         |row| row.get(0),
     )?;
+    let invalid_ordinal_count: i64 = history.query_row(
+        "SELECT COUNT(*)
+         FROM thread_turns
+         WHERE thread_id=?1
+           AND (
+               rollout_ordinal < 0
+               OR rollout_end_ordinal < rollout_ordinal
+               OR rollout_end_ordinal >= ?2
+           )",
+        (&info.rollout_id, next_ordinal),
+        |row| row.get(0),
+    )?;
+    let invalid_item_ordinal_count: i64 = history.query_row(
+        "SELECT COUNT(*)
+         FROM thread_items
+         WHERE thread_id=?1
+           AND (rollout_ordinal < 0 OR rollout_ordinal >= ?2)",
+        (&info.rollout_id, next_ordinal),
+        |row| row.get(0),
+    )?;
+    // 数值范围不足以证明跳号历史中的 item 真有来源：例如 10,12 中的 11。
+    let mut items =
+        history.prepare("SELECT rollout_ordinal FROM thread_items WHERE thread_id=?1")?;
+    let item_boundaries_match = items
+        .query_map([&info.rollout_id], |row| row.get::<_, i64>(0))?
+        .try_fold(true, |matches, row| -> anyhow::Result<bool> {
+            Ok(matches
+                && u64::try_from(row?)
+                    .ok()
+                    .is_some_and(|ordinal| info.record_start_offsets.contains_key(&ordinal)))
+        })?;
+    let mut turns = history.prepare(
+        "SELECT rollout_ordinal, rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset
+         FROM thread_turns WHERE thread_id=?1",
+    )?;
+    let boundaries_match = turns
+        .query_map([&info.rollout_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?
+        .try_fold(true, |matches, row| -> anyhow::Result<bool> {
+            let (ordinal, start, end_ordinal, end) = row?;
+            let (Ok(ordinal), Ok(start)) = (u64::try_from(ordinal), u64::try_from(start)) else {
+                return Ok(false);
+            };
+            if info.record_start_offsets.get(&ordinal) != Some(&start) {
+                return Ok(false);
+            }
+            match (end_ordinal, end) {
+                (None, None) => Ok(matches),
+                (Some(end_ordinal), Some(end)) => {
+                    let (Ok(end_ordinal), Ok(end)) =
+                        (u64::try_from(end_ordinal), u64::try_from(end))
+                    else {
+                        return Ok(false);
+                    };
+                    Ok(matches && info.record_end_offsets.get(&end_ordinal) == Some(&end))
+                }
+                _ => Ok(false),
+            }
+        })?;
     Ok(invalid_turn_offset_count == 0
-        && max_end.is_some_and(|value| value >= 0 && value as u64 <= rollout_length))
+        && invalid_ordinal_count == 0
+        && invalid_item_ordinal_count == 0
+        && item_boundaries_match
+        && boundaries_match
+        && max_end.is_none_or(|value| {
+            value >= 0
+                && u64::try_from(value).ok().is_some_and(|end| {
+                    info.record_end_offsets
+                        .values()
+                        .any(|offset| *offset == end)
+                })
+        }))
 }
 
 fn mark_rollout_history_legacy(
@@ -1200,7 +2136,7 @@ fn mark_rollout_history_legacy(
 
 fn mark_database_history_legacy(
     state_path: &Path,
-    plans: &[PaginatedHistoryRecoveryPlan],
+    plans: &[LogicalThreadHistoryRecoveryPlan],
     may_write: &mut impl FnMut() -> Result<bool, AppError>,
 ) -> anyhow::Result<()> {
     let mut state = Connection::open(state_path)?;
@@ -1208,17 +2144,24 @@ fn mark_database_history_legacy(
         anyhow::bail!("state_5.sqlite 缺少 history_mode 列");
     }
     let transaction = state.transaction()?;
+    let mut seen = BTreeSet::new();
     for plan in plans {
+        if !seen.insert(&plan.logical_thread_id) {
+            anyhow::bail!(
+                "历史恢复计划包含重复 logical thread ID {}",
+                plan.logical_thread_id
+            );
+        }
         if !may_write()? {
             anyhow::bail!("Codex 已重新运行或修复目标已变化，历史恢复已终止并回滚。");
         }
         let rows = transaction.execute(
             "UPDATE threads SET history_mode='legacy'
              WHERE id=?1 AND history_mode='paginated'",
-            [&plan.thread_id],
+            [&plan.logical_thread_id],
         )?;
         if rows != 1 {
-            anyhow::bail!("会话 {} 的 history_mode 已并发变化", plan.thread_id);
+            anyhow::bail!("会话 {} 的 history_mode 已并发变化", plan.logical_thread_id);
         }
     }
     if !may_write()? {
@@ -1235,7 +2178,8 @@ struct MigrationReport {
 
 #[derive(Deserialize)]
 struct MigrationOutcome {
-    thread_id: String,
+    thread_id: Option<String>,
+    rollout_path: PathBuf,
     status: String,
     message: Option<String>,
 }
@@ -1243,8 +2187,9 @@ struct MigrationOutcome {
 fn run_codex_history_migration(
     codex_home: &Path,
     configured_app: Option<&str>,
-    plans: &[PaginatedHistoryRecoveryPlan],
+    plans: &[LogicalThreadHistoryRecoveryPlan],
 ) -> anyhow::Result<MigrationReport> {
+    ensure_migration_uses_backed_up_databases(codex_home)?;
     let output = codex_history_migration_command(codex_home, configured_app, plans)?
         .output()
         .map_err(|error| anyhow::anyhow!("无法启动 Codex 历史迁移器：{error}"))?;
@@ -1256,16 +2201,94 @@ fn run_codex_history_migration(
     }
     let report: MigrationReport = serde_json::from_slice(&output.stdout)
         .map_err(|error| anyhow::anyhow!("无法解析 Codex 历史迁移结果：{error}"))?;
-    for plan in plans {
-        let outcome = report
-            .outcomes
+    validate_migration_report(plans, &report)?;
+    Ok(report)
+}
+
+fn ensure_migration_uses_backed_up_databases(codex_home: &Path) -> anyhow::Result<()> {
+    if std::env::var_os("CODEX_SQLITE_HOME").is_some() {
+        anyhow::bail!(
+            "检测到 CODEX_SQLITE_HOME；当前恢复仅备份 CODEX_HOME 内 SQLite，拒绝向未计划数据库迁移"
+        );
+    }
+    let config_path = codex_home.join("config.toml");
+    if config_path.is_file() {
+        let config = fs::read_to_string(&config_path)?;
+        let document = config
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| anyhow::anyhow!("无法解析 Codex 配置中的 sqlite_home：{error}"))?;
+        if toml_contains_sqlite_home(document.as_item()) {
+            anyhow::bail!(
+                "检测到配置 sqlite_home；当前恢复仅备份 CODEX_HOME 内 SQLite，拒绝向未计划数据库迁移"
+            );
+        }
+    }
+    let journals = codex_home.join("rollout-migrations");
+    if journals.is_dir() && fs::read_dir(&journals)?.next().is_some() {
+        anyhow::bail!("检测到已有 rollout-migrations journal，拒绝覆盖或清理未知迁移副产物");
+    }
+    Ok(())
+}
+
+fn toml_contains_sqlite_home(item: &toml_edit::Item) -> bool {
+    match item {
+        toml_edit::Item::Table(table) => table
             .iter()
-            .find(|outcome| outcome.thread_id == plan.thread_id)
-            .ok_or_else(|| anyhow::anyhow!("迁移器未返回会话 {}", plan.thread_id))?;
+            .any(|(key, value)| key == "sqlite_home" || toml_contains_sqlite_home(value)),
+        toml_edit::Item::ArrayOfTables(tables) => tables.iter().any(|table| {
+            table
+                .iter()
+                .any(|(key, value)| key == "sqlite_home" || toml_contains_sqlite_home(value))
+        }),
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => {
+            table.iter().any(|(key, _)| key == "sqlite_home")
+        }
+        _ => false,
+    }
+}
+
+fn validate_migration_report(
+    plans: &[LogicalThreadHistoryRecoveryPlan],
+    report: &MigrationReport,
+) -> anyhow::Result<()> {
+    let expected = plans
+        .iter()
+        .flat_map(|logical_plan| {
+            logical_plan
+                .rollouts
+                .iter()
+                .map(move |rollout| (&logical_plan.logical_thread_id, rollout))
+        })
+        .collect::<Vec<_>>();
+    if report.outcomes.len() != expected.len() {
+        anyhow::bail!(
+            "迁移器返回 {} 条 outcome，预期 {} 条物理 rollout outcome",
+            report.outcomes.len(),
+            expected.len()
+        );
+    }
+    let mut matched = vec![false; expected.len()];
+    for outcome in &report.outcomes {
+        let matching = expected
+            .iter()
+            .enumerate()
+            .filter(|(_, (logical_thread_id, rollout))| {
+                outcome.thread_id.as_deref() == Some(logical_thread_id.as_str())
+                    && rollout_paths_match(&outcome.rollout_path, &rollout.path)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 || matched[matching[0]] {
+            anyhow::bail!(
+                "迁移器返回未知或重复 outcome：thread_id={:?}，rollout_path={}",
+                outcome.thread_id,
+                outcome.rollout_path.display()
+            );
+        }
         if outcome.status != "migrated" {
             anyhow::bail!(
-                "会话 {} 未完成历史迁移：{}{}",
-                plan.thread_id,
+                "物理 rollout {} 未完成历史迁移：{}{}",
+                outcome.rollout_path.display(),
                 outcome.status,
                 outcome
                     .message
@@ -1274,14 +2297,22 @@ fn run_codex_history_migration(
                     .unwrap_or_default()
             );
         }
+        matched[matching[0]] = true;
     }
-    Ok(report)
+    if matched.iter().any(|matched| !matched) {
+        anyhow::bail!("迁移器未返回所有目标物理 rollout 的 outcome");
+    }
+    Ok(())
+}
+
+fn rollout_paths_match(left: &Path, right: &Path) -> bool {
+    fs::canonicalize(left).ok() == fs::canonicalize(right).ok()
 }
 
 fn codex_history_migration_command(
     codex_home: &Path,
     configured_app: Option<&str>,
-    plans: &[PaginatedHistoryRecoveryPlan],
+    plans: &[LogicalThreadHistoryRecoveryPlan],
 ) -> anyhow::Result<std::process::Command> {
     let mut command = platform::codex_cli_command_for_app(configured_app)
         .map_err(|error| anyhow::anyhow!("无法启动 Codex 历史迁移器：{error}"))?;
@@ -1290,8 +2321,11 @@ fn codex_history_migration_command(
         .arg("migrate-rollouts")
         .arg("--apply")
         .arg("--json");
+    let mut seen = BTreeSet::new();
     for plan in plans {
-        command.arg("--thread").arg(&plan.thread_id);
+        if seen.insert(&plan.logical_thread_id) {
+            command.arg("--thread").arg(&plan.logical_thread_id);
+        }
     }
     #[cfg(windows)]
     {
@@ -1305,8 +2339,9 @@ fn codex_history_migration_command(
 fn verify_paginated_history_recovery(
     state_path: &Path,
     history_path: &Path,
-    plans: &[PaginatedHistoryRecoveryPlan],
+    plans: &[LogicalThreadHistoryRecoveryPlan],
     migration_report: &MigrationReport,
+    target: &str,
 ) -> anyhow::Result<()> {
     let state = Connection::open_with_flags(
         state_path,
@@ -1316,48 +2351,43 @@ fn verify_paginated_history_recovery(
         history_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    for plan in plans {
-        let outcome = migration_report
-            .outcomes
-            .iter()
-            .find(|outcome| outcome.thread_id == plan.thread_id)
-            .ok_or_else(|| anyhow::anyhow!("迁移器未返回会话 {}", plan.thread_id))?;
-        if outcome.status != "migrated" {
-            anyhow::bail!(
-                "会话 {} 未完成历史迁移：{}{}",
-                plan.thread_id,
-                outcome.status,
-                outcome
-                    .message
-                    .as_deref()
-                    .map(|message| format!("（{message}）"))
-                    .unwrap_or_default()
-            );
-        }
+    validate_migration_report(plans, migration_report)?;
+    for logical_plan in plans {
         let mode: Option<String> = state
             .query_row(
                 "SELECT history_mode FROM threads WHERE id=?1",
-                [&plan.thread_id],
+                [&logical_plan.logical_thread_id],
                 |row| row.get(0),
             )
             .optional()?;
-        let rollout_length = fs::metadata(&plan.path)?.len();
-        if !paginated_projection_is_valid(
-            Some(&history),
-            &plan.thread_id,
-            rollout_length,
-            plan.is_subagent,
-        )? {
-            anyhow::bail!("会话 {} 的分页历史投影仍不可用", plan.thread_id);
+        if mode.as_deref() != Some("paginated") {
+            anyhow::bail!(
+                "会话 {} 迁移后 history_mode 必须为 paginated",
+                logical_plan.logical_thread_id
+            );
         }
-        match mode.as_deref() {
-            Some("paginated") => {}
-            Some("legacy") => {}
-            Some(other) => anyhow::bail!(
-                "会话 {} 迁移后 history_mode 不受支持：{other}",
-                plan.thread_id
-            ),
-            None => anyhow::bail!("会话 {} 迁移后缺少 history_mode", plan.thread_id),
+        for plan in &logical_plan.rollouts {
+            let bytes = fs::read(&plan.path)?;
+            let info = rollout_recovery_info(&plan.path, &bytes)?;
+            if info.logical_thread_id != logical_plan.logical_thread_id
+                || info.rollout_id != plan.rollout_id
+                || info.history_mode.as_deref() != Some("paginated")
+            {
+                anyhow::bail!(
+                    "会话 {} 的 rollout {} 迁移后元数据不一致",
+                    logical_plan.logical_thread_id,
+                    plan.path.display()
+                );
+            }
+            verify_rollout_semantic_sha256(&bytes, &plan.semantic_sha256)?;
+            verify_rollout_route(&plan.path, target)?;
+            if !paginated_projection_is_valid(Some(&history), &info)? {
+                anyhow::bail!(
+                    "会话 {} 的物理 rollout {} 分页历史投影仍不可用",
+                    logical_plan.logical_thread_id,
+                    plan.rollout_id
+                );
+            }
         }
     }
     Ok(())
@@ -1416,6 +2446,11 @@ fn plan_rollout(
                 repaired_sha256: file_sha256_bytes(&write.repaired),
                 meta_count: write.meta_count,
                 session_meta_count: analysis.session_meta_count,
+                write_mode: if !write.changes_layout {
+                    RolloutWriteMode::InPlaceEqualLength
+                } else {
+                    RolloutWriteMode::RewriteAndReproject
+                },
             },
             None => RolloutPlan::Matching {
                 session_meta_count: analysis.session_meta_count,
@@ -1437,7 +2472,14 @@ enum RolloutPlan {
         repaired_sha256: String,
         meta_count: usize,
         session_meta_count: usize,
+        write_mode: RolloutWriteMode,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RolloutWriteMode {
+    InPlaceEqualLength,
+    RewriteAndReproject,
 }
 
 struct RecordedRollout {
@@ -1469,6 +2511,19 @@ impl RecordedRollout {
 struct BackupEntry {
     original: PathBuf,
     backup: PathBuf,
+    kind: BackupEntryKind,
+}
+
+enum BackupEntryKind {
+    Bytes {
+        original_sha256: String,
+        snapshot_sha256: String,
+    },
+    SqliteSnapshot {
+        original_sha256: String,
+        snapshot_sha256: String,
+    },
+    AbsentSqlite,
 }
 
 struct RepairBackup {
@@ -1495,43 +2550,184 @@ impl RepairBackup {
         self.entries.push(BackupEntry {
             original: original.to_path_buf(),
             backup,
+            kind: BackupEntryKind::Bytes {
+                original_sha256: file_sha256_bytes(bytes),
+                snapshot_sha256: file_sha256_bytes(bytes),
+            },
         });
+        self.write_manifest()?;
         Ok(())
     }
 
-    /// SQLite 的提交可能依赖 WAL/SHM；主文件单独备份会在回滚时丢失尚未
-    /// checkpoint 的页。把存在的 sidecar 一并记录，原来不存在的也记录下来，
-    /// 以便恢复时清除本次写入新建的 sidecar。
+    /// 使用 SQLite backup API 生成逻辑一致快照。恢复时只从该快照恢复主库并移除
+    /// WAL/SHM；因此验证的是快照哈希与 SQLite 完整性，不把运行时 sidecar 的
+    /// 物理字节等同于一致性快照。
     fn add_sqlite_database(&mut self, original: &Path) -> anyhow::Result<()> {
-        self.add_optional_file(original)?;
-        for suffix in ["-wal", "-shm"] {
-            let mut sidecar = original.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            self.add_optional_file(Path::new(&sidecar))?;
+        if !original.is_file() {
+            let backup = self.dir.join(format!("{:04}.absent", self.entries.len()));
+            self.entries.push(BackupEntry {
+                original: original.to_path_buf(),
+                backup,
+                kind: BackupEntryKind::AbsentSqlite,
+            });
+            self.write_manifest()?;
+            return Ok(());
         }
-        Ok(())
-    }
-
-    fn add_optional_file(&mut self, original: &Path) -> anyhow::Result<()> {
-        let backup = self.dir.join(format!("{:04}.bak", self.entries.len()));
-        if original.exists() {
-            fs::copy(original, &backup)?;
+        let backup = self.dir.join(format!("{:04}.sqlite", self.entries.len()));
+        let source = Connection::open_with_flags(
+            original,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut snapshot = Connection::open(&backup)?;
+        {
+            let backup_api = Backup::new(&source, &mut snapshot)?;
+            backup_api.run_to_completion(128, Duration::from_millis(5), None)?;
         }
+        drop(snapshot);
+        drop(source);
+        let snapshot_sha256 = file_sha256(&backup)?;
         self.entries.push(BackupEntry {
             original: original.to_path_buf(),
             backup,
+            kind: BackupEntryKind::SqliteSnapshot {
+                original_sha256: file_sha256(original)?,
+                snapshot_sha256,
+            },
         });
+        self.write_manifest()?;
         Ok(())
     }
 
+    #[cfg(test)]
     fn restore(&self) -> anyhow::Result<()> {
-        for entry in self.entries.iter().rev() {
-            if entry.backup.exists() {
-                fs::copy(&entry.backup, &entry.original)?;
-            } else if entry.original.exists() {
-                fs::remove_file(&entry.original)?;
+        self.restore_selected(
+            &self
+                .entries
+                .iter()
+                .map(|entry| entry.original.clone())
+                .collect(),
+        )
+    }
+
+    fn restore_selected(&self, originals: &HashSet<PathBuf>) -> anyhow::Result<()> {
+        let mut failures = Vec::new();
+        for entry in self
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| originals.contains(&entry.original))
+        {
+            if let Err(error) = self.restore_entry(entry) {
+                failures.push(format!("{}：{error}", entry.original.display()));
             }
         }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("恢复失败目标：{}", failures.join("；"))
+        }
+    }
+
+    fn restore_entry(&self, entry: &BackupEntry) -> anyhow::Result<()> {
+        match &entry.kind {
+            BackupEntryKind::Bytes {
+                snapshot_sha256, ..
+            } => {
+                if file_sha256(&entry.backup)? != *snapshot_sha256 {
+                    anyhow::bail!("备份字节哈希核验失败");
+                }
+                atomic_write(&entry.original, &fs::read(&entry.backup)?)?;
+                if file_sha256(&entry.original)? != *snapshot_sha256 {
+                    anyhow::bail!("恢复字节哈希核验失败");
+                }
+            }
+            BackupEntryKind::SqliteSnapshot {
+                snapshot_sha256, ..
+            } => {
+                if file_sha256(&entry.backup)? != *snapshot_sha256 {
+                    anyhow::bail!("SQLite 备份快照哈希核验失败");
+                }
+                let snapshot_connection = Connection::open_with_flags(
+                    &entry.backup,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                let snapshot_integrity: String =
+                    snapshot_connection
+                        .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+                if snapshot_integrity != "ok" {
+                    anyhow::bail!("SQLite 备份 integrity_check={snapshot_integrity}");
+                }
+                drop(snapshot_connection);
+                for suffix in ["-wal", "-shm"] {
+                    let mut target = entry.original.as_os_str().to_os_string();
+                    target.push(suffix);
+                    let target = PathBuf::from(target);
+                    if target.exists() {
+                        fs::remove_file(target)?;
+                    }
+                }
+                let snapshot = fs::read(&entry.backup)?;
+                atomic_write(&entry.original, &snapshot)?;
+                if file_sha256(&entry.original)? != *snapshot_sha256 {
+                    anyhow::bail!("SQLite 快照哈希核验失败");
+                }
+                let connection = Connection::open_with_flags(
+                    &entry.original,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                let integrity: String =
+                    connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+                if integrity != "ok" {
+                    anyhow::bail!("SQLite integrity_check={integrity}");
+                }
+            }
+            BackupEntryKind::AbsentSqlite => {
+                for suffix in ["", "-wal", "-shm"] {
+                    let mut target = entry.original.as_os_str().to_os_string();
+                    target.push(suffix);
+                    let target = PathBuf::from(target);
+                    if target.exists() {
+                        fs::remove_file(target)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_manifest(&self) -> anyhow::Result<()> {
+        let entries = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let (kind, original_sha256, snapshot_sha256) = match &entry.kind {
+                    BackupEntryKind::Bytes {
+                        original_sha256,
+                        snapshot_sha256,
+                    } => ("bytes", Some(original_sha256), Some(snapshot_sha256)),
+                    BackupEntryKind::SqliteSnapshot {
+                        original_sha256,
+                        snapshot_sha256,
+                    } => (
+                        "sqlite_snapshot",
+                        Some(original_sha256),
+                        Some(snapshot_sha256),
+                    ),
+                    BackupEntryKind::AbsentSqlite => ("absent_sqlite", None, None),
+                };
+                serde_json::json!({
+                    "original_path": entry.original,
+                    "backup_path": entry.backup,
+                    "type": kind,
+                    "original_sha256": original_sha256,
+                    "snapshot_sha256": snapshot_sha256,
+                })
+            })
+            .collect::<Vec<_>>();
+        atomic_write(
+            &self.dir.join("backup-manifest.json"),
+            &serde_json::to_vec_pretty(&entries)?,
+        )?;
         Ok(())
     }
 
@@ -1561,15 +2757,92 @@ fn verify_repair_commit(
 
 fn verify_rollout_route(path: &Path, target: &str) -> anyhow::Result<()> {
     let bytes = fs::read(path)?;
+    let mut session_meta_count = 0;
+    let mut session_meta_target_count = 0;
     for line in std::str::from_utf8(&bytes)?.lines() {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some((_, provider)) = provider_metadata_field(&record)
-            && provider != target
-        {
-            anyhow::bail!("会话文件 {} 仍包含旧 provider", path.display());
+        let is_session_meta = record.get("type").and_then(Value::as_str) == Some("session_meta");
+        if is_session_meta {
+            session_meta_count += 1;
         }
+        for (_, provider) in provider_metadata_fields(&record) {
+            if provider != target {
+                anyhow::bail!("会话文件 {} 仍包含旧 provider", path.display());
+            }
+            if is_session_meta {
+                session_meta_target_count += 1;
+            }
+        }
+    }
+    if session_meta_count == 0 || session_meta_target_count == 0 {
+        anyhow::bail!(
+            "会话文件 {} 缺少可验证的 session_meta 目标 provider",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// 迁移器允许规范化 provider、history_mode、空 history_base 与 ordinal；其余 JSON
+/// 记录的完整顺序、数量以及用户消息、工具调用/结果都参与哈希。
+fn rollout_semantic_sha256(bytes: &[u8]) -> anyhow::Result<String> {
+    let mut normalized = Vec::new();
+    for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let line = segment.strip_suffix(b"\n").unwrap_or(segment);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let mut record: Value = serde_json::from_slice(line)?;
+        if let Some(object) = record.as_object_mut() {
+            object.remove("ordinal");
+            if object.get("type").and_then(Value::as_str) == Some("session_meta") {
+                if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
+                    payload.remove("model_provider");
+                    payload.remove("model_provider_id");
+                    payload.remove("history_mode");
+                    if payload.get("history_base").is_some_and(Value::is_null) {
+                        payload.remove("history_base");
+                    }
+                }
+            } else if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("turn_context")
+            ) {
+                if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
+                    payload.remove("model_provider");
+                    payload.remove("model_provider_id");
+                }
+            } else if object.get("type").and_then(Value::as_str) == Some("event_msg")
+                && object
+                    .get("payload")
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("thread_settings_applied")
+                && let Some(settings) = object
+                    .get_mut("payload")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|payload| payload.get_mut("thread_settings"))
+                    .and_then(Value::as_object_mut)
+            {
+                settings.remove("model_provider");
+                settings.remove("model_provider_id");
+            }
+        }
+        normalized.push(record);
+    }
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&normalized)?)
+    ))
+}
+
+fn verify_rollout_semantic_sha256(bytes: &[u8], expected: &str) -> anyhow::Result<()> {
+    let actual = rollout_semantic_sha256(bytes)?;
+    if actual != expected {
+        anyhow::bail!("迁移后会话语义内容发生未允许变化");
     }
     Ok(())
 }
@@ -1683,6 +2956,7 @@ fn repair_database_commit(
     path: &Path,
     target: &str,
     scope: &SessionScope,
+    expected_rows: usize,
     may_write: &mut impl FnMut() -> Result<bool, AppError>,
 ) -> anyhow::Result<usize> {
     let mut db = Connection::open(path)?;
@@ -1721,6 +2995,12 @@ fn repair_database_commit(
         anyhow::bail!("Codex 已重新运行或修复目标已变化，切换已终止并回滚。");
     }
     transaction.commit()?;
+    if rows != expected_rows {
+        anyhow::bail!(
+            "会话数据库 {} 在提交期间发生并发变化（预期更新 {expected_rows} 行，实际 {rows} 行）",
+            path.display()
+        );
+    }
     Ok(rows)
 }
 
@@ -1766,6 +3046,7 @@ struct RolloutWrite {
     repaired: Vec<u8>,
     original_sha256: String,
     meta_count: usize,
+    changes_layout: bool,
 }
 
 struct RolloutAnalysis {
@@ -1773,18 +3054,20 @@ struct RolloutAnalysis {
     write: Option<RolloutWrite>,
 }
 
-/// 流式分析一个 rollout：只读，不写盘。返回需要原位修改的字节与统计。
-/// provider 名称长度不同时返回错误，由调用方在写入前整体终止切换。
+/// 流式分析一个 rollout：只读，不写盘。仅补丁确认过的 provider 值字节，绝不重序列化
+/// 真实会话。长度变化由调用方检测并触发分页历史偏移的重建。
 fn analyze_rollout_metadata_in_place(path: &Path, target: &str) -> anyhow::Result<RolloutAnalysis> {
     if fs::metadata(path)?.len() > MAX_REPAIR_ROLLOUT_BYTES {
         anyhow::bail!("会话文件超过 256 MB，已跳过以避免占用过多内存");
     }
     let original = fs::read(path)?;
-    let mut output = original.clone();
+    let target_bytes = target.as_bytes();
     let mut session_meta_count = 0;
     let mut meta_count = 0;
     let mut saw_session_meta = false;
     let mut offset = 0;
+    let mut patches = Vec::new();
+    let mut changes_layout = false;
 
     for segment in original.split_inclusive(|byte| *byte == b'\n') {
         let line_len = segment.len();
@@ -1815,27 +3098,35 @@ fn analyze_rollout_metadata_in_place(path: &Path, target: &str) -> anyhow::Resul
         // legacy rollout 的 turn_context 和 thread_settings_applied 记录经常
         // 没有 provider 字段；它们仍是合法历史，不能因为缺少可更新字段而
         // 阻断整个会话。session_meta 则必须包含 provider，才能确认路由目标。
-        let Some((field, provider)) = provider_metadata_field(&record) else {
+        let fields = provider_metadata_fields(&record);
+        if fields.is_empty() {
             if record_type == Some("session_meta") {
                 anyhow::bail!("session_meta 缺少可原位更新的 model_provider 字段");
             }
             offset += line_len;
             continue;
-        };
-        let (value_start, value_end) = unique_json_string_field_range(line, field)
-            .ok_or_else(|| anyhow::anyhow!("会话元数据结构未知，拒绝原位写入"))?;
-        let current = &line[value_start..value_end];
-        if current != provider.as_bytes() {
-            anyhow::bail!("会话元数据与原始字节不一致，拒绝原位写入");
         }
-        let target_bytes = target.as_bytes();
-        if value_end - value_start != target_bytes.len() {
-            anyhow::bail!("旧 provider 与目标 provider 长度不同，拒绝原位写入");
+        if fields
+            .iter()
+            .map(|(_, provider)| *provider)
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 1
+        {
+            anyhow::bail!("会话元数据包含冲突的 provider 别名，拒绝原位写入");
         }
-        if provider != target {
-            let output_start = offset + value_start;
-            output[output_start..output_start + target_bytes.len()].copy_from_slice(target_bytes);
-            meta_count += 1;
+        for (field, provider) in fields {
+            let (value_start, value_end) = unique_json_string_field_range(line, field)
+                .ok_or_else(|| anyhow::anyhow!("会话元数据结构未知，拒绝原位写入"))?;
+            let current = &line[value_start..value_end];
+            if current != provider.as_bytes() {
+                anyhow::bail!("会话元数据与原始字节不一致，拒绝原位写入");
+            }
+            if provider != target {
+                changes_layout |= value_end - value_start != target_bytes.len();
+                patches.push((offset + value_start, offset + value_end));
+                meta_count += 1;
+            }
         }
         offset += line_len;
     }
@@ -1844,6 +3135,24 @@ fn analyze_rollout_metadata_in_place(path: &Path, target: &str) -> anyhow::Resul
         anyhow::bail!("未找到可验证的 session_meta，拒绝原位写入");
     }
     let write = if meta_count > 0 {
+        patches.sort_unstable_by_key(|(start, _)| *start);
+        let removed = patches
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum::<usize>();
+        let mut repaired = Vec::with_capacity(
+            original
+                .len()
+                .saturating_add(patches.len().saturating_mul(target.len()))
+                .saturating_sub(removed),
+        );
+        let mut copied = 0;
+        for (start, end) in patches {
+            repaired.extend_from_slice(&original[copied..start]);
+            repaired.extend_from_slice(target_bytes);
+            copied = end;
+        }
+        repaired.extend_from_slice(&original[copied..]);
         Some(RolloutWrite {
             original_sha256: {
                 let mut hasher = Sha256::new();
@@ -1851,8 +3160,9 @@ fn analyze_rollout_metadata_in_place(path: &Path, target: &str) -> anyhow::Resul
                 format!("{:x}", hasher.finalize())
             },
             original,
-            repaired: output,
+            repaired,
             meta_count,
+            changes_layout,
         })
     } else {
         None
@@ -1863,48 +3173,39 @@ fn analyze_rollout_metadata_in_place(path: &Path, target: &str) -> anyhow::Resul
     })
 }
 
-fn provider_metadata_field(record: &Value) -> Option<(&'static [u8], &str)> {
-    let payload = record.get("payload")?;
+fn provider_metadata_fields(record: &Value) -> Vec<(&'static [u8], &str)> {
+    let Some(payload) = record.get("payload") else {
+        return Vec::new();
+    };
     match record.get("type").and_then(Value::as_str) {
-        Some("session_meta") => payload
-            .get("model_provider")
-            .or_else(|| payload.get("model_provider_id"))
-            .and_then(Value::as_str)
-            .map(|provider| {
-                if payload.get("model_provider").is_some() {
-                    (b"model_provider".as_slice(), provider)
-                } else {
-                    (b"model_provider_id".as_slice(), provider)
-                }
-            }),
-        Some("turn_context") => payload
-            .get("model_provider")
-            .or_else(|| payload.get("model_provider_id"))
-            .and_then(Value::as_str)
-            .map(|provider| {
-                if payload.get("model_provider").is_some() {
-                    (b"model_provider".as_slice(), provider)
-                } else {
-                    (b"model_provider_id".as_slice(), provider)
-                }
-            }),
+        Some("session_meta") | Some("turn_context") => ["model_provider", "model_provider_id"]
+            .into_iter()
+            .filter_map(|field| {
+                payload
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(|provider| (field.as_bytes(), provider))
+            })
+            .collect(),
         Some("event_msg")
             if payload.get("type").and_then(Value::as_str) == Some("thread_settings_applied") =>
         {
-            let settings = payload.get("thread_settings")?;
-            settings
-                .get("model_provider_id")
-                .or_else(|| settings.get("model_provider"))
-                .and_then(Value::as_str)
-                .map(|provider| {
-                    if settings.get("model_provider_id").is_some() {
-                        (b"model_provider_id".as_slice(), provider)
-                    } else {
-                        (b"model_provider".as_slice(), provider)
-                    }
+            payload
+                .get("thread_settings")
+                .into_iter()
+                .flat_map(|settings| {
+                    ["model_provider_id", "model_provider"]
+                        .into_iter()
+                        .filter_map(move |field| {
+                            settings
+                                .get(field)
+                                .and_then(Value::as_str)
+                                .map(|provider| (field.as_bytes(), provider))
+                        })
                 })
+                .collect()
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -2011,7 +3312,7 @@ pub fn list_database_sessions_from_paths(
 }
 
 pub fn rollout_files(codex_home: &Path) -> Vec<PathBuf> {
-    [
+    let mut output = [
         codex_home.join("sessions"),
         codex_home.join("archived_sessions"),
     ]
@@ -2028,7 +3329,12 @@ pub fn rollout_files(codex_home: &Path) -> Vec<PathBuf> {
                     .is_some_and(|extension| extension == "jsonl")
             })
     })
-    .collect()
+    .collect::<Vec<_>>();
+    // 确定性处理顺序：修复/回滚按路径排序写入，避免不同平台文件系统迭代
+    // 顺序不一致导致写序与回滚行为差异（例如外部写入目标被意外覆盖）。
+    output.sort();
+    output.dedup();
+    output
 }
 
 pub fn database_paths(codex_home: &Path) -> Vec<PathBuf> {
@@ -2222,6 +3528,245 @@ mod tests {
     use super::*;
     use std::io::{BufWriter, Seek, Write};
 
+    fn single_recovery_plan(
+        logical_thread_id: &str,
+        rollout_id: &str,
+        path: PathBuf,
+        _is_subagent: bool,
+    ) -> LogicalThreadHistoryRecoveryPlan {
+        LogicalThreadHistoryRecoveryPlan {
+            logical_thread_id: logical_thread_id.into(),
+            rollouts: vec![PhysicalRolloutRecoveryPlan {
+                logical_thread_id: logical_thread_id.into(),
+                rollout_id: rollout_id.into(),
+                path,
+                original_sha256: "unused".into(),
+                semantic_sha256: "unused".into(),
+                recovery_reason: Some(HistoryRecoveryReason::ProjectionInvalid),
+            }],
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn assert_sqlite_integrity(path: &Path) {
+        let database = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let integrity: String = database
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "{}", path.display());
+    }
+
+    fn assert_no_repair_residue(home: &Path) {
+        let residue = WalkDir::new(home)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.path().to_path_buf())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.contains("pending") || name.ends_with(".tmp")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "遗留修复临时文件：{residue:#?}");
+    }
+
+    fn paginated_recovery_fixture(
+        temp: &tempfile::TempDir,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf, String) {
+        let home = temp.path().join("codex");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let logical = "00000000-0000-7000-8000-0000000000b1".to_owned();
+        let rollout = sessions.join(format!("rollout-2026-09-05T12-00-00-{logical}.jsonl"));
+        fs::write(
+            &rollout,
+            format!(
+                concat!(
+                    "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{logical}\",\"model_provider\":\"codex_tools_openai_relay\",\"history_mode\":\"paginated\"}}}}\n",
+                    "{{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}}}\n"
+                ),
+                logical = logical,
+            ),
+        )
+        .unwrap();
+        let state = home.join("state_5.sqlite");
+        let database = Connection::open(&state).unwrap();
+        database
+            .execute_batch(&format!(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, history_mode TEXT, archived INTEGER, source TEXT);
+                 INSERT INTO threads VALUES('{logical}','openai','paginated',0,NULL);"
+            ))
+            .unwrap();
+        drop(database);
+        let history = home.join(THREAD_HISTORY_FILE);
+        let database = Connection::open(&history).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE thread_history_projection_state(
+                     thread_id TEXT PRIMARY KEY,
+                     next_rollout_byte_offset INTEGER,
+                     next_rollout_ordinal INTEGER
+                 );
+                 CREATE TABLE thread_items(thread_id TEXT, rollout_ordinal INTEGER, item_json TEXT);
+                 CREATE TABLE thread_turns(
+                     thread_id TEXT,
+                     rollout_ordinal INTEGER,
+                     rollout_byte_offset INTEGER,
+                     rollout_end_ordinal INTEGER,
+                     rollout_end_byte_offset INTEGER
+                 );",
+            )
+            .unwrap();
+        drop(database);
+        (home, rollout, state, history, logical)
+    }
+
+    fn explicit_paginated_rollout(home: &Path, logical: &str) -> PathBuf {
+        let rollout = home
+            .join("sessions")
+            .join(format!("rollout-2026-09-05T12-00-00-{logical}.jsonl"));
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            format!(
+                concat!(
+                    "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{logical}\",\"model_provider\":\"codex_tools_openai_relay\",\"history_mode\":\"paginated\"}}}}\n",
+                    "{{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}}}\n"
+                ),
+                logical = logical,
+            ),
+        )
+        .unwrap();
+        rollout
+    }
+
+    fn finish_synthetic_migration(
+        _home: &Path,
+        _configured_app: Option<&str>,
+        plans: &[LogicalThreadHistoryRecoveryPlan],
+    ) -> anyhow::Result<MigrationReport> {
+        for logical_plan in plans {
+            let state_path = logical_plan
+                .rollouts
+                .first()
+                .and_then(|plan| plan.path.parent())
+                .and_then(Path::parent)
+                .expect("sessions parent")
+                .join("state_5.sqlite");
+            let history_path = state_path
+                .parent()
+                .expect("codex home")
+                .join(THREAD_HISTORY_FILE);
+            Connection::open(&state_path)?.execute(
+                "UPDATE threads SET history_mode='paginated' WHERE id=?1",
+                [&logical_plan.logical_thread_id],
+            )?;
+            let history = Connection::open(&history_path)?;
+            for plan in &logical_plan.rollouts {
+                let bytes = fs::read(&plan.path)?;
+                let repaired = String::from_utf8(bytes)?.replace(
+                    "\"history_mode\":\"legacy\"",
+                    "\"history_mode\":\"paginated\"",
+                );
+                atomic_write(&plan.path, repaired.as_bytes())?;
+                let info = rollout_recovery_info(&plan.path, repaired.as_bytes())?;
+                let end = *info
+                    .record_end_offsets
+                    .values()
+                    .last()
+                    .expect("fixture has records");
+                history.execute(
+                    "INSERT OR REPLACE INTO thread_history_projection_state VALUES(?1,?2,?3)",
+                    (
+                        &plan.rollout_id,
+                        i64::try_from(end)?,
+                        i64::try_from(info.last_ordinal + 1)?,
+                    ),
+                )?;
+                history.execute(
+                    "INSERT INTO thread_items VALUES(?1,?2,'{}')",
+                    (&plan.rollout_id, i64::try_from(info.last_ordinal)?),
+                )?;
+                history.execute(
+                    "INSERT INTO thread_turns VALUES(?1,0,0,?2,?3)",
+                    (
+                        &plan.rollout_id,
+                        i64::try_from(info.last_ordinal)?,
+                        i64::try_from(end)?,
+                    ),
+                )?;
+            }
+        }
+        Ok(MigrationReport {
+            outcomes: plans
+                .iter()
+                .flat_map(|plan| {
+                    plan.rollouts.iter().map(move |rollout| MigrationOutcome {
+                        thread_id: Some(plan.logical_thread_id.clone()),
+                        rollout_path: rollout.path.clone(),
+                        status: "migrated".into(),
+                        message: None,
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    fn non_migrated_synthetic_report(
+        _: &Path,
+        _: Option<&str>,
+        plans: &[LogicalThreadHistoryRecoveryPlan],
+    ) -> anyhow::Result<MigrationReport> {
+        Ok(MigrationReport {
+            outcomes: plans
+                .iter()
+                .flat_map(|plan| {
+                    plan.rollouts.iter().map(move |rollout| MigrationOutcome {
+                        thread_id: Some(plan.logical_thread_id.clone()),
+                        rollout_path: rollout.path.clone(),
+                        status: "skipped".into(),
+                        message: Some("injected".into()),
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    fn set_session_meta_provider(path: &Path, provider: Option<&str>) -> anyhow::Result<()> {
+        let mut output = String::new();
+        for line in fs::read_to_string(path)?.lines() {
+            let mut record: Value = serde_json::from_str(line)?;
+            if record.get("type").and_then(Value::as_str) == Some("session_meta") {
+                let payload = record
+                    .get_mut("payload")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| anyhow::anyhow!("fixture session_meta.payload 缺失"))?;
+                match provider {
+                    Some(provider) => {
+                        payload.insert("model_provider".into(), Value::String(provider.into()));
+                    }
+                    None => {
+                        payload.remove("model_provider");
+                        payload.remove("model_provider_id");
+                    }
+                }
+            }
+            output.push_str(&serde_json::to_string(&record)?);
+            output.push('\n');
+        }
+        atomic_write(path, output.as_bytes())
+    }
+
     #[test]
     fn repair_workers_are_bounded_by_files_parallelism_and_cap() {
         assert_eq!(repair_worker_count(0, 16), 0);
@@ -2299,12 +3844,12 @@ mod tests {
         fs::create_dir_all(cli.parent().unwrap()).unwrap();
         fs::write(&app, b"desktop").unwrap();
         fs::write(&cli, b"cli").unwrap();
-        let plans = [PaginatedHistoryRecoveryPlan {
-            thread_id: "thread-one".into(),
-            path: temp.path().join("rollout.jsonl"),
-            original_sha256: "unused".into(),
-            is_subagent: false,
-        }];
+        let plans = [single_recovery_plan(
+            "thread-one",
+            "rollout-one",
+            temp.path().join("rollout.jsonl"),
+            false,
+        )];
 
         let command =
             codex_history_migration_command(temp.path(), Some(app.to_str().unwrap()), &plans)
@@ -2334,12 +3879,12 @@ mod tests {
         let app = temp.path().join("Custom/Codex.exe");
         fs::create_dir_all(app.parent().unwrap()).unwrap();
         fs::write(&app, b"desktop").unwrap();
-        let plans = [PaginatedHistoryRecoveryPlan {
-            thread_id: "thread-one".into(),
-            path: temp.path().join("rollout.jsonl"),
-            original_sha256: "unused".into(),
-            is_subagent: false,
-        }];
+        let plans = [single_recovery_plan(
+            "thread-one",
+            "rollout-one",
+            temp.path().join("rollout.jsonl"),
+            false,
+        )];
 
         let error =
             codex_history_migration_command(temp.path(), Some(app.to_str().unwrap()), &plans)
@@ -2462,6 +4007,65 @@ mod tests {
         assert!(after.contains("\"message\":\"unchanged\""));
         assert!(!data.exists());
         assert!(!data.join("backup").exists());
+    }
+
+    #[test]
+    fn repair_updates_different_length_provider_without_reserializing_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/rollout.jsonl");
+        let unchanged = concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg-keep\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"keep exact bytes\"}]}}\r\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"also keep\"}}\n"
+        );
+        let original = format!(
+            "{{ \"type\": \"session_meta\", \"payload\": {{ \"id\": \"one\", \"model_provider\": \"other-provider\", \"future\": true }} }}\n{unchanged}"
+        );
+        fs::write(&rollout, &original).unwrap();
+
+        let result = repair(&home, "custom").unwrap();
+
+        let repaired = fs::read(&rollout).unwrap();
+        assert_eq!(result.files_modified, 1);
+        assert_eq!(result.session_meta_updated, 1);
+        assert_eq!(
+            repaired.len(),
+            original.len() - ("other-provider".len() - "custom".len())
+        );
+        assert!(String::from_utf8_lossy(&repaired).contains("\"model_provider\": \"custom\""));
+        assert!(repaired.ends_with(unchanged.as_bytes()));
+    }
+
+    #[test]
+    fn repair_updates_relay_provider_in_thread_settings_without_rewriting_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/relay.jsonl");
+        let history = concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg-keep\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"keep exact history bytes\"}]}}\r\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"keep following record\"}}\n"
+        );
+        let original = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"relay\",\"model_provider\":\"custom\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"thread_settings_applied\",\"thread_settings\":{{\"model_provider_id\":\"codex_tools_openai_relay\"}}}}}}\n{history}"
+        );
+        fs::write(&rollout, &original).unwrap();
+
+        let result = repair(&home, "custom").unwrap();
+
+        let repaired = fs::read(&rollout).unwrap();
+        assert_eq!(result.files_modified, 1);
+        assert_eq!(result.session_meta_updated, 1);
+        for line in repaired.split_inclusive(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            assert!(!line.is_empty());
+            serde_json::from_slice::<Value>(line).unwrap();
+        }
+        let repaired_text = String::from_utf8_lossy(&repaired);
+        assert!(repaired_text.contains("\"model_provider_id\":\"custom\""));
+        assert!(repaired.ends_with(history.as_bytes()));
     }
 
     #[test]
@@ -2951,6 +4555,235 @@ mod tests {
     }
 
     #[test]
+    fn explicit_paginated_length_change_rejects_configured_external_sqlite_without_home_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let logical = "00000000-0000-7000-8000-0000000000c1";
+        let rollout = explicit_paginated_rollout(&home, logical);
+        let external = temp.path().join("isolated-sqlite");
+        fs::create_dir_all(&external).unwrap();
+        let external_db = external.join("outside.sqlite");
+        Connection::open(&external_db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES('keep');",
+            )
+            .unwrap();
+        let config = home.join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "sqlite_home = {}\n",
+                serde_json::to_string(&external.to_string_lossy().to_string()).unwrap()
+            ),
+        )
+        .unwrap();
+        let rollout_before = fs::read(&rollout).unwrap();
+        let external_before = fs::read(&external_db).unwrap();
+
+        let error = repair_after_connection_switch_preserving_history_with_guard_at(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            || Ok(true),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("sqlite_home"));
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+        assert_eq!(fs::read(&external_db).unwrap(), external_before);
+    }
+
+    #[test]
+    fn missing_mode_length_change_rejects_configured_external_sqlite_without_home_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let logical = "00000000-0000-7000-8000-0000000000c5";
+        let rollout = home.join(format!(
+            "sessions/rollout-2026-09-05T12-00-00-{logical}.jsonl"
+        ));
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            format!(
+                "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{logical}\",\"model_provider\":\"codex_tools_openai_relay\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let external = temp.path().join("isolated-sqlite");
+        fs::create_dir_all(&external).unwrap();
+        let external_db = external.join("outside.sqlite");
+        Connection::open(&external_db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES('keep');",
+            )
+            .unwrap();
+        fs::write(
+            home.join("config.toml"),
+            format!(
+                "sqlite_home = {}\n",
+                serde_json::to_string(&external.to_string_lossy().to_string()).unwrap()
+            ),
+        )
+        .unwrap();
+        let rollout_before = fs::read(&rollout).unwrap();
+        let external_before = fs::read(&external_db).unwrap();
+
+        let error = repair_after_connection_switch_preserving_history_with_guard_at(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            || Ok(true),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("sqlite_home"));
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+        assert_eq!(fs::read(&external_db).unwrap(), external_before);
+    }
+
+    #[test]
+    fn explicit_paginated_length_change_rejects_missing_state_before_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let rollout = explicit_paginated_rollout(&home, "00000000-0000-7000-8000-0000000000c2");
+        let rollout_before = fs::read(&rollout).unwrap();
+
+        let error = repair_after_connection_switch_preserving_history_with_guard_at(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            || Ok(true),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("需要 state_5.sqlite"));
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+    }
+
+    #[test]
+    fn explicit_paginated_length_change_rejects_state_missing_history_mode_column_before_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, rollout, state, history, _logical) = paginated_recovery_fixture(&temp);
+        fs::remove_file(&state).unwrap();
+        Connection::open(&state)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT);
+                 INSERT INTO threads VALUES('00000000-0000-7000-8000-0000000000b1','openai');",
+            )
+            .unwrap();
+        let rollout_before = fs::read(&rollout).unwrap();
+        let state_before = fs::read(&state).unwrap();
+        let history_before = fs::read(&history).unwrap();
+
+        let error = repair_after_connection_switch_preserving_history_with_guard_at(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            || Ok(true),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("id/history_mode"));
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+        assert_eq!(fs::read(&state).unwrap(), state_before);
+        assert_eq!(fs::read(&history).unwrap(), history_before);
+    }
+
+    #[test]
+    fn explicit_paginated_length_change_rejects_state_mode_mismatch_before_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
+        Connection::open(&state)
+            .unwrap()
+            .execute(
+                "UPDATE threads SET history_mode='legacy' WHERE id=?1",
+                [&logical],
+            )
+            .unwrap();
+        let rollout_before = fs::read(&rollout).unwrap();
+        let state_before = fs::read(&state).unwrap();
+        let history_before = fs::read(&history).unwrap();
+
+        let error = repair_after_connection_switch_preserving_history_with_guard_at(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            || Ok(true),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("分页状态不一致"));
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+        assert_eq!(fs::read(&state).unwrap(), state_before);
+        assert_eq!(fs::read(&history).unwrap(), history_before);
+    }
+
+    #[test]
+    fn legacy_rollout_with_paginated_state_is_rejected_before_length_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
+        let legacy = format!(
+            concat!(
+                "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{logical}\",\"model_provider\":\"codex_tools_openai_relay\",\"history_mode\":\"legacy\"}}}}\n",
+                "{{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}}}\n"
+            ),
+            logical = logical,
+        );
+        fs::write(&rollout, &legacy).unwrap();
+        let rollout_before = fs::read(&rollout).unwrap();
+        let state_before = fs::read(&state).unwrap();
+        let history_before = fs::read(&history).unwrap();
+
+        let error = repair_after_connection_switch_preserving_history_with_guard_at(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            || Ok(true),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("legacy history_mode 与分页证据冲突")
+        );
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+        assert_eq!(fs::read(&state).unwrap(), state_before);
+        assert_eq!(fs::read(&history).unwrap(), history_before);
+    }
+
+    #[test]
+    fn explicit_legacy_length_change_without_projection_remains_supported() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/legacy.jsonl");
+        fs::write(
+            &rollout,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"legacy\",\"model_provider\":\"codex_tools_openai_relay\",\"history_mode\":\"legacy\"}}\n",
+        )
+        .unwrap();
+
+        let result = repair_after_connection_switch_preserving_history_with_guard_at(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            || Ok(true),
+        )
+        .unwrap();
+
+        assert_eq!(result.files_modified, 1);
+        assert!(
+            fs::read_to_string(&rollout)
+                .unwrap()
+                .contains("\"model_provider\":\"custom\"")
+        );
+    }
+
+    #[test]
     fn activation_repair_ignores_auxiliary_sqlite_databases_without_session_tables() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
@@ -3025,8 +4858,6 @@ mod tests {
             )
             .unwrap();
         drop(connection);
-        let db_before = fs::read(&db).unwrap();
-
         let mut guard_calls = 0;
         let error = repair_after_connection_switch_preserving_history_with_guard_at(
             &home,
@@ -3043,7 +4874,23 @@ mod tests {
         assert_eq!(guard_calls, 3);
         assert!(error.to_string().contains("已终止并回滚"));
         assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
-        assert_eq!(fs::read(&db).unwrap(), db_before);
+        let connection = Connection::open_with_flags(
+            &db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let provider: String = connection
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id='one'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(provider, "openai");
+        assert_eq!(integrity, "ok");
         assert!(!manifest_path.exists());
     }
 
@@ -3071,9 +4918,6 @@ mod tests {
                 .unwrap();
             drop(connection);
         }
-        let db_a_before = fs::read(&db_a).unwrap();
-        let db_b_before = fs::read(&db_b).unwrap();
-
         let mut guard_calls = 0;
         let error = repair_after_connection_switch_preserving_history_with_guard_at(
             &home,
@@ -3090,9 +4934,424 @@ mod tests {
         assert_eq!(guard_calls, 4);
         assert!(error.to_string().contains("已终止并回滚"));
         assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
-        assert_eq!(fs::read(&db_a).unwrap(), db_a_before);
-        assert_eq!(fs::read(&db_b).unwrap(), db_b_before);
+        for path in [&db_a, &db_b] {
+            let connection = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            let provider: String = connection
+                .query_row(
+                    "SELECT model_provider FROM threads WHERE id='one'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let integrity: String = connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(provider, "openai");
+            assert_eq!(integrity, "ok");
+        }
         assert!(!manifest_path.exists());
+    }
+
+    #[test]
+    fn backup_phase_conflict_preserves_external_changes_without_rollback() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let first = sessions.join("a.jsonl");
+        let second = sessions.join("b.jsonl");
+        let original = |id| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":id,"model_provider":"openai"}})
+            )
+        };
+        fs::write(&first, original("one")).unwrap();
+        fs::write(&second, original("two")).unwrap();
+        let first_external = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"openai","external":"first"}})
+        );
+        let second_external = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"two","model_provider":"openai","external":"second"}})
+        );
+        let mut hook = |stage| {
+            if stage == RepairTestStage::AfterBackup(first.clone()) {
+                fs::write(&first, &first_external)?;
+                fs::write(&second, &second_external)?;
+            }
+            Ok(())
+        };
+        let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            None,
+            || Ok(true),
+            &mut hook,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("写入前预检或备份失败"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), first_external);
+        assert_eq!(fs::read_to_string(&second).unwrap(), second_external);
+        assert_no_repair_residue(&home);
+    }
+
+    #[test]
+    fn rollback_restores_only_written_rollout_and_preserves_external_unwritten_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let first = sessions.join("a.jsonl");
+        let second = sessions.join("b.jsonl");
+        let first_original = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"openai"}})
+        );
+        let second_original = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"two","model_provider":"openai"}})
+        );
+        fs::write(&first, &first_original).unwrap();
+        fs::write(&second, &second_original).unwrap();
+        let second_external = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"two","model_provider":"openai","external":true}})
+        );
+        let mut hook = |stage| {
+            if stage == RepairTestStage::AfterRolloutWrite(first.clone()) {
+                fs::write(&second, &second_external)?;
+            }
+            Ok(())
+        };
+        let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            None,
+            || Ok(true),
+            &mut hook,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("已回滚全部修改"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), first_original);
+        assert_eq!(fs::read_to_string(&second).unwrap(), second_external);
+        assert_no_repair_residue(&home);
+    }
+
+    #[test]
+    fn rollback_after_history_mode_commit_restores_rollout_and_sqlite() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
+        let rollout_before = fs::read(&rollout).unwrap();
+        let mut hook = |stage| match stage {
+            RepairTestStage::AfterHistoryModeCommitted => anyhow::bail!("注入 state 提交后失败"),
+            _ => Ok(()),
+        };
+        let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            None,
+            || Ok(true),
+            &mut hook,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("已回滚全部修改"));
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+        let route: (String, String) = Connection::open(&state)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider, history_mode FROM threads WHERE id=?1",
+                [&logical],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(route, ("openai".into(), "paginated".into()));
+        assert_sqlite_integrity(&state);
+        assert_sqlite_integrity(&history);
+        assert_no_repair_residue(&home);
+    }
+
+    #[test]
+    fn migration_cli_start_failure_rolls_back_all_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
+        let rollout_before = fs::read(&rollout).unwrap();
+        let mut hook = |_| Ok(());
+        let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            Some(&temp.path().join("missing/Codex.exe").to_string_lossy()),
+            || Ok(true),
+            &mut hook,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("无法启动 Codex 历史迁移器"));
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+        let route: (String, String) = Connection::open(&state)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider, history_mode FROM threads WHERE id=?1",
+                [&logical],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(route, ("openai".into(), "paginated".into()));
+        assert_sqlite_integrity(&state);
+        assert_sqlite_integrity(&history);
+        assert_no_repair_residue(&home);
+    }
+
+    #[test]
+    fn migration_non_migrated_outcome_rolls_back_all_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
+        let rollout_before = fs::read(&rollout).unwrap();
+        let mut hook = |_| Ok(());
+        let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            None,
+            || Ok(true),
+            &mut hook,
+            Some(non_migrated_synthetic_report),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("未完成历史迁移"));
+        assert_eq!(fs::read(&rollout).unwrap(), rollout_before);
+        let route: (String, String) = Connection::open(&state)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider, history_mode FROM threads WHERE id=?1",
+                [&logical],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(route, ("openai".into(), "paginated".into()));
+        assert_sqlite_integrity(&state);
+        assert_sqlite_integrity(&history);
+        assert_no_repair_residue(&home);
+    }
+
+    #[test]
+    fn migration_postcondition_failures_roll_back_all_mutations() {
+        for fault in [
+            "legacy",
+            "provider",
+            "provider_missing",
+            "provider_null",
+            "cursor",
+            "semantic",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
+            let rollout_before = fs::read(&rollout).unwrap();
+            let pending = home
+                .join("rollout-migrations")
+                .join(format!("{logical}.pending"));
+            let temporary = rollout.with_file_name(format!(
+                ".{}.paginated.tmp",
+                rollout.file_name().unwrap().to_string_lossy()
+            ));
+            let mut hook = |stage| {
+                if stage == RepairTestStage::AfterMigration {
+                    fs::create_dir_all(pending.parent().unwrap())?;
+                    fs::write(&pending, b"current migration pending")?;
+                    fs::write(&temporary, b"current migration temporary")?;
+                    match fault {
+                        "legacy" => {
+                            let text = fs::read_to_string(&rollout)?;
+                            atomic_write(
+                                &rollout,
+                                text.replace(
+                                    "\"history_mode\":\"paginated\"",
+                                    "\"history_mode\":\"legacy\"",
+                                )
+                                .as_bytes(),
+                            )?;
+                        }
+                        "provider" => {
+                            set_session_meta_provider(&rollout, Some("openai"))?;
+                        }
+                        "provider_missing" => {
+                            set_session_meta_provider(&rollout, None)?;
+                        }
+                        "provider_null" => {
+                            let mut output = String::new();
+                            for line in fs::read_to_string(&rollout)?.lines() {
+                                let mut record: Value = serde_json::from_str(line)?;
+                                if record.get("type").and_then(Value::as_str)
+                                    == Some("session_meta")
+                                {
+                                    *record
+                                        .pointer_mut("/payload/model_provider")
+                                        .expect("synthetic session provider") = Value::Null;
+                                }
+                                output.push_str(&serde_json::to_string(&record)?);
+                                output.push('\n');
+                            }
+                            atomic_write(&rollout, output.as_bytes())?;
+                        }
+                        "cursor" => {
+                            Connection::open(&history)?.execute(
+                                "UPDATE thread_history_projection_state SET next_rollout_byte_offset=0",
+                                [],
+                            )?;
+                        }
+                        "semantic" => {
+                            let text = fs::read_to_string(&rollout)?;
+                            atomic_write(
+                                &rollout,
+                                text.replace("turn-one", "tampered-turn").as_bytes(),
+                            )?;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Ok(())
+            };
+            let result = repair_after_connection_switch_preserving_history_with_test_hooks(
+                &home,
+                "custom",
+                Some(&temp.path().join("manifest.json")),
+                None,
+                || Ok(true),
+                &mut hook,
+                Some(finish_synthetic_migration),
+            );
+            assert!(
+                result.is_err(),
+                "{fault} unexpectedly succeeded: {result:#?}"
+            );
+            let error = result.unwrap_err();
+
+            assert!(
+                error.to_string().contains("已回滚全部修改"),
+                "{fault}: {error}"
+            );
+            assert_eq!(fs::read(&rollout).unwrap(), rollout_before, "{fault}");
+            let route: (String, String) = Connection::open(&state)
+                .unwrap()
+                .query_row(
+                    "SELECT model_provider, history_mode FROM threads WHERE id=?1",
+                    [&logical],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(route, ("openai".into(), "paginated".into()), "{fault}");
+            let rows: i64 = Connection::open(&history)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM thread_history_projection_state",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "{fault}");
+            assert_sqlite_integrity(&state);
+            assert_sqlite_integrity(&history);
+            assert!(!pending.exists(), "{fault}");
+            assert!(!temporary.exists(), "{fault}");
+            assert_no_repair_residue(&home);
+        }
+    }
+
+    #[test]
+    fn preexisting_unknown_migration_residue_is_rejected_and_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, _rollout, _state, _history, _logical) = paginated_recovery_fixture(&temp);
+        let journals = home.join("rollout-migrations");
+        fs::create_dir_all(&journals).unwrap();
+        let unknown = journals.join("previous-run.pending");
+        let bytes = b"unknown previous migration";
+        fs::write(&unknown, bytes).unwrap();
+        let mut hook = |_| Ok(());
+        let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            None,
+            || Ok(true),
+            &mut hook,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("已有 rollout-migrations journal")
+        );
+        assert_eq!(fs::read(&unknown).unwrap(), bytes);
+    }
+
+    #[test]
+    fn provider_database_commit_failure_rolls_back_rollout_and_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/one.jsonl");
+        let rollout_before = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"openai"}})
+        );
+        fs::write(&rollout, &rollout_before).unwrap();
+        let state = home.join("state_5.sqlite");
+        Connection::open(&state)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT);
+                 INSERT INTO threads VALUES('one','openai');",
+            )
+            .unwrap();
+        let mut hook = |stage| match stage {
+            RepairTestStage::BeforeDatabaseCommit(_) => {
+                anyhow::bail!("注入 provider 数据库提交失败")
+            }
+            _ => Ok(()),
+        };
+        let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            None,
+            || Ok(true),
+            &mut hook,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("已回滚全部修改"));
+        assert_eq!(fs::read_to_string(&rollout).unwrap(), rollout_before);
+        let provider: String = Connection::open(&state)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id='one'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai");
+        assert_sqlite_integrity(&state);
+        assert_no_repair_residue(&home);
     }
 
     #[test]
@@ -3192,474 +5451,1110 @@ mod tests {
     }
 
     #[test]
-    fn rollout_recovery_info_recognizes_known_subagent_parent_fields_and_fails_closed() {
-        let direct = rollout_recovery_info(
-            br#"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent","history_mode":"paginated"}}"#,
-        )
-        .unwrap();
-        assert!(direct.is_subagent);
-
-        let nested = rollout_recovery_info(
-            br#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}},"history_mode":"paginated"}}"#,
-        )
-        .unwrap();
-        assert!(nested.is_subagent);
-
-        let unknown = rollout_recovery_info(
-            br#"{"type":"session_meta","payload":{"id":"root","source":{"worker":{"parent":"parent"}},"history_mode":"paginated"}}"#,
-        )
-        .unwrap();
-        assert!(!unknown.is_subagent);
+    fn metadata_summary_allows_legacy_without_ordinal_but_strict_paginated_parser_rejects_it() {
+        let logical = "00000000-0000-7000-8000-00000000000a";
+        let legacy = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{logical}\",\"history_mode\":\"legacy\"}}}}\n"
+        );
+        assert_eq!(
+            rollout_metadata_summary(legacy.as_bytes())
+                .unwrap()
+                .history_mode
+                .as_deref(),
+            Some("legacy")
+        );
+        let path = PathBuf::from(format!("rollout-2026-09-05T12-00-00-{logical}.jsonl"));
+        assert!(rollout_recovery_info(&path, legacy.as_bytes()).is_err());
     }
 
-    #[test]
-    fn state_only_paginated_projection_is_valid_only_for_subagent() {
-        let temp = tempfile::tempdir().unwrap();
-        let history_path = temp.path().join(THREAD_HISTORY_FILE);
-        let history = Connection::open(&history_path).unwrap();
-        history
-            .execute_batch(
-                "CREATE TABLE thread_history_projection_state(
-                     thread_id TEXT PRIMARY KEY,
-                     next_rollout_byte_offset INTEGER,
-                     next_rollout_ordinal INTEGER
-                 );
-                 CREATE TABLE thread_items(thread_id TEXT, rollout_ordinal INTEGER, item_json TEXT);
-                 CREATE TABLE thread_turns(
-                     thread_id TEXT,
-                     rollout_ordinal INTEGER,
-                     rollout_byte_offset INTEGER,
-                     rollout_end_ordinal INTEGER,
-                     rollout_end_byte_offset INTEGER
-                 );
-                 INSERT INTO thread_history_projection_state VALUES('child',100,7);",
-            )
+    // 真实问题是 10→12 跳号。末尾附加记录保证 turn 的 inclusive end 不等于 EOF。
+    fn t7_gapped_projection_fixture(
+        temp: &tempfile::TempDir,
+        provider: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf, String) {
+        let fixture = paginated_recovery_fixture(temp);
+        let (_, rollout, state_path, history_path, logical) = &fixture;
+        let lines = [
+            format!("{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{logical}\",\"model_provider\":\"{provider}\",\"history_mode\":\"paginated\"}}}}\n"),
+            "{\"ordinal\":10,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n".into(),
+            "{\"ordinal\":12,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-one\"}}\n".into(),
+            "{\"ordinal\":13,\"type\":\"turn_context\",\"payload\":{\"note\":\"after turn\"}}\n".into(),
+        ];
+        fs::write(rollout, lines.concat()).unwrap();
+        Connection::open(state_path)
+            .unwrap()
+            .execute("UPDATE threads SET model_provider=?1", [provider])
             .unwrap();
-
-        assert!(paginated_projection_is_valid(Some(&history), "child", 100, true).unwrap());
-        assert!(!paginated_projection_is_valid(Some(&history), "child", 100, false).unwrap());
-    }
-
-    #[test]
-    fn verify_accepts_paginated_projection_rebuilt_from_empty_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let state_path = temp.path().join("state_5.sqlite");
-        let history_path = temp.path().join(THREAD_HISTORY_FILE);
-        let rollout_path = temp.path().join("rollout.jsonl");
-        let rollout = concat!(
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-one\",\"history_mode\":\"legacy\"}}\n",
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n"
-        );
-        fs::write(&rollout_path, rollout).unwrap();
-
-        let state = Connection::open(&state_path).unwrap();
-        state
-            .execute_batch(
-                "CREATE TABLE threads(id TEXT PRIMARY KEY, history_mode TEXT);
-                 INSERT INTO threads VALUES('thread-one','paginated');",
-            )
-            .unwrap();
-        drop(state);
-
-        let history = Connection::open(&history_path).unwrap();
-        let rollout_length = fs::metadata(&rollout_path).unwrap().len() as i64;
-        history
-            .execute_batch(
-                "CREATE TABLE thread_history_projection_state(
-                     thread_id TEXT PRIMARY KEY,
-                     next_rollout_byte_offset INTEGER,
-                     next_rollout_ordinal INTEGER
-                 );
-                 CREATE TABLE thread_items(
-                     thread_id TEXT,
-                     rollout_ordinal INTEGER,
-                     item_json TEXT
-                 );
-                 CREATE TABLE thread_turns(
-                     thread_id TEXT,
-                     rollout_ordinal INTEGER,
-                     rollout_byte_offset INTEGER,
-                     rollout_end_ordinal INTEGER,
-                     rollout_end_byte_offset INTEGER
-                 );",
-            )
-            .unwrap();
-        drop(history);
-
-        let plan = PaginatedHistoryRecoveryPlan {
-            thread_id: "thread-one".into(),
-            path: rollout_path.clone(),
-            original_sha256: file_sha256(&rollout_path).unwrap(),
-            is_subagent: false,
-        };
-        let report = MigrationReport {
-            outcomes: vec![MigrationOutcome {
-                thread_id: "thread-one".into(),
-                status: "migrated".into(),
-                message: None,
-            }],
-        };
-        assert!(
-            verify_paginated_history_recovery(
-                &state_path,
-                &history_path,
-                std::slice::from_ref(&plan),
-                &report,
-            )
-            .is_err()
-        );
-
-        let history = Connection::open(&history_path).unwrap();
+        let history = Connection::open(history_path).unwrap();
         history
             .execute(
-                "INSERT INTO thread_history_projection_state VALUES('thread-one',?1,2)",
-                [rollout_length],
+                "INSERT INTO thread_history_projection_state VALUES(?1,?2,14)",
+                (logical, lines.iter().map(String::len).sum::<usize>() as i64),
             )
             .unwrap();
         history
-            .execute("INSERT INTO thread_items VALUES('thread-one',1,'{}')", [])
+            .execute("INSERT INTO thread_items VALUES(?1,10,'{}')", [logical])
             .unwrap();
         history
             .execute(
-                "INSERT INTO thread_turns VALUES('thread-one',1,0,2,?1)",
-                [rollout_length],
-            )
-            .unwrap();
-        drop(history);
-
-        verify_paginated_history_recovery(
-            &state_path,
-            &history_path,
-            std::slice::from_ref(&plan),
-            &report,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn verify_accepts_state_only_subagent_projection_after_migration_for_both_modes() {
-        for mode in ["legacy", "paginated"] {
-            let temp = tempfile::tempdir().unwrap();
-            let state_path = temp.path().join("state_5.sqlite");
-            let history_path = temp.path().join(THREAD_HISTORY_FILE);
-            let rollout_path = temp.path().join("rollout.jsonl");
-            fs::write(
-                &rollout_path,
-                format!(
-                    "{}\n",
-                    serde_json::json!({
-                        "type": "session_meta",
-                        "payload": {
-                            "id": "child",
-                            "parent_thread_id": "parent",
-                            "history_mode": mode
-                        }
-                    })
+                "INSERT INTO thread_turns VALUES(?1,10,?2,12,?3)",
+                (
+                    logical,
+                    lines[0].len() as i64,
+                    lines[..3].iter().map(String::len).sum::<usize>() as i64,
                 ),
             )
             .unwrap();
-            let rollout_length = fs::metadata(&rollout_path).unwrap().len() as i64;
+        fixture
+    }
 
-            let state = Connection::open(&state_path).unwrap();
-            state
-                .execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, history_mode TEXT);")
-                .unwrap();
-            state
-                .execute("INSERT INTO threads VALUES('child',?1)", [mode])
-                .unwrap();
-            drop(state);
-
-            let history = Connection::open(&history_path).unwrap();
-            history
-                .execute_batch(
-                    "CREATE TABLE thread_history_projection_state(
-                         thread_id TEXT PRIMARY KEY,
-                         next_rollout_byte_offset INTEGER,
-                         next_rollout_ordinal INTEGER
-                     );
-                     CREATE TABLE thread_items(thread_id TEXT, rollout_ordinal INTEGER, item_json TEXT);
-                     CREATE TABLE thread_turns(
-                         thread_id TEXT,
-                         rollout_ordinal INTEGER,
-                         rollout_byte_offset INTEGER,
-                         rollout_end_ordinal INTEGER,
-                         rollout_end_byte_offset INTEGER
-                     );",
-                )
-                .unwrap();
-            history
-                .execute(
-                    "INSERT INTO thread_history_projection_state VALUES('child',?1,827)",
-                    [rollout_length],
-                )
-                .unwrap();
-            drop(history);
-
-            let plan = PaginatedHistoryRecoveryPlan {
-                thread_id: "child".into(),
-                path: rollout_path,
-                original_sha256: "unused".into(),
-                is_subagent: true,
+    #[test]
+    fn t7_healthy_gapped_projection_equal_length_switch_never_migrates() {
+        for (provider, target) in [("custom", "openai"), ("openai", "custom")] {
+            let temp = tempfile::tempdir().unwrap();
+            let (home, rollout, state, history, _) = t7_gapped_projection_fixture(&temp, provider);
+            let before = fs::read_to_string(&rollout).unwrap();
+            let history_before = fs::read(&history).unwrap();
+            let info = rollout_recovery_info(&rollout, before.as_bytes()).unwrap();
+            assert!(
+                paginated_projection_is_valid(Some(&Connection::open(&history).unwrap()), &info)
+                    .unwrap()
+            );
+            let mut hook = |stage| {
+                assert_ne!(stage, RepairTestStage::AfterHistoryModeCommitted);
+                Ok(())
             };
-            let report = MigrationReport {
-                outcomes: vec![MigrationOutcome {
-                    thread_id: "child".into(),
-                    status: "migrated".into(),
-                    message: None,
-                }],
-            };
-            verify_paginated_history_recovery(
-                &state_path,
-                &history_path,
-                std::slice::from_ref(&plan),
-                &report,
+            fn no_migration(
+                _: &Path,
+                _: Option<&str>,
+                _: &[LogicalThreadHistoryRecoveryPlan],
+            ) -> anyhow::Result<MigrationReport> {
+                panic!("健康跳号历史的等长切换不能启动迁移器")
+            }
+            let (result, _) = repair_after_connection_switch_preserving_history_with_test_hooks(
+                &home,
+                target,
+                Some(&temp.path().join("manifest.json")),
+                None,
+                || Ok(true),
+                &mut hook,
+                Some(no_migration),
             )
             .unwrap();
+            assert!(result.repair_complete);
+            assert_eq!(result.files_modified, 1);
+            assert_eq!(
+                fs::read_to_string(&rollout).unwrap(),
+                before.replace(provider, target)
+            );
+            assert_eq!(fs::read(&history).unwrap(), history_before);
+            let route: (String, String) = Connection::open(&state)
+                .unwrap()
+                .query_row(
+                    "SELECT model_provider, history_mode FROM threads",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(route, (target.into(), "paginated".into()));
         }
     }
 
     #[test]
-    fn verify_accepts_legacy_state_when_migration_report_and_projection_are_valid() {
+    fn healthy_projection_prefix_equal_length_switch_never_migrates() {
+        for (provider, target) in [("custom", "openai"), ("openai", "custom")] {
+            let temp = tempfile::tempdir().unwrap();
+            let (home, rollout, state, history_path, logical) =
+                t7_gapped_projection_fixture(&temp, provider);
+            let before = fs::read_to_string(&rollout).unwrap();
+            let record_starts = before
+                .split_inclusive('\n')
+                .scan(0_u64, |offset, line| {
+                    let current = *offset;
+                    *offset += line.len() as u64;
+                    Some(current)
+                })
+                .collect::<Vec<_>>();
+            let history = Connection::open(&history_path).unwrap();
+            history
+                .execute(
+                    "UPDATE thread_history_projection_state
+                     SET next_rollout_byte_offset=?2, next_rollout_ordinal=13
+                     WHERE thread_id=?1",
+                    (logical.as_str(), record_starts[3] as i64),
+                )
+                .unwrap();
+            drop(history);
+            let history_before = fs::read(&history_path).unwrap();
+            let info = rollout_recovery_info(&rollout, before.as_bytes()).unwrap();
+            assert!(
+                paginated_projection_is_valid(
+                    Some(&Connection::open(&history_path).unwrap()),
+                    &info,
+                )
+                .unwrap()
+            );
+            fn no_migration(
+                _: &Path,
+                _: Option<&str>,
+                _: &[LogicalThreadHistoryRecoveryPlan],
+            ) -> anyhow::Result<MigrationReport> {
+                panic!("健康 projection 前缀的等长切换不能启动迁移器")
+            }
+            let (result, _) = repair_after_connection_switch_preserving_history_with_test_hooks(
+                &home,
+                target,
+                Some(&temp.path().join("manifest.json")),
+                None,
+                || Ok(true),
+                &mut |_| Ok(()),
+                Some(no_migration),
+            )
+            .unwrap();
+            assert!(result.repair_complete);
+            assert_eq!(
+                fs::read_to_string(&rollout).unwrap(),
+                before.replace(provider, target)
+            );
+            assert_eq!(fs::read(&history_path).unwrap(), history_before);
+            let route: (String, String) = Connection::open(&state)
+                .unwrap()
+                .query_row(
+                    "SELECT model_provider, history_mode FROM threads",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(route, (target.into(), "paginated".into()));
+        }
+    }
+
+    #[test]
+    fn equal_length_switch_preserves_preexisting_projection_without_migration() {
+        for fault in [
+            "cursor_eof",
+            "cursor_ordinal",
+            "item_gap",
+            "turn_gap",
+            "turn_offset",
+            "null_ordinal",
+            "null_offset",
+            "missing_projection",
+        ] {
+            for (provider, target) in [("custom", "openai"), ("openai", "custom")] {
+                let temp = tempfile::tempdir().unwrap();
+                let (home, rollout, state, history_path, _) =
+                    t7_gapped_projection_fixture(&temp, provider);
+                let history = Connection::open(&history_path).unwrap();
+                let sql = match fault {
+                    "cursor_eof" => {
+                        "UPDATE thread_history_projection_state SET next_rollout_byte_offset=next_rollout_byte_offset-1"
+                    }
+                    "cursor_ordinal" => {
+                        "UPDATE thread_history_projection_state SET next_rollout_ordinal=13"
+                    }
+                    "item_gap" => "UPDATE thread_items SET rollout_ordinal=11",
+                    "turn_gap" => "UPDATE thread_turns SET rollout_end_ordinal=11",
+                    "turn_offset" => {
+                        "UPDATE thread_turns SET rollout_end_byte_offset=rollout_end_byte_offset-1"
+                    }
+                    "null_ordinal" => "UPDATE thread_turns SET rollout_end_ordinal=NULL",
+                    "null_offset" => "UPDATE thread_turns SET rollout_end_byte_offset=NULL",
+                    _ => "DELETE FROM thread_history_projection_state",
+                };
+                history.execute(sql, []).unwrap();
+                drop(history);
+                let rollout_before = fs::read_to_string(&rollout).unwrap();
+                let history_before = fs::read(&history_path).unwrap();
+                fn no_migration(
+                    _: &Path,
+                    _: Option<&str>,
+                    _: &[LogicalThreadHistoryRecoveryPlan],
+                ) -> anyhow::Result<MigrationReport> {
+                    panic!("等长 provider 改写不能修复或迁移既有 projection")
+                }
+                let (result, _) =
+                    repair_after_connection_switch_preserving_history_with_test_hooks(
+                        &home,
+                        target,
+                        Some(&temp.path().join("manifest.json")),
+                        None,
+                        || Ok(true),
+                        &mut |_| Ok(()),
+                        Some(no_migration),
+                    )
+                    .unwrap();
+                assert!(result.repair_complete, "{fault}");
+                assert_eq!(
+                    fs::read_to_string(&rollout).unwrap(),
+                    rollout_before.replace(provider, target),
+                    "{fault}"
+                );
+                assert_eq!(fs::read(&history_path).unwrap(), history_before, "{fault}");
+                let route: (String, String) = Connection::open(&state)
+                    .unwrap()
+                    .query_row(
+                        "SELECT model_provider, history_mode FROM threads",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(route, (target.into(), "paginated".into()), "{fault}");
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_session_meta_uses_only_the_first_record_as_rollout_identity() {
         let temp = tempfile::tempdir().unwrap();
-        let state_path = temp.path().join("state_5.sqlite");
-        let history_path = temp.path().join(THREAD_HISTORY_FILE);
-        let rollout_path = temp.path().join("rollout.jsonl");
-        fs::write(
-            &rollout_path,
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-one\",\"history_mode\":\"legacy\"}}\n",
-        )
-        .unwrap();
-
-        let state = Connection::open(&state_path).unwrap();
-        state
-            .execute_batch(
-                "CREATE TABLE threads(id TEXT PRIMARY KEY, history_mode TEXT);
-                 INSERT INTO threads VALUES('thread-one','legacy');",
-            )
-            .unwrap();
-        drop(state);
-
+        let (home, rollout, _state, history_path, logical) = paginated_recovery_fixture(&temp);
+        let parent = "00000000-0000-7000-8000-0000000000b2";
+        let ancestor = "00000000-0000-7000-8000-0000000000b3";
+        let lines = [
+            format!(
+                "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{logical}\",\"session_id\":\"{parent}\",\"parent_thread_id\":\"{parent}\",\"model_provider\":\"openai\",\"history_mode\":\"paginated\"}}}}\n"
+            ),
+            format!(
+                "{{\"ordinal\":1,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{parent}\",\"model_provider\":\"openai\",\"history_mode\":\"legacy\",\"history_base\":{{\"thread_id\":\"{ancestor}\",\"end_ordinal_exclusive\":50,\"end_byte_offset\":500}}}}}}\n"
+            ),
+            "{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n".into(),
+            "{\"ordinal\":3,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-one\"}}\n".into(),
+            "{\"ordinal\":4,\"type\":\"world_state\",\"payload\":{\"state\":{}}}\n".into(),
+        ];
+        let original = lines.concat();
+        fs::write(&rollout, &original).unwrap();
         let history = Connection::open(&history_path).unwrap();
-        let rollout_length = fs::metadata(&rollout_path).unwrap().len() as i64;
         history
-            .execute_batch(
-                "CREATE TABLE thread_history_projection_state(
-                     thread_id TEXT PRIMARY KEY,
-                     next_rollout_byte_offset INTEGER,
-                     next_rollout_ordinal INTEGER
-                 );
-                 CREATE TABLE thread_items(thread_id TEXT, rollout_ordinal INTEGER, item_json TEXT);
-                 CREATE TABLE thread_turns(
-                     thread_id TEXT,
-                     rollout_ordinal INTEGER,
-                     rollout_byte_offset INTEGER,
-                     rollout_end_ordinal INTEGER,
-                     rollout_end_byte_offset INTEGER
-                 );
-                 INSERT INTO thread_items VALUES('thread-one',1,'{}');",
+            .execute(
+                "INSERT INTO thread_history_projection_state VALUES(?1,?2,5)",
+                (logical.as_str(), original.len() as i64),
             )
             .unwrap();
         history
             .execute(
-                "INSERT INTO thread_history_projection_state VALUES('thread-one',?1,2)",
-                [rollout_length],
+                "INSERT INTO thread_items VALUES(?1,2,'{}')",
+                [logical.as_str()],
             )
             .unwrap();
         history
             .execute(
-                "INSERT INTO thread_turns VALUES('thread-one',1,0,2,?1)",
-                [rollout_length],
+                "INSERT INTO thread_turns VALUES(?1,2,?2,3,?3)",
+                (
+                    logical.as_str(),
+                    (lines[0].len() + lines[1].len()) as i64,
+                    lines[..4].iter().map(String::len).sum::<usize>() as i64,
+                ),
             )
             .unwrap();
         drop(history);
 
-        let plan = PaginatedHistoryRecoveryPlan {
-            thread_id: "thread-one".into(),
-            path: rollout_path,
-            original_sha256: "unused".into(),
-            is_subagent: false,
-        };
-        let report = MigrationReport {
-            outcomes: vec![MigrationOutcome {
-                thread_id: "thread-one".into(),
-                status: "migrated".into(),
-                message: Some("projection rebuilt".into()),
-            }],
-        };
+        let info = rollout_recovery_info(&rollout, original.as_bytes()).unwrap();
+        assert_eq!(info.logical_thread_id, logical);
+        assert!(info.is_subagent);
+        assert_eq!(info.history_mode.as_deref(), Some("paginated"));
+        assert!(info.history_base.is_none());
+        assert_eq!(info.record_start_offsets.len(), 5);
+        assert!(
+            paginated_projection_is_valid(Some(&Connection::open(&history_path).unwrap()), &info)
+                .unwrap()
+        );
 
-        verify_paginated_history_recovery(
-            &state_path,
-            &history_path,
-            std::slice::from_ref(&plan),
-            &report,
+        let mut scope = SessionScope::default();
+        scope.eligible.insert(logical.clone());
+        scope.eligible_rollouts.insert(rollout.clone());
+        assert!(
+            preflight_paginated_history_recovery(
+                &home,
+                &scope,
+                std::slice::from_ref(&rollout),
+                &HashSet::new(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let analysis = analyze_rollout_metadata_in_place(&rollout, "custom").unwrap();
+        assert_eq!(analysis.session_meta_count, 2);
+        let write = analysis.write.unwrap();
+        assert!(!write.changes_layout);
+        assert_eq!(write.meta_count, 2);
+        let repaired = String::from_utf8(write.repaired).unwrap();
+        assert_eq!(repaired.matches("\"model_provider\":\"custom\"").count(), 2);
+        assert!(repaired.contains(&format!("\"id\":\"{logical}\"")));
+        assert!(repaired.contains(&format!("\"id\":\"{parent}\"")));
+
+        let invalid = original.replacen(&format!("\"id\":\"{logical}\","), "", 1);
+        let error = rollout_recovery_info(&rollout, invalid.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("首条 session_meta 缺少 logical thread ID"));
+    }
+
+    #[test]
+    fn t7_legacy_and_undeclared_ordinals_do_not_require_lineage() {
+        for mode in [Some("legacy"), None] {
+            for missing in [true, false] {
+                for target in ["custom", "openai"] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let (home, rollout, state, history, _) = paginated_recovery_fixture(&temp);
+                    let original = fs::read_to_string(&rollout).unwrap().replace(
+                        ",\"history_mode\":\"paginated\"",
+                        &mode
+                            .map(|mode| format!(",\"history_mode\":\"{mode}\""))
+                            .unwrap_or_default(),
+                    );
+                    let original = if missing {
+                        original
+                            .replace("\"ordinal\":0,", "")
+                            .replace("\"ordinal\":1,", "")
+                    } else {
+                        original
+                            .replace("\"ordinal\":0", "\"ordinal\":10")
+                            .replace("\"ordinal\":1,", "\"ordinal\":12,")
+                    };
+                    fs::write(&rollout, &original).unwrap();
+                    Connection::open(&state)
+                        .unwrap()
+                        .execute("UPDATE threads SET history_mode='legacy'", [])
+                        .unwrap();
+                    let history_before = fs::read(&history).unwrap();
+                    let result = repair_after_connection_switch_preserving_history_with_guard_at(
+                        &home,
+                        target,
+                        Some(&temp.path().join("manifest.json")),
+                        || Ok(true),
+                    )
+                    .unwrap();
+                    assert!(result.repair_complete);
+                    assert_eq!(
+                        fs::read_to_string(&rollout).unwrap(),
+                        original.replace("codex_tools_openai_relay", target)
+                    );
+                    assert_eq!(fs::read(&history).unwrap(), history_before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn t7_gapped_length_changing_reprojection_fails_before_any_write() {
+        for fault in [
+            "length",
+            "cursor_eof",
+            "cursor_ordinal",
+            "item_gap",
+            "turn_gap",
+            "turn_offset",
+            "null_ordinal",
+            "null_offset",
+            "missing_projection",
+        ] {
+            for target in ["custom", "openai"] {
+                let temp = tempfile::tempdir().unwrap();
+                let provider = "codex_tools_openai_relay";
+                let (home, rollout, state, history_path, _) =
+                    t7_gapped_projection_fixture(&temp, provider);
+                let history = Connection::open(&history_path).unwrap();
+                let sql = match fault {
+                    "length" => None,
+                    "cursor_eof" => Some(
+                        "UPDATE thread_history_projection_state SET next_rollout_byte_offset=next_rollout_byte_offset-1",
+                    ),
+                    "cursor_ordinal" => {
+                        Some("UPDATE thread_history_projection_state SET next_rollout_ordinal=13")
+                    }
+                    "item_gap" => Some("UPDATE thread_items SET rollout_ordinal=11"),
+                    "turn_gap" => Some("UPDATE thread_turns SET rollout_end_ordinal=11"),
+                    "turn_offset" => Some(
+                        "UPDATE thread_turns SET rollout_end_byte_offset=rollout_end_byte_offset-1",
+                    ),
+                    "null_ordinal" => Some("UPDATE thread_turns SET rollout_end_ordinal=NULL"),
+                    "null_offset" => Some("UPDATE thread_turns SET rollout_end_byte_offset=NULL"),
+                    _ => Some("DELETE FROM thread_history_projection_state"),
+                };
+                if let Some(sql) = sql {
+                    history.execute(sql, []).unwrap();
+                }
+                drop(history);
+                let before = [&rollout, &state, &history_path].map(|path| fs::read(path).unwrap());
+                let mut hook = |_| -> anyhow::Result<()> {
+                    panic!("{fault}: 写入前不能进入备份或提交阶段")
+                };
+                let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+                    &home,
+                    target,
+                    Some(&temp.path().join("manifest.json")),
+                    None,
+                    || Ok(true),
+                    &mut hook,
+                    Some(finish_synthetic_migration),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    error.contains("缺号")
+                        && error.contains("写入前")
+                        && error.contains(rollout.to_str().unwrap()),
+                    "{fault}: {error}"
+                );
+                assert_eq!(
+                    [&rollout, &state, &history_path].map(|path| fs::read(path).unwrap()),
+                    before,
+                    "{fault}"
+                );
+                assert_no_repair_residue(&home);
+            }
+        }
+    }
+
+    #[test]
+    fn t7_length_changing_paginated_illegal_ordinals_fail_before_any_write() {
+        for ordinal in [
+            Some("10"),
+            Some("9"),
+            Some("-1"),
+            Some("\"12\""),
+            Some("null"),
+            Some("12.5"),
+            Some("9223372036854775807"),
+            None,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (home, rollout, state, history, _) =
+                t7_gapped_projection_fixture(&temp, "codex_tools_openai_relay");
+            let original = fs::read_to_string(&rollout).unwrap();
+            let invalid = original.replace(
+                "\"ordinal\":12,",
+                &ordinal
+                    .map(|value| format!("\"ordinal\":{value},"))
+                    .unwrap_or_default(),
+            );
+            fs::write(&rollout, invalid).unwrap();
+            let before = [&rollout, &state, &history].map(|path| fs::read(path).unwrap());
+            let mut hook =
+                |_| -> anyhow::Result<()> { panic!("非法 ordinal 不能进入写入阶段") };
+            let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+                &home,
+                "custom",
+                Some(&temp.path().join("manifest.json")),
+                None,
+                || Ok(true),
+                &mut hook,
+                Some(finish_synthetic_migration),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("ordinal") && error.contains(rollout.to_str().unwrap()),
+                "{error}"
+            );
+            assert_eq!(
+                [&rollout, &state, &history].map(|path| fs::read(path).unwrap()),
+                before
+            );
+            assert_no_repair_residue(&home);
+        }
+    }
+
+    #[test]
+    fn t7_in_progress_turn_requires_paired_null_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, rollout, _, history, _) = t7_gapped_projection_fixture(&temp, "custom");
+        let info = rollout_recovery_info(&rollout, &fs::read(&rollout).unwrap()).unwrap();
+        let history = Connection::open(history).unwrap();
+        history
+            .execute(
+                "UPDATE thread_turns SET rollout_end_ordinal=NULL, rollout_end_byte_offset=NULL",
+                [],
+            )
+            .unwrap();
+        assert!(paginated_projection_is_valid(Some(&history), &info).unwrap());
+    }
+
+    #[test]
+    fn repair_updates_all_known_provider_aliases_and_rejects_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/aliases.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"one\",\"model_provider\":\"codex_tools_openai_relay\",\"model_provider_id\":\"codex_tools_openai_relay\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_settings\":{\"model_provider\":\"codex_tools_openai_relay\",\"model_provider_id\":\"codex_tools_openai_relay\"}}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"codex_tools_openai_relay must remain body text\"}]}}\n"
+            ),
         )
         .unwrap();
+        repair(&home, "custom").unwrap();
+        let repaired = fs::read_to_string(&rollout).unwrap();
+        assert!(!repaired.contains("\"model_provider\":\"codex_tools_openai_relay\""));
+        assert!(!repaired.contains("\"model_provider_id\":\"codex_tools_openai_relay\""));
+        assert!(repaired.contains("body text"));
+
+        let conflict = home.join("sessions/conflict.jsonl");
+        let original = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"two\",\"model_provider\":\"openai\",\"model_provider_id\":\"custom\"}}\n";
+        fs::write(&conflict, original).unwrap();
+        assert!(repair(&home, "custom").is_err());
+        assert_eq!(fs::read_to_string(&conflict).unwrap(), original);
     }
 
     #[test]
-    fn sqlite_backup_restores_sidecars_and_removes_new_ones() {
+    fn migration_semantic_hash_rejects_tampered_user_or_tool_content() {
+        let original = concat!(
+            "{\"timestamp\":\"2026-09-05T12:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"00000000-0000-7000-8000-0000000000ae\",\"model_provider\":\"codex_tools_openai_relay\",\"history_mode\":\"legacy\"}}\n",
+            "{\"timestamp\":\"2026-09-05T12:00:00.000Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"semantic user body\"}}\n",
+            "{\"timestamp\":\"2026-09-05T12:00:00.000Z\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-one\",\"output\":\"semantic tool body\"}}\n"
+        );
+        let hash = rollout_semantic_sha256(original.as_bytes()).unwrap();
+        let allowed_only = original
+            .replace("codex_tools_openai_relay", "custom")
+            .replace(
+                "\"history_mode\":\"legacy\"",
+                "\"history_mode\":\"paginated\"",
+            );
+        verify_rollout_semantic_sha256(allowed_only.as_bytes(), &hash).unwrap();
+        let null_history_base = allowed_only.replace(
+            "\"history_mode\":\"paginated\"",
+            "\"history_mode\":\"paginated\",\"history_base\":null",
+        );
+        verify_rollout_semantic_sha256(null_history_base.as_bytes(), &hash).unwrap();
+        assert!(
+            verify_rollout_semantic_sha256(
+                original
+                    .replace("semantic user body", "tampered user body")
+                    .as_bytes(),
+                &hash
+            )
+            .is_err()
+        );
+        assert!(
+            verify_rollout_semantic_sha256(
+                original
+                    .replace("semantic tool body", "tampered tool body")
+                    .as_bytes(),
+                &hash
+            )
+            .is_err()
+        );
+        assert!(
+            verify_rollout_semantic_sha256(
+                original
+                    .replace(
+                        "\"history_mode\":\"legacy\"",
+                        "\"history_mode\":\"paginated\",\"history_base\":{\"thread_id\":\"00000000-0000-7000-8000-0000000000af\",\"end_ordinal_exclusive\":1,\"end_byte_offset\":1}",
+                    )
+                    .as_bytes(),
+                &hash
+            )
+                .is_err()
+        );
+        let with_base = original.replace(
+            "\"history_mode\":\"legacy\"",
+            "\"history_mode\":\"legacy\",\"history_base\":{\"thread_id\":\"00000000-0000-7000-8000-0000000000af\",\"end_ordinal_exclusive\":1,\"end_byte_offset\":1}",
+        );
+        let with_base_hash = rollout_semantic_sha256(with_base.as_bytes()).unwrap();
+        for altered in [
+            with_base.replace(
+                "\"history_base\":{\"thread_id\":\"00000000-0000-7000-8000-0000000000af\",\"end_ordinal_exclusive\":1,\"end_byte_offset\":1}",
+                "\"history_base\":null",
+            ),
+            with_base.replace(
+                "\"history_base\":{\"thread_id\":\"00000000-0000-7000-8000-0000000000af\",\"end_ordinal_exclusive\":1,\"end_byte_offset\":1}",
+                "",
+            ),
+            with_base.replace("\"end_byte_offset\":1", "\"end_byte_offset\":2"),
+        ] {
+            assert!(
+                verify_rollout_semantic_sha256(altered.as_bytes(), &with_base_hash).is_err(),
+                "非空 history_base 的删除或修改必须改变语义哈希"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CODEX_TOOLS_TEST_CODEX_CLI and an explicit isolated official CLI run"]
+    fn official_cli_single_rollout_rewrites_provider_and_reprojects() {
+        let cli = PathBuf::from(
+            std::env::var_os("CODEX_TOOLS_TEST_CODEX_CLI")
+                .expect("CODEX_TOOLS_TEST_CODEX_CLI must name the official Codex CLI"),
+        );
+        assert!(cli.is_file(), "官方 CLI 不可用");
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let logical = "00000000-0000-7000-8000-0000000000ac";
+        let rollout = home.join(format!(
+            "sessions/2026/09/05/rollout-2026-09-05T12-00-00-{logical}.jsonl"
+        ));
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let stamp = "2026-09-05T12:00:00.000Z";
+        fs::write(
+            &rollout,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"{}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"session_id\":\"{}\",\"timestamp\":\"{}\",\"cwd\":\"D:\\\\synthetic\",\"originator\":\"codex-tools-test\",\"cli_version\":\"0.153.0-alpha.5\",\"source\":\"cli\",\"model_provider\":\"codex_tools_openai_relay\",\"history_mode\":\"legacy\"}}}}\n",
+                    "{{\"timestamp\":\"{}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-synthetic\"}}}}\n",
+                    "{{\"timestamp\":\"{}\",\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"turn_id\":\"turn-synthetic\",\"message\":\"semantic user body\"}}}}\n",
+                    "{{\"timestamp\":\"{}\",\"ordinal\":3,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"semantic user body\"}}]}}}}\n",
+                    "{{\"timestamp\":\"{}\",\"ordinal\":4,\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call_synthetic\",\"output\":\"semantic tool body\"}}}}\n",
+                    "{{\"timestamp\":\"{}\",\"ordinal\":5,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-synthetic\"}}}}\n"
+                ),
+                stamp, logical, logical, stamp, stamp, stamp, stamp, stamp, stamp
+            ),
+        )
+        .unwrap();
+        let bootstrap = std::process::Command::new(&cli)
+            .env("CODEX_HOME", &home)
+            .env_remove("CODEX_SQLITE_HOME")
+            .env("OTEL_SDK_DISABLED", "true")
+            .arg("migrate-rollouts")
+            .arg("--apply")
+            .arg("--json")
+            .arg("--thread")
+            .arg(logical)
+            .output()
+            .unwrap();
+        assert!(
+            bootstrap.status.success(),
+            "bootstrap failed: {}",
+            String::from_utf8_lossy(&bootstrap.stderr)
+        );
+
+        let manifest = temp.path().join("manifest.json");
+        // 这一轮必须直接覆盖 legacy relay（24 bytes）-> openai（6 bytes）；
+        // custom -> openai 是等长切换，不能替代该非等长 CLI 验证。
+        let (result, openai_paths) =
+            repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app(
+                &home,
+                "openai",
+                Some(&manifest),
+                Some(cli.to_str().unwrap()),
+                || Ok(true),
+            )
+            .unwrap();
+        assert!(result.repair_complete);
+        assert!(
+            openai_paths
+                .iter()
+                .any(|path| path.ends_with(THREAD_HISTORY_FILE))
+        );
+        let final_rollout = fs::read_to_string(&rollout).unwrap();
+        assert!(final_rollout.contains("\"model_provider\":\"openai\""));
+        assert!(final_rollout.contains("semantic user body"));
+        assert!(final_rollout.contains("semantic tool body"));
+        let (openai_repeat, openai_repeat_paths) =
+            repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app(
+                &home,
+                "openai",
+                Some(&manifest),
+                Some(cli.to_str().unwrap()),
+                || Ok(true),
+            )
+            .unwrap();
+        assert_eq!(openai_repeat.files_modified, 0);
+        assert!(openai_repeat_paths.is_empty());
+
+        let (to_custom, custom_paths) =
+            repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app(
+                &home,
+                "custom",
+                Some(&manifest),
+                Some(cli.to_str().unwrap()),
+                || Ok(true),
+            )
+            .unwrap();
+        assert!(to_custom.repair_complete);
+        assert_eq!(to_custom.files_modified, 1);
+        assert!(
+            !custom_paths.iter().any(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == THREAD_HISTORY_FILE)
+            }),
+            "健康等长切换不得调用历史迁移器：{openai_paths:#?}"
+        );
+        let (custom_repeat, custom_repeat_paths) =
+            repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app(
+                &home,
+                "custom",
+                Some(&manifest),
+                Some(cli.to_str().unwrap()),
+                || Ok(true),
+            )
+            .unwrap();
+        assert_eq!(custom_repeat.files_modified, 0);
+        assert!(custom_repeat_paths.is_empty());
+        let final_rollout = fs::read_to_string(&rollout).unwrap();
+        assert!(final_rollout.contains("\"model_provider\":\"custom\""));
+        assert!(final_rollout.contains("semantic user body"));
+        assert!(final_rollout.contains("semantic tool body"));
+        let state = Connection::open(home.join("state_5.sqlite")).unwrap();
+        let mode: String = state
+            .query_row(
+                "SELECT history_mode FROM threads WHERE id=?1",
+                [logical],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, "paginated");
+    }
+
+    #[test]
+    fn migration_report_requires_one_exact_physical_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let logical = "00000000-0000-7000-8000-00000000000a";
+        let physical = "00000000-0000-7000-8000-00000000000b";
+        let path = temp.path().join(format!(
+            "rollout-2026-09-05T12-00-00-{logical}_{physical}.jsonl"
+        ));
+        fs::write(&path, b"synthetic").unwrap();
+        let plan = single_recovery_plan(logical, physical, path.clone(), false);
+        let report = MigrationReport {
+            outcomes: vec![MigrationOutcome {
+                thread_id: Some(logical.into()),
+                rollout_path: path,
+                status: "migrated".into(),
+                message: None,
+            }],
+        };
+        validate_migration_report(std::slice::from_ref(&plan), &report).unwrap();
+        let duplicate = MigrationReport {
+            outcomes: vec![
+                MigrationOutcome {
+                    thread_id: Some(logical.into()),
+                    rollout_path: report.outcomes[0].rollout_path.clone(),
+                    status: "migrated".into(),
+                    message: None,
+                },
+                MigrationOutcome {
+                    thread_id: Some(logical.into()),
+                    rollout_path: report.outcomes[0].rollout_path.clone(),
+                    status: "migrated".into(),
+                    message: None,
+                },
+            ],
+        };
+        assert!(validate_migration_report(std::slice::from_ref(&plan), &duplicate).is_err());
+    }
+    #[test]
+    fn sqlite_backup_uses_consistent_wal_snapshot_and_restore_attempts_all_targets() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("state_5.sqlite");
-        let wal = temp.path().join("state_5.sqlite-wal");
-        let shm = temp.path().join("state_5.sqlite-shm");
-        fs::write(&database, b"database-before").unwrap();
-        fs::write(&wal, b"wal-before").unwrap();
-        fs::write(&shm, b"shm-before").unwrap();
-
-        let backup = RepairBackup::create().unwrap();
-        let mut backup = backup;
-        backup.add_sqlite_database(&database).unwrap();
-        fs::write(&database, b"database-after").unwrap();
-        fs::write(&wal, b"wal-after").unwrap();
-        fs::remove_file(&shm).unwrap();
-        backup.restore().unwrap();
-        assert_eq!(fs::read(&database).unwrap(), b"database-before");
-        assert_eq!(fs::read(&wal).unwrap(), b"wal-before");
-        assert_eq!(fs::read(&shm).unwrap(), b"shm-before");
-        backup.cleanup().unwrap();
-
-        let database = temp.path().join("history.sqlite");
-        let wal = temp.path().join("history.sqlite-wal");
-        let shm = temp.path().join("history.sqlite-shm");
-        fs::write(&database, b"database-before").unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE entries(value TEXT);")
+            .unwrap();
+        connection
+            .execute("INSERT INTO entries VALUES('before')", [])
+            .unwrap();
         let mut backup = RepairBackup::create().unwrap();
         backup.add_sqlite_database(&database).unwrap();
-        fs::write(&database, b"database-after").unwrap();
-        fs::write(&wal, b"wal-created").unwrap();
-        fs::write(&shm, b"shm-created").unwrap();
+        connection
+            .execute("INSERT INTO entries VALUES('after')", [])
+            .unwrap();
+        drop(connection);
         backup.restore().unwrap();
-        assert_eq!(fs::read(&database).unwrap(), b"database-before");
-        assert!(!wal.exists());
-        assert!(!shm.exists());
+        let restored = Connection::open_with_flags(
+            &database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let values = restored
+            .prepare("SELECT value FROM entries ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values, ["before"]);
+        let integrity: String = restored
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        drop(restored);
+        backup.cleanup().unwrap();
+
+        let good = temp.path().join("good.jsonl");
+        let bad = temp.path().join("bad.jsonl");
+        fs::write(&good, b"good-before").unwrap();
+        fs::write(&bad, b"bad-before").unwrap();
+        let mut backup = RepairBackup::create().unwrap();
+        backup.add_bytes(&good, b"good-before").unwrap();
+        backup.add_bytes(&bad, b"bad-before").unwrap();
+        fs::write(&good, b"good-after").unwrap();
+        fs::write(&bad, b"bad-after").unwrap();
+        fs::remove_file(&backup.entries[1].backup).unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(backup.dir.join("backup-manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.as_array().unwrap().len(), 2);
+        let error = backup.restore().unwrap_err();
+        assert!(error.to_string().contains("bad.jsonl"));
+        assert_eq!(fs::read(&good).unwrap(), b"good-before");
+        assert_eq!(fs::read(&bad).unwrap(), b"bad-after");
+        assert!(backup.dir.exists());
         backup.cleanup().unwrap();
     }
 
     #[test]
-    fn preflight_skips_healthy_state_only_subagent_projection() {
+    fn corrupt_backup_is_detected_before_its_target_is_touched() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.jsonl");
+        fs::write(&target, b"before").unwrap();
+        let mut backup = RepairBackup::create().unwrap();
+        backup.add_bytes(&target, b"before").unwrap();
+        fs::write(&target, b"external-after").unwrap();
+        fs::write(&backup.entries[0].backup, b"corrupt").unwrap();
+
+        let error = backup.restore_entry(&backup.entries[0]).unwrap_err();
+
+        assert!(error.to_string().contains("哈希核验失败"));
+        assert_eq!(fs::read(&target).unwrap(), b"external-after");
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(backup.dir.join("backup-manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest[0]["type"], "bytes");
+        backup.cleanup().unwrap();
+    }
+
+    #[test]
+    fn corrupt_sqlite_snapshot_is_detected_before_wal_or_target_is_touched() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("state_5.sqlite");
+        let connection = Connection::open(&target).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE entries(value TEXT);")
+            .unwrap();
+        connection
+            .execute("INSERT INTO entries VALUES('before')", [])
+            .unwrap();
+        let mut backup = RepairBackup::create().unwrap();
+        backup.add_sqlite_database(&target).unwrap();
+        connection
+            .execute("INSERT INTO entries VALUES('external-after')", [])
+            .unwrap();
+        drop(connection);
+        let target_before = fs::read(&target).unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", target.display()));
+        let wal_before = wal_path.is_file().then(|| fs::read(&wal_path).unwrap());
+        fs::write(&backup.entries[0].backup, b"corrupt").unwrap();
+
+        let error = backup.restore_entry(&backup.entries[0]).unwrap_err();
+
+        assert!(error.to_string().contains("SQLite 备份快照哈希核验失败"));
+        assert_eq!(fs::read(&target).unwrap(), target_before);
+        assert_eq!(
+            wal_path.is_file().then(|| fs::read(&wal_path).unwrap()),
+            wal_before
+        );
+        backup.cleanup().unwrap();
+    }
+
+    #[test]
+    fn post_rename_write_error_is_registered_and_rolled_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("rollout.jsonl");
+        fs::write(&target, b"before").unwrap();
+        let mut backup = RepairBackup::create().unwrap();
+        backup.add_bytes(&target, b"before").unwrap();
+        let mut written = HashSet::new();
+
+        let error = track_atomic_write_result(&target, b"after", &mut written, || {
+            atomic_write(&target, b"after")?;
+            anyhow::bail!("模拟 rename 后目录 fsync 失败")
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rename 后目录 fsync"));
+        assert!(written.contains(&target));
+        backup.restore_selected(&written).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"before");
+        backup.cleanup().unwrap();
+    }
+
+    #[test]
+    fn database_rows_zero_after_preflight_is_a_concurrent_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let database_path = temp.path().join("state_5.sqlite");
+        let database = Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT);
+                 INSERT INTO threads VALUES('one','openai');",
+            )
+            .unwrap();
+        let scope = session_scope(std::slice::from_ref(&database_path), &[]).unwrap();
+        assert_eq!(
+            preflight_database(&database_path, "custom", &scope).unwrap(),
+            1
+        );
+        database
+            .execute(
+                "UPDATE threads SET model_provider='custom' WHERE id='one'",
+                [],
+            )
+            .unwrap();
+        drop(database);
+
+        let error = repair_database_commit(&database_path, "custom", &scope, 1, &mut || Ok(true))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("并发变化"));
+        assert_sqlite_integrity(&database_path);
+    }
+
+    #[test]
+    fn migration_command_deduplicates_logical_thread_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let logical = "00000000-0000-7000-8000-0000000000b2";
+        let first = single_recovery_plan(
+            logical,
+            logical,
+            temp.path()
+                .join(format!("rollout-2026-09-05T12-00-00-{logical}.jsonl")),
+            false,
+        );
+        let second = single_recovery_plan(
+            logical,
+            logical,
+            temp.path()
+                .join(format!("rollout-2026-09-05T12-01-00-{logical}.jsonl")),
+            false,
+        );
+        // 跨平台构建 Codex 应用/CLI 夹具：Windows 用 .exe + resources CLI，
+        // macOS 用 .app bundle，其余 Unix 直接用可执行文件；Unix 需显式设置
+        // 可执行位，否则权限校验会拒绝普通文件。
+        let configured_app = {
+            #[cfg(windows)]
+            {
+                let app = temp.path().join("Custom/Codex.exe");
+                let cli = temp.path().join("Custom/resources/codex.exe");
+                fs::create_dir_all(cli.parent().unwrap()).unwrap();
+                fs::write(&app, b"desktop").unwrap();
+                fs::write(&cli, b"cli").unwrap();
+                app
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let bundle = temp.path().join("Custom.app");
+                let cli = bundle.join("Contents/Resources/codex");
+                fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+                fs::create_dir_all(cli.parent().unwrap()).unwrap();
+                fs::write(&cli, b"cli").unwrap();
+                make_executable(&cli);
+                bundle
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let app = temp.path().join("Custom/codex");
+                fs::create_dir_all(app.parent().unwrap()).unwrap();
+                fs::write(&app, b"cli").unwrap();
+                make_executable(&app);
+                app
+            }
+        };
+        let command = codex_history_migration_command(
+            temp.path(),
+            Some(configured_app.to_string_lossy().as_ref()),
+            &[first, second],
+        )
+        .unwrap();
+        let args = command
+            .get_args()
+            .filter_map(|arg| arg.to_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == "--thread" && pair[1] == logical)
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn preflight_uses_physical_rollout_id_for_healthy_abc_lineage() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         let sessions = home.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
-        let parent = sessions.join("parent.jsonl");
-        let child = sessions.join("child.jsonl");
-        fs::write(
-            &parent,
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"parent\",\"history_mode\":\"paginated\"}}\n",
-        )
-        .unwrap();
-        fs::write(
-            &child,
-            concat!(
-                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"parent_thread_id\":\"parent\",\"history_mode\":\"paginated\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent\"}}}}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-child\"}}\n"
-            ),
-        )
-        .unwrap();
-        let state = Connection::open(home.join("state_5.sqlite")).unwrap();
-        state
-            .execute_batch(
-                "CREATE TABLE threads(
-                     id TEXT PRIMARY KEY,
-                     history_mode TEXT,
-                     source TEXT,
-                     archived INTEGER
-                 );
-                 INSERT INTO threads VALUES('parent','paginated',NULL,0);
-                 INSERT INTO threads VALUES(
-                     'child',
-                     'paginated',
-                     '{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent\"}}}',
-                     0
-                 );",
-            )
-            .unwrap();
-        drop(state);
-        let history = Connection::open(home.join(THREAD_HISTORY_FILE)).unwrap();
-        history
-            .execute_batch(
-                "CREATE TABLE thread_history_projection_state(
-                     thread_id TEXT PRIMARY KEY,
-                     next_rollout_byte_offset INTEGER,
-                     next_rollout_ordinal INTEGER
-                 );
-                 CREATE TABLE thread_items(thread_id TEXT, rollout_ordinal INTEGER, item_json TEXT);
-                 CREATE TABLE thread_turns(
-                     thread_id TEXT,
-                     rollout_ordinal INTEGER,
-                     rollout_byte_offset INTEGER,
-                     rollout_end_ordinal INTEGER,
-                     rollout_end_byte_offset INTEGER
-                 );",
-            )
-            .unwrap();
-        history
-            .execute(
-                "INSERT INTO thread_history_projection_state VALUES('child',?1,827)",
-                [i64::try_from(fs::metadata(&child).unwrap().len()).unwrap()],
-            )
-            .unwrap();
-        drop(history);
-
-        let rollouts = rollout_files(&home);
-        let scope = session_scope(
-            std::slice::from_ref(&home.join("state_5.sqlite")),
-            &rollouts,
-        )
-        .unwrap();
-        let plans = preflight_paginated_history_recovery(&home, &scope, &rollouts).unwrap();
-
-        assert!(plans.is_empty());
-    }
-
-    #[test]
-    fn preflight_recovers_only_missing_or_out_of_range_paginated_projection() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("codex");
-        fs::create_dir_all(home.join("sessions")).unwrap();
-        let missing = home.join("sessions/missing.jsonl");
-        let healthy = home.join("sessions/healthy.jsonl");
-        for (path, id) in [(&missing, "missing"), (&healthy, "healthy")] {
+        let logical = "00000000-0000-7000-8000-00000000000a";
+        let physical_a = logical;
+        let physical_b = "00000000-0000-7000-8000-00000000000b";
+        let physical_c = "00000000-0000-7000-8000-00000000000c";
+        let path_a = sessions.join(format!("rollout-2026-09-05T12-00-00-{logical}.jsonl"));
+        let path_b = sessions.join(format!(
+            "rollout-2026-09-05T12-01-00-{logical}_{physical_b}.jsonl"
+        ));
+        let path_c = sessions.join(format!(
+            "rollout-2026-09-05T12-02-00-{logical}_{physical_c}.jsonl"
+        ));
+        let write_rollout = |path: &Path,
+                             ordinal: u64,
+                             history_base: Option<Value>,
+                             filler_length: usize| {
             fs::write(
                 path,
                 format!(
                     "{}\n{}\n",
                     serde_json::json!({
-                        "ordinal": 0,
+                        "ordinal": ordinal,
                         "type": "session_meta",
                         "payload": {
-                            "id": id,
-                            "model_provider": "custom",
-                            "history_mode": if id == "healthy" {
-                                serde_json::Value::String("paginated".into())
-                            } else {
-                                serde_json::Value::Null
-                            }
+                            "id": logical,
+                            "history_mode": "paginated",
+                            "model_provider": "openai",
+                            "history_base": history_base
                         }
                     }),
                     serde_json::json!({
-                        "ordinal": 1,
+                        "ordinal": ordinal + 1,
                         "type": "event_msg",
-                        "payload": {"type": "task_started", "turn_id": format!("turn-{id}")}
+                        "payload": {
+                            "type": "task_started",
+                            "turn_id": format!("turn-{}", path.file_stem().unwrap().to_string_lossy()),
+                            "filler": "x".repeat(filler_length)
+                        }
                     })
                 ),
             )
-            .unwrap();
-        }
-        let state = Connection::open(home.join("state_5.sqlite")).unwrap();
+            .unwrap()
+        };
+        write_rollout(&path_a, 0, None, 600);
+        let length_a = fs::metadata(&path_a).unwrap().len();
+        write_rollout(
+            &path_b,
+            2,
+            Some(serde_json::json!({
+                "thread_id": physical_a,
+                "end_ordinal_exclusive": 2,
+                "end_byte_offset": length_a
+            })),
+            60,
+        );
+        let length_b = fs::metadata(&path_b).unwrap().len();
+        write_rollout(
+            &path_c,
+            4,
+            Some(serde_json::json!({
+                "thread_id": physical_b,
+                "end_ordinal_exclusive": 4,
+                "end_byte_offset": length_b
+            })),
+            160,
+        );
+        let paths = [
+            (&path_a, physical_a, 0_i64),
+            (&path_b, physical_b, 2_i64),
+            (&path_c, physical_c, 4_i64),
+        ];
+        let state_path = home.join("state_5.sqlite");
+        let state = Connection::open(&state_path).unwrap();
         state
-            .execute_batch(
-                "CREATE TABLE threads(
-                     id TEXT PRIMARY KEY,
-                     model_provider TEXT,
-                     history_mode TEXT,
-                     archived INTEGER,
-                     source TEXT
-                 );
-                 INSERT INTO threads VALUES('missing','custom','paginated',0,NULL);
-                 INSERT INTO threads VALUES('healthy','custom','paginated',0,NULL);",
-            )
+            .execute_batch(&format!(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, history_mode TEXT, archived INTEGER, source TEXT);
+                 INSERT INTO threads VALUES('{logical}','paginated',0,NULL);"
+            ))
             .unwrap();
         drop(state);
+
         let history = Connection::open(home.join(THREAD_HISTORY_FILE)).unwrap();
         history
             .execute_batch(
@@ -3668,11 +6563,7 @@ mod tests {
                      next_rollout_byte_offset INTEGER,
                      next_rollout_ordinal INTEGER
                  );
-                 CREATE TABLE thread_items(
-                     thread_id TEXT,
-                     rollout_ordinal INTEGER,
-                     item_json TEXT
-                 );
+                 CREATE TABLE thread_items(thread_id TEXT, rollout_ordinal INTEGER, item_json TEXT);
                  CREATE TABLE thread_turns(
                      thread_id TEXT,
                      rollout_ordinal INTEGER,
@@ -3682,34 +6573,82 @@ mod tests {
                  );",
             )
             .unwrap();
-        let healthy_length = fs::metadata(&healthy).unwrap().len();
-        history
-            .execute(
-                "INSERT INTO thread_history_projection_state VALUES('healthy',?1,2)",
-                [i64::try_from(healthy_length).unwrap()],
-            )
-            .unwrap();
-        history
-            .execute("INSERT INTO thread_items VALUES('healthy',1,'{}')", [])
-            .unwrap();
-        history
-            .execute(
-                "INSERT INTO thread_turns VALUES('healthy',1,0,2,?1)",
-                [i64::try_from(healthy_length).unwrap()],
-            )
-            .unwrap();
+        for (path, physical, start_ordinal) in &paths {
+            let length = i64::try_from(fs::metadata(path).unwrap().len()).unwrap();
+            history
+                .execute(
+                    "INSERT INTO thread_history_projection_state VALUES(?1,?2,?3)",
+                    (physical, length, start_ordinal + 2),
+                )
+                .unwrap();
+            history
+                .execute(
+                    "INSERT INTO thread_items VALUES(?1,?2,'{}')",
+                    (*physical, start_ordinal + 1),
+                )
+                .unwrap();
+            history
+                .execute(
+                    "INSERT INTO thread_turns VALUES(?1,?2,0,?3,?4)",
+                    (*physical, start_ordinal, start_ordinal + 1, length),
+                )
+                .unwrap();
+        }
         drop(history);
 
         let rollouts = rollout_files(&home);
-        let scope = session_scope(
-            std::slice::from_ref(&home.join("state_5.sqlite")),
-            &rollouts,
-        )
-        .unwrap();
-        let plans = preflight_paginated_history_recovery(&home, &scope, &rollouts).unwrap();
+        let scope = session_scope(std::slice::from_ref(&state_path), &rollouts).unwrap();
+        let plans = preflight_paginated_history_recovery(&home, &scope, &rollouts, &HashSet::new())
+            .unwrap();
 
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].thread_id, "missing");
-        assert_eq!(plans[0].path, missing);
+        assert!(
+            plans.is_empty(),
+            "healthy A/B/C lineage must not be recovered: {plans:#?}"
+        );
+
+        let history = Connection::open(home.join(THREAD_HISTORY_FILE)).unwrap();
+        history
+            .execute(
+                "DELETE FROM thread_history_projection_state WHERE thread_id=?1",
+                [physical_b],
+            )
+            .unwrap();
+        drop(history);
+        let error = preflight_paginated_history_recovery(
+            &home,
+            &scope,
+            &rollouts,
+            &HashSet::from([path_a.clone()]),
+        )
+        .unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("写入前拒绝恢复"));
+        assert!(error.contains(path_a.to_string_lossy().as_ref()));
+        assert!(error.contains(path_b.to_string_lossy().as_ref()));
+        assert!(error.contains(path_c.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn rollout_filename_parser_distinguishes_logical_and_physical_ids() {
+        let logical = "00000000-0000-7000-8000-00000000000a";
+        let physical = "00000000-0000-7000-8000-00000000000b";
+        let single = PathBuf::from(format!("rollout-2026-09-05T12-00-00-{logical}.jsonl"));
+        assert_eq!(
+            rollout_ids_from_path(&single).unwrap(),
+            (logical.into(), logical.into())
+        );
+        let continued = PathBuf::from(format!(
+            "rollout-2026-09-05T12-00-01-{logical}_{physical}.jsonl"
+        ));
+        assert_eq!(
+            rollout_ids_from_path(&continued).unwrap(),
+            (logical.into(), physical.into())
+        );
+        assert!(
+            rollout_ids_from_path(Path::new(
+                "rollout-2026-99-05T12-00-00-00000000-0000-7000-8000-00000000000a.jsonl"
+            ))
+            .is_err()
+        );
     }
 }

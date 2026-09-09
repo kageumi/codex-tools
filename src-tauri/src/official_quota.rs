@@ -1,5 +1,6 @@
 use crate::models::{
-    AppError, OfficialAccountSource, QuotaData, QuotaStatus, QuotaWindow, StoredOfficialAccount,
+    AppError, OfficialAccountSource, QuotaData, QuotaStatus, QuotaWindow, ResetCreditDetailsStatus,
+    ResetCreditSummary, StoredOfficialAccount,
 };
 use futures_util::StreamExt;
 use reqwest::header::{
@@ -21,7 +22,7 @@ pub struct QuotaFetchError {
 }
 
 impl QuotaFetchError {
-    fn new(status: QuotaStatus, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: QuotaStatus, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
@@ -30,7 +31,7 @@ impl QuotaFetchError {
         }
     }
 
-    fn retryable(message: impl Into<String>) -> Self {
+    pub(crate) fn retryable(message: impl Into<String>) -> Self {
         Self {
             status: QuotaStatus::Error,
             message: message.into(),
@@ -61,6 +62,7 @@ pub(crate) fn ensure_account_usable(account: &StoredOfficialAccount) -> Result<(
 pub struct QuotaFetchResult {
     pub data: QuotaData,
     pub plan_type: Option<String>,
+    pub reset_credits: ResetCreditSummary,
 }
 
 pub async fn fetch_quota(
@@ -70,11 +72,9 @@ pub async fn fetch_quota(
     fetch_quota_from(client, account, OPENAI_USAGE_URL).await
 }
 
-async fn fetch_quota_from(
-    client: &reqwest::Client,
+pub(crate) fn official_headers(
     account: &StoredOfficialAccount,
-    endpoint: &str,
-) -> Result<QuotaFetchResult, QuotaFetchError> {
+) -> Result<HeaderMap, QuotaFetchError> {
     let access_token = account.credential.tokens.access_token.trim();
     if access_token.is_empty() {
         return Err(QuotaFetchError::new(
@@ -109,9 +109,20 @@ async fn fetch_quota_from(
         );
     }
 
+    Ok(headers)
+}
+
+async fn fetch_quota_from(
+    client: &reqwest::Client,
+    account: &StoredOfficialAccount,
+    endpoint: &str,
+) -> Result<QuotaFetchResult, QuotaFetchError> {
     let response = tokio::time::timeout(
         Duration::from_secs(30),
-        client.get(endpoint).headers(headers).send(),
+        client
+            .get(endpoint)
+            .headers(official_headers(account)?)
+            .send(),
     )
     .await
     .map_err(|_| QuotaFetchError::retryable("OpenAI 额度查询超时，请稍后重试"))?
@@ -138,7 +149,6 @@ async fn fetch_quota_from(
             retry_after.as_deref(),
         ));
     }
-
     let payload = read_bounded_json(response).await?;
     let data =
         parse_quota_payload(&payload, chrono::Utc::now().timestamp()).map_err(
@@ -154,10 +164,56 @@ async fn fetch_quota_from(
     Ok(QuotaFetchResult {
         data,
         plan_type: parse_plan_type(&payload),
+        reset_credits: parse_reset_credit_summary(&payload),
     })
 }
 
-fn classify_http_error(
+pub(crate) fn parse_reset_credit_summary(payload: &Value) -> ResetCreditSummary {
+    let credits = payload
+        .get("rate_limit_reset_credits")
+        .or_else(|| payload.get("rateLimitResetCredits"))
+        .or_else(|| payload.pointer("/data/rate_limit_reset_credits"))
+        .or_else(|| payload.pointer("/data/rateLimitResetCredits"))
+        .or_else(|| {
+            (payload.get("available_count").is_some()
+                || payload.get("availableCount").is_some()
+                || payload.get("credits").is_some())
+            .then_some(payload)
+        });
+    let Some(credits) = credits.filter(|value| value.is_object()) else {
+        return ResetCreditSummary::default();
+    };
+    let available_count = credits
+        .get("available_count")
+        .or_else(|| credits.get("availableCount"))
+        .and_then(parse_number)
+        .and_then(|value| u32::try_from(value).ok());
+    let detail_status = match credits
+        .get("credits")
+        .filter(|value| value.is_array())
+        .and_then(Value::as_array)
+    {
+        Some(items)
+            if available_count.is_some_and(|count| {
+                items
+                    .iter()
+                    .filter(|item| item.get("status").and_then(Value::as_str) == Some("available"))
+                    .count()
+                    >= count as usize
+            }) =>
+        {
+            ResetCreditDetailsStatus::Complete
+        }
+        Some(_) => ResetCreditDetailsStatus::Partial,
+        None => ResetCreditDetailsStatus::Unknown,
+    };
+    ResetCreditSummary {
+        available_count,
+        details_status: detail_status,
+    }
+}
+
+pub(crate) fn classify_http_error(
     status: reqwest::StatusCode,
     payload: Option<&Value>,
     retry_after: Option<&str>,
@@ -302,7 +358,7 @@ fn extract_error_code(payload: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn read_optional_error_json(response: reqwest::Response) -> Option<Value> {
+pub(crate) async fn read_optional_error_json(response: reqwest::Response) -> Option<Value> {
     read_response_bytes(response)
         .await
         .ok()
@@ -327,13 +383,17 @@ fn should_send_account_id(account: &StoredOfficialAccount) -> bool {
             && account_id.starts_with("proxy-"))
 }
 
-async fn read_bounded_json(response: reqwest::Response) -> Result<Value, QuotaFetchError> {
+pub(crate) async fn read_bounded_json(
+    response: reqwest::Response,
+) -> Result<Value, QuotaFetchError> {
     let bytes = read_response_bytes(response).await?;
     serde_json::from_slice(&bytes)
         .map_err(|_| QuotaFetchError::new(QuotaStatus::Error, "OpenAI 额度接口没有返回有效 JSON"))
 }
 
-async fn read_response_bytes(response: reqwest::Response) -> Result<Vec<u8>, QuotaFetchError> {
+pub(crate) async fn read_response_bytes(
+    response: reqwest::Response,
+) -> Result<Vec<u8>, QuotaFetchError> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -433,7 +493,7 @@ fn parse_non_negative_f64(value: &Value) -> Option<f64> {
         .filter(|number| number.is_finite() && *number >= 0.0)
 }
 
-fn parse_timestamp(value: &Value) -> Option<i64> {
+pub(crate) fn parse_timestamp(value: &Value) -> Option<i64> {
     parse_number(value).or_else(|| {
         value.as_str().and_then(|text| {
             chrono::DateTime::parse_from_rfc3339(text.trim())
@@ -545,6 +605,7 @@ mod tests {
         let QuotaFetchResult {
             data: quota,
             plan_type,
+            ..
         } = quota;
         let QuotaData::Windowed { primary, secondary } = quota;
         assert_eq!(plan_type, None);

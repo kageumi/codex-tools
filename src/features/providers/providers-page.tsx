@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   Add01Icon,
+  ArrowRight01Icon,
   CheckmarkCircle02Icon,
   Key01Icon,
   Login03Icon,
   Refresh01Icon,
   TestTube01Icon,
+  Ticket01Icon,
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
 
@@ -64,6 +66,8 @@ import {
   ProviderEditorDialog,
 } from "./provider-editor-dialog"
 import { displayQuotaWindows, quotaWindowEstimate } from "./quota-estimate"
+import { ResetCreditsDialog } from "./reset-credits-dialog"
+import { resetCreditCountText } from "./reset-credits"
 
 export function ProvidersPage({
   connections,
@@ -83,6 +87,10 @@ export function ProvidersPage({
   const [loginError, setLoginError] = useState<string>()
   const [editor, setEditor] = useState<Provider>(emptyProvider())
   const [remarkAccount, setRemarkAccount] = useState<OfficialAccountView>()
+  const [resetCreditAccountId, setResetCreditAccountId] = useState<string>()
+  const resetCreditAccount = connections?.officialAccounts.find(
+    (item) => item.id === resetCreditAccountId
+  )
   const [authorization, setAuthorization] = useState<DeviceAuthorization>()
   const [estimating, setEstimating] = useState(false)
   const { busy, begin, end, run } = useAsyncAction<string>()
@@ -318,6 +326,15 @@ export function ProvidersPage({
           void importCookie(name, accountId, content)
         }
       />
+      <ResetCreditsDialog
+        key={resetCreditAccountId ?? "closed"}
+        account={resetCreditAccount}
+        open={Boolean(resetCreditAccountId && resetCreditAccount)}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setResetCreditAccountId(undefined)
+        }}
+        onChanged={onRefresh}
+      />
     </>
   )
 
@@ -461,7 +478,11 @@ export function ProvidersPage({
 
       <Card key={item.id} size="sm" className="shrink-0">
         {isAccount ? (
-          <AccountCardHeader account={account!} displayName={displayName} />
+          <AccountCardHeader
+            account={account!}
+            displayName={displayName}
+            onOpenResetCredits={() => setResetCreditAccountId(account!.id)}
+          />
         ) : (
           <CardHeader className="border-b">
             <div className="flex items-center gap-2">
@@ -695,9 +716,11 @@ type StatusBadgeVariant = "default" | "secondary" | "destructive" | "outline"
 function AccountCardHeader({
   account,
   displayName,
+  onOpenResetCredits,
 }: {
   account: OfficialAccountView
   displayName: string
+  onOpenResetCredits: () => void
 }) {
   const loginStatus = loginVerificationText(account)
   const maintenanceStatus = credentialRefreshText(account)
@@ -705,42 +728,77 @@ function AccountCardHeader({
   const shortMaintenanceStatus = shortMaintenanceStatusText(account)
 
   return (
-    <CardHeader className="border-b">
-      <div className="flex flex-wrap items-center gap-2">
-        <CardTitle className="min-w-0 break-words">{displayName}</CardTitle>
-        {account.active && (
-          <Badge>
-            <HugeiconsIcon icon={CheckmarkCircle02Icon} />
-            当前连接
+    <CardHeader className="grid-cols-1 gap-4 border-b min-[480px]:grid-cols-[minmax(0,1fr)_auto]">
+      <div className="flex min-w-0 flex-col gap-1.5">
+        <div className="flex flex-wrap items-center gap-2">
+          <CardTitle className="min-w-0 break-words">{displayName}</CardTitle>
+          {account.active && (
+            <Badge>
+              <HugeiconsIcon icon={CheckmarkCircle02Icon} />
+              当前连接
+            </Badge>
+          )}
+          <Badge variant="secondary">{accountPlanText(account)}</Badge>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-muted-foreground">
+          <span className="break-all">{account.email || "未提供邮箱"}</span>
+          <span aria-hidden="true">·</span>
+          <span>
+            {account.source === "proxy_import"
+              ? "Cookie 登录数据"
+              : "OpenAI 官方授权"}
+          </span>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <Badge
+            variant={loginVerificationVariant(account)}
+            className="h-auto max-w-full justify-start px-1.5 py-0.5 text-left leading-tight break-words whitespace-normal"
+            aria-label={`登录状态：${loginStatus}`}
+          >
+            <span>{shortLoginStatus}</span>
           </Badge>
-        )}
-        <Badge variant="secondary">{accountPlanText(account)}</Badge>
+          <Badge
+            variant={credentialRefreshVariant(account)}
+            className="h-auto max-w-full justify-start px-1.5 py-0.5 text-left leading-tight break-words whitespace-normal"
+            aria-label={`自动维护：${maintenanceStatus}`}
+          >
+            <span>{shortMaintenanceStatus}</span>
+          </Badge>
+        </div>
       </div>
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-muted-foreground">
-        <span className="break-all">{account.email || "未提供邮箱"}</span>
-        <span aria-hidden="true">·</span>
-        <span>
-          {account.source === "proxy_import"
-            ? "Cookie 登录数据"
-            : "OpenAI 官方授权"}
+      <Button
+        type="button"
+        variant="outline"
+        className="h-auto justify-between gap-5 rounded-xl border-foreground/15 bg-muted/50 px-4 py-3 text-left hover:border-foreground/30 hover:bg-muted min-[480px]:min-w-36"
+        onClick={onOpenResetCredits}
+        aria-label={`${resetCreditCountText(account)}，打开重置卡列表`}
+        aria-haspopup="dialog"
+      >
+        <span className="flex flex-col gap-1.5">
+          <span className="flex items-center gap-1.5 text-sm">
+            <HugeiconsIcon icon={Ticket01Icon} aria-hidden="true" />
+            重置卡
+          </span>
+          <span className="flex items-baseline gap-1">
+            <span className="text-2xl leading-none font-semibold tabular-nums">
+              {account.quota.resetCredits?.availableCount ?? "—"}
+            </span>
+            <span className="text-xs font-normal text-muted-foreground">
+              {account.quota.resetCredits?.availableCount == null
+                ? "待查询"
+                : "张"}
+            </span>
+          </span>
         </span>
-      </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <Badge
-          variant={loginVerificationVariant(account)}
-          className="h-auto max-w-full justify-start px-1.5 py-0.5 text-left leading-tight break-words whitespace-normal"
-          aria-label={`登录状态：${loginStatus}`}
-        >
-          <span>{shortLoginStatus}</span>
-        </Badge>
-        <Badge
-          variant={credentialRefreshVariant(account)}
-          className="h-auto max-w-full justify-start px-1.5 py-0.5 text-left leading-tight break-words whitespace-normal"
-          aria-label={`自动维护：${maintenanceStatus}`}
-        >
-          <span>{shortMaintenanceStatus}</span>
-        </Badge>
-      </div>
+        <span className="flex items-center gap-1 self-end text-xs text-muted-foreground">
+          查看
+          <HugeiconsIcon
+            icon={ArrowRight01Icon}
+            className="size-3.5"
+            aria-hidden="true"
+          />
+        </span>
+      </Button>
     </CardHeader>
   )
 }

@@ -7,9 +7,9 @@ use crate::{
     codex::{self, ConfigManager},
     local_usage::UsageLedger,
     models::*,
-    official_quota, proxy_import, record_current_activation,
+    official_quota, official_reset_credits, proxy_import, record_current_activation,
     session_index::SessionIndex,
-    state::{ActivationLock, ApiClient},
+    state::{ActivationLock, ApiClient, ResetCreditOperations},
     storage::Store,
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
@@ -84,6 +84,7 @@ fn apply_successful_quota_snapshot(
     snapshot: &mut ProviderAccountQuota,
     data: QuotaData,
     plan_type: Option<String>,
+    reset_credits: ResetCreditSummary,
     now: i64,
 ) {
     snapshot.status = QuotaStatus::Success;
@@ -92,6 +93,7 @@ fn apply_successful_quota_snapshot(
     snapshot.fetched_at = Some(now);
     snapshot.error = None;
     snapshot.error_code = None;
+    snapshot.reset_credits = reset_credits;
     // 新额度快照的百分比不能与旧快照的金额混用；同周期旧估算也必须重新计算。
     let current_windows = estimate_window_ids(snapshot);
     snapshot.estimates.retain(|estimate| {
@@ -306,6 +308,7 @@ async fn refresh_official_quota(
                 &mut snapshot,
                 data.data,
                 data.plan_type,
+                data.reset_credits,
                 chrono::Utc::now().timestamp(),
             );
         }
@@ -336,6 +339,166 @@ async fn account_for_quota(
     } else {
         center.refresh_account(store, account_id).await
     }
+}
+
+async fn load_reset_credits(
+    store: &Store,
+    center: &AuthCenter,
+    client: &ApiClient,
+    activation: &ActivationLock,
+    account_id: &str,
+) -> Result<ResetCreditDetails, AppError> {
+    // 和整体额度快照使用同一网络锁：详情摘要仅字段级保存，避免较旧快照覆盖它。
+    let _network_guard = client.1.lock().await;
+    let account = account_for_quota(store, center, activation, account_id).await?;
+    let http = client.current()?;
+    let details = official_reset_credits::fetch_reset_credits(&http, &account)
+        .await
+        .map_err(|error| AppError::InvalidConfig(error.message))?;
+    store.save_official_account_reset_credit_summary(account_id, details.summary.clone())?;
+    Ok(details)
+}
+
+fn credit_is_usable(credit: &ResetCredit, now: i64) -> bool {
+    credit.status.as_deref() == Some("available")
+        && credit.expires_at.is_none_or(|expires_at| expires_at > now)
+}
+
+fn validate_idempotency_key(value: &str) -> Result<(), AppError> {
+    let value = value.trim();
+    if !(16..=256).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(AppError::InvalidConfig(
+            "重置卡请求标识无效；请关闭确认框后重新开始一次操作。".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn connections_get_reset_credits(
+    store: State<'_, Store>,
+    center: State<'_, AuthCenter>,
+    client: State<'_, ApiClient>,
+    activation: State<'_, ActivationLock>,
+    account_id: String,
+) -> Result<ResetCreditDetails, AppError> {
+    load_reset_credits(&store, &center, &client, &activation, &account_id).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
+pub(crate) async fn connections_consume_reset_credit(
+    store: State<'_, Store>,
+    center: State<'_, AuthCenter>,
+    client: State<'_, ApiClient>,
+    activation: State<'_, ActivationLock>,
+    operations: State<'_, ResetCreditOperations>,
+    account_id: String,
+    credit_id: String,
+    idempotency_key: String,
+) -> Result<ResetCreditConsumeResult, AppError> {
+    validate_idempotency_key(&idempotency_key)?;
+    let _operation_guard = operations.lock(&account_id).await;
+    // 先从该账号自己的服务端详情确认归属和可用性；不依据客户端传入的标题或数量。
+    let account = account_for_quota(&store, &center, &activation, &account_id).await?;
+    let before = {
+        let _network_guard = client.1.lock().await;
+        let http = client.current()?;
+        official_reset_credits::fetch_reset_credits(&http, &account)
+            .await
+            .map_err(|error| AppError::InvalidConfig(error.message))?
+    };
+    let credit = before
+        .credits
+        .iter()
+        .find(|credit| credit.id == credit_id)
+        .ok_or_else(|| {
+            AppError::InvalidConfig("重置卡不存在、已不属于该账号，或详情尚未完整提供该卡。".into())
+        })?;
+    if !credit_is_usable(credit, chrono::Utc::now().timestamp()) {
+        return Err(AppError::InvalidConfig(
+            "该重置卡已过期、正在使用、已使用或状态未知，不能再次提交。".into(),
+        ));
+    }
+    if operations.is_unknown(&account_id, &credit_id).await {
+        return Err(AppError::InvalidConfig(
+            "该重置卡此前结果未知；为避免重复消费，本会话不会再次提交。".into(),
+        ));
+    }
+    let consume_result = {
+        let _network_guard = client.1.lock().await;
+        let http = client.current()?;
+        official_reset_credits::consume_reset_credit(&http, &account, &credit_id, &idempotency_key)
+            .await
+    };
+    let outcome = match consume_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            operations.mark_unknown(&account_id, &credit_id).await;
+            return Err(AppError::InvalidConfig(error.message));
+        }
+    };
+
+    let mut refresh_errors = Vec::new();
+    if matches!(
+        outcome,
+        ResetCreditConsumeOutcome::Reset | ResetCreditConsumeOutcome::AlreadyRedeemed
+    ) {
+        match store.official_account(&account_id) {
+            Ok(account) => {
+                if let Err(error) =
+                    clear_estimates_for_current_quota(&store, &account_id, &account.quota)
+                {
+                    refresh_errors.push(format!("旧额度估算清理失败：{error}"));
+                }
+            }
+            Err(error) => refresh_errors.push(format!("旧额度估算读取失败：{error}")),
+        }
+    }
+    if outcome == ResetCreditConsumeOutcome::Unknown {
+        operations.mark_unknown(&account_id, &credit_id).await;
+    }
+
+    // 消费已由服务端确认；后续详情或额度刷新失败只能作为附带告警，不能改写消费结果。
+    let details = match load_reset_credits(&store, &center, &client, &activation, &account_id).await
+    {
+        Ok(details) => details,
+        Err(error) => {
+            refresh_errors.push(format!("重置卡详情刷新失败：{error}"));
+            ResetCreditDetails {
+                account_id: account_id.clone(),
+                summary: ResetCreditSummary::default(),
+                credits: Vec::new(),
+            }
+        }
+    };
+    let quota =
+        match refresh_official_quota(&store, &center, &client, &activation, &account_id).await {
+            Ok(quota) if quota.status == QuotaStatus::Success => Some(quota),
+            Ok(quota) => {
+                refresh_errors.push(
+                    quota
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "额度刷新未成功。".into()),
+                );
+                Some(quota)
+            }
+            Err(error) => {
+                refresh_errors.push(format!("额度刷新失败：{error}"));
+                None
+            }
+        };
+    Ok(ResetCreditConsumeResult {
+        outcome,
+        details,
+        quota,
+        refresh_error: (!refresh_errors.is_empty()).then(|| refresh_errors.join("；")),
+    })
 }
 
 #[tauri::command]
@@ -874,6 +1037,7 @@ mod tests {
                 secondary: None,
             },
             Some("plus".into()),
+            ResetCreditSummary::default(),
             42,
         );
         assert_eq!(snapshot.status, QuotaStatus::Success);

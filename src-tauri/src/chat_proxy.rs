@@ -3020,6 +3020,7 @@ mod tests {
             model: String::new(),
 
             model_context_windows: Default::default(),
+            context_window_override: None,
             available_models: Default::default(),
             selected_models: None,
             custom_models: Default::default(),

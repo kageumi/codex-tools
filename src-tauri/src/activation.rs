@@ -149,14 +149,27 @@ pub(crate) async fn sync_active_codex_configuration(
             // 本应用上次写入的第三方服务模型；只有与最近一次写入记录一致
             // 才清除（用户手动设置的模型不受影响）。
             let managed_model = managed_model_to_remove(store, &home)?;
-            codex::connections_activate_official_account_checked(
+            let applied = codex::connections_activate_official_account_checked_with_patch(
                 &home,
                 &account.credential,
                 managed_model.as_deref(),
                 || ensure_codex_stopped(store),
             )?;
+            let previous_managed_model = store.last_managed_model()?;
+            if let Err(error) =
+                ensure_active_session_repair(store, home.clone(), "openai".into()).await
+            {
+                return match manager.rollback_applied(applied) {
+                    Ok(()) => {
+                        store.save_last_managed_model(previous_managed_model)?;
+                        Err(error)
+                    }
+                    Err(rollback) => Err(AppError::Internal(format!(
+                        "{error}；Codex 配置回滚失败，请手动检查配置文件：{rollback}"
+                    ))),
+                };
+            }
             store.save_last_managed_model(None)?;
-            let _ = repair_home_after_activation(store, home, "openai".into()).await;
             return Ok(());
         }
         ActiveKind::None => return Ok(()),
@@ -193,7 +206,38 @@ pub(crate) async fn sync_active_codex_configuration(
             ))),
         };
     }
-    let _ = repair_home_after_activation(store, home, codex::MANAGED_PROVIDER_ID.into()).await;
+    if let Err(error) =
+        ensure_active_session_repair(store, home, codex::MANAGED_PROVIDER_ID.into()).await
+    {
+        let files = manager.rollback_applied(applied);
+        let managed_model = store.save_last_managed_model(previous_managed_model);
+        return match (files, managed_model) {
+            (Ok(()), Ok(())) => Err(error),
+            (files, managed_model) => Err(AppError::Internal(format!(
+                "{error}；Codex 配置回滚失败：{}",
+                files
+                    .err()
+                    .or_else(|| managed_model.err())
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "未知错误".into())
+            ))),
+        };
+    }
+    Ok(())
+}
+
+async fn ensure_active_session_repair(
+    store: &Store,
+    home: std::path::PathBuf,
+    target_provider: String,
+) -> Result<(), AppError> {
+    let repair = repair_home_after_activation(store, home, target_provider).await;
+    if !repair.repair_complete {
+        return Err(AppError::Internal(repair_incomplete_message(
+            &repair,
+            "Codex 配置同步已回滚",
+        )));
+    }
     Ok(())
 }
 
@@ -249,17 +293,32 @@ pub(crate) async fn activate_openai_record_with_paths(
         if !activation.is_current(activation_operation) {
             return Err(AppError::StaleOperation);
         }
-        if let Err(error) = codex::connections_activate_official_account_checked(
+        let previous_managed_model = store.last_managed_model()?;
+        let applied = match codex::connections_activate_official_account_checked_with_patch(
             &home,
             &account.credential,
             managed_model.as_deref(),
             || ensure_codex_stopped(store),
         ) {
-            return Err(compensate_activation_failure(store, manager, proxy, error).await);
-        }
+            Ok(applied) => applied,
+            Err(error) => {
+                return Err(compensate_activation_failure(store, manager, proxy, error).await);
+            }
+        };
         let previous_active = store.read(|state| state.active.clone())?;
         if let Err(error) = store.connections_activate_official_account(&account.id) {
-            return Err(compensate_activation_failure(store, manager, proxy, error).await);
+            return match manager.rollback_applied(applied) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(compensate_activation_failure(
+                    store,
+                    manager,
+                    proxy,
+                    AppError::Internal(format!(
+                        "{error}；Codex 配置回滚失败，请手动检查配置文件：{rollback}"
+                    )),
+                )
+                .await),
+            };
         }
         let (repair, affected_paths) = if repair_sessions {
             repair_home_after_activation_with_paths(store, home, "openai".into()).await
@@ -289,7 +348,21 @@ pub(crate) async fn activate_openai_record_with_paths(
                 )
                 .await);
             }
-            return Err(compensate_activation_failure(store, manager, proxy, rollback_error).await);
+            return match manager.rollback_applied(applied) {
+                Ok(()) => {
+                    store.save_last_managed_model(previous_managed_model)?;
+                    Err(rollback_error)
+                }
+                Err(rollback) => Err(compensate_activation_failure(
+                    store,
+                    manager,
+                    proxy,
+                    AppError::Internal(format!(
+                        "{rollback_error}；Codex 配置回滚失败，请手动检查配置文件：{rollback}"
+                    )),
+                )
+                .await),
+            };
         }
         Ok::<_, AppError>((repair, affected_paths))
     }
@@ -388,6 +461,7 @@ mod tests {
                 model: String::new(),
 
                 model_context_windows: Default::default(),
+                context_window_override: None,
                 available_models: vec!["api-model".into()],
                 selected_models: None,
                 custom_models: Default::default(),
@@ -420,6 +494,165 @@ mod tests {
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth.as_object().unwrap().len(), 1);
         assert_eq!(auth["OPENAI_API_KEY"], "secret");
+    }
+
+    #[tokio::test]
+    async fn active_provider_sync_repairs_a_legacy_relay_after_custom_to_custom_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let provider = ProviderProfile {
+            id: "provider".into(),
+            name: "Provider A".into(),
+            base_url: "https://provider-a.example.test/v1".into(),
+            headers: Default::default(),
+            timeout_secs: 30,
+            enabled: true,
+            active: false,
+            model: String::new(),
+            model_context_windows: Default::default(),
+            context_window_override: None,
+            available_models: vec!["api-model".into()],
+            selected_models: None,
+            custom_models: Default::default(),
+            models_dev_meta: Default::default(),
+            api_type: ProviderApiType::Responses,
+            api_key: Some("secret-a".into()),
+            has_api_key: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let saved = store.connections_save_provider(provider).unwrap();
+        store.activate(&saved.id).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+
+        let rollout = home.join("sessions/legacy-relay.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"legacy-relay\",\"model_provider\":\"custom\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_settings\":{\"model_provider_id\":\"codex_tools_openai_relay\"}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"keep\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut replacement = store.provider(&saved.id).unwrap();
+        replacement.name = "Provider B".into();
+        replacement.base_url = "https://provider-b.example.test/v1".into();
+        replacement.api_key = Some("secret-b".into());
+        replacement.available_models = vec!["api-model".into()];
+        store
+            .update(|state| {
+                let current = state
+                    .providers
+                    .iter_mut()
+                    .find(|provider| provider.id == saved.id)
+                    .unwrap();
+                *current = replacement;
+                Ok(())
+            })
+            .unwrap();
+
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("https://provider-b.example.test/v1"));
+        let repaired = fs::read_to_string(rollout).unwrap();
+        assert!(repaired.contains("\"model_provider_id\":\"custom\""));
+        assert!(!repaired.contains(codex::LEGACY_OPENAI_RELAY_PROVIDER_ID));
+    }
+
+    #[tokio::test]
+    async fn active_provider_sync_returns_error_and_restores_config_when_repair_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let provider = ProviderProfile {
+            id: "provider".into(),
+            name: "Provider A".into(),
+            base_url: "https://provider-a.example.test/v1".into(),
+            headers: Default::default(),
+            timeout_secs: 30,
+            enabled: true,
+            active: false,
+            model: String::new(),
+            model_context_windows: Default::default(),
+            context_window_override: None,
+            available_models: vec!["api-model".into()],
+            selected_models: None,
+            custom_models: Default::default(),
+            models_dev_meta: Default::default(),
+            api_type: ProviderApiType::Responses,
+            api_key: Some("secret-a".into()),
+            has_api_key: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let saved = store.connections_save_provider(provider).unwrap();
+        store.activate(&saved.id).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+        let config_before = fs::read_to_string(home.join("config.toml")).unwrap();
+
+        fs::write(
+            home.join("sessions/repair-failure.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"repair-failure\",\"model_provider\":\"custom\"}}\n",
+        )
+        .unwrap();
+        let state_database = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        state_database
+            .execute_batch("CREATE TABLE unknown_table(id TEXT);")
+            .unwrap();
+        drop(state_database);
+
+        let mut replacement = store.provider(&saved.id).unwrap();
+        replacement.base_url = "https://provider-b.example.test/v1".into();
+        replacement.available_models = vec!["api-model".into()];
+        store
+            .update(|state| {
+                let current = state
+                    .providers
+                    .iter_mut()
+                    .find(|provider| provider.id == saved.id)
+                    .unwrap();
+                *current = replacement;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("会话归属修复未完成"));
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            config_before
+        );
     }
 
     #[tokio::test]
@@ -803,6 +1036,7 @@ base_url = "http://127.0.0.1:1/codex-tools-installation-id/stale"
                 active: false,
                 model: String::new(),
                 model_context_windows: Default::default(),
+                context_window_override: None,
                 available_models: vec!["api-model".into()],
                 selected_models: None,
                 custom_models: Default::default(),

@@ -8,7 +8,7 @@ use crate::{
     commands::sessions::repair_home_after_activation_with_paths,
     local_usage::UsageLedger,
     models::*,
-    models_dev, provider_http, provider_sync,
+    models_dev, provider_http,
     session_index::SessionIndex,
     state::{ActivationLock, ApiClient},
     storage::{ProviderSnapshotRevision, ProviderSourceFingerprint, Store},
@@ -703,11 +703,9 @@ pub(crate) async fn connections_activate(
         }
         let home = codex::home(&store.codex_home_setting()?);
         sync_active_openai_credential(&store, &home)?;
-        // 第三方之间切换时会话归属字段已经是 "custom"，无需遍历修复；
-        // 仅当当前配置不是 MANAGED_PROVIDER_ID（如从官方账号切换过来）
-        // 时才需要修复。
-        let current_configured_provider = provider_sync::configured_provider(&home);
-        let repair_sessions = current_configured_provider != codex::MANAGED_PROVIDER_ID;
+        // 配置文件中的任意第三方 provider 都会归一为 "custom"，但旧 rollout
+        // 仍可能保留已删除的 codex_tools_openai_relay。始终调用修复引擎；
+        // 正常 custom -> custom 历史会被识别为目标路由并保持零写入。
         let preview = manager.preview_custom(&home, &provider, &target)?;
         let pending_id = crate::begin_activation(
             &ledger,
@@ -731,24 +729,12 @@ pub(crate) async fn connections_activate(
             }
             // 转换代理保持运行：Codex 会缓存配置里的地址，端口必须在本机会话内
             // 保持稳定，切回其他服务再切回来时才能继续使用同一端口。
-            let (repair, affected_paths) = if repair_sessions {
-                repair_home_after_activation_with_paths(
-                    &store,
-                    home.clone(),
-                    codex::MANAGED_PROVIDER_ID.into(),
-                )
-                .await
-            } else {
-                (
-                    RepairResult {
-                        target_provider: codex::MANAGED_PROVIDER_ID.into(),
-                        repair_complete: true,
-                        verification_passed: true,
-                        ..RepairResult::default()
-                    },
-                    Vec::new(),
-                )
-            };
+            let (repair, affected_paths) = repair_home_after_activation_with_paths(
+                &store,
+                home.clone(),
+                codex::MANAGED_PROVIDER_ID.into(),
+            )
+            .await;
             // 会话归属修复必须整体完成才算切换成功：任一会话未修复都回滚激活
             // 状态与 Codex 配置，绝不返回部分成功。修复失败时会话文件已由修复
             // 路径整体回滚，因此恢复原激活状态后回滚配置即可回到切换前的连接。
@@ -814,6 +800,7 @@ mod tests {
             active: false,
             model: String::new(),
             model_context_windows: BTreeMap::new(),
+            context_window_override: None,
             available_models: vec![model.into()],
             selected_models: None,
             custom_models: Default::default(),
@@ -938,6 +925,65 @@ mod tests {
             .filter_map(|model| model["slug"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(slugs, vec!["model-a", "model-b"]);
+        assert!(store.is_active_provider("provider").unwrap());
+    }
+
+    #[tokio::test]
+    async fn active_provider_context_override_resyncs_catalog_and_clears_to_automatic() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let mut initial = provider("provider", "https://provider.example.test/v1", "model-a");
+        initial.available_models = vec!["model-a".into(), "model-b".into()];
+        initial.model_context_windows =
+            BTreeMap::from([("model-a".into(), 128_000), ("model-b".into(), 256_000)]);
+        initial.context_window_override = Some(1_000_000);
+        let saved = store.connections_save_provider(initial).unwrap();
+        store.activate(&saved.id).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+
+        let catalog_path = home
+            .join(crate::model_unlock::MODEL_CATALOG_DIR)
+            .join(crate::model_unlock::MODEL_CATALOG_FILE);
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+        for model in catalog["models"].as_array().unwrap() {
+            assert_eq!(model["context_window"], 1_000_000);
+            assert_eq!(model["max_context_window"], 1_000_000);
+        }
+
+        let mut cleared = store.provider(&saved.id).unwrap();
+        cleared.context_window_override = None;
+        store.connections_save_provider(cleared).unwrap();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(catalog_path).unwrap()).unwrap();
+        let windows = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| {
+                (
+                    model["slug"].as_str().unwrap(),
+                    model["context_window"].as_u64(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(windows["model-a"], Some(128_000));
+        assert_eq!(windows["model-b"], Some(256_000));
         assert!(store.is_active_provider("provider").unwrap());
     }
 

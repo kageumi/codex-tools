@@ -12,6 +12,7 @@ mod models_dev;
 mod network;
 mod official_pricing;
 mod official_quota;
+mod official_reset_credits;
 mod platform;
 mod pricing;
 mod provider_http;
@@ -30,7 +31,7 @@ use codex::ConfigManager;
 use local_usage::UsageLedger;
 use models::*;
 use session_index::SessionIndex;
-use state::{ActivationLock, ApiClient};
+use state::{ActivationLock, ApiClient, ResetCreditOperations};
 use std::time::Duration;
 use storage::Store;
 use tauri::menu::{Menu, MenuItem};
@@ -211,6 +212,7 @@ pub fn run() {
         .manage(ConfigManager::default())
         .manage(ActivationLock::default())
         .manage(ApiClient::default())
+        .manage(ResetCreditOperations::default())
         .manage(ChatProxyRegistry::default())
         .manage(SessionIndex::default())
         .setup(|app| {
@@ -280,6 +282,8 @@ pub fn run() {
             commands::official_accounts::connections_refresh_quota,
             commands::official_accounts::connections_estimate_quota,
             commands::official_accounts::connections_refresh_all_quota,
+            commands::official_accounts::connections_get_reset_credits,
+            commands::official_accounts::connections_consume_reset_credit,
             commands::providers::settings_preview_activation,
             commands::providers::settings_apply_activation,
             commands::providers::connections_activate,

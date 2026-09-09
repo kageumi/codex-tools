@@ -14,6 +14,9 @@ import {
   credentialRefreshText,
   loginVerificationText,
   effectiveModelsOf,
+  contextWindowOverrideInputOf,
+  contextWindowOverrideEditorSessionOf,
+  isValidContextWindowOverride,
   noModelsSelected,
   providerSaveInputOf,
   removeCustomModelFrom,
@@ -104,6 +107,7 @@ describe("providerSaveInputOf", () => {
     )
     expect(input.selectedModels).toBeNull()
     expect(input.customModels).toEqual([])
+    expect(input.contextWindowOverride).toBeNull()
   })
 
   it("保留显式模型子集", () => {
@@ -115,6 +119,41 @@ describe("providerSaveInputOf", () => {
         })
       ).selectedModels
     ).toEqual(["b"])
+  })
+
+  it("保留服务级上下文窗口覆盖", () => {
+    expect(
+      providerSaveInputOf(makeProvider({ contextWindowOverride: 262_144 }))
+        .contextWindowOverride
+    ).toBe(262_144)
+  })
+})
+
+describe("contextWindowOverrideInputOf", () => {
+  it("留空恢复自动匹配，正整数转换为 token", () => {
+    expect(contextWindowOverrideInputOf("  ")).toBeNull()
+    expect(contextWindowOverrideInputOf("262144")).toBe(262_144)
+  })
+
+  it("拒绝零、负数、小数和超过安全整数的输入", () => {
+    expect(isValidContextWindowOverride("0")).toBe(false)
+    expect(isValidContextWindowOverride("-1")).toBe(false)
+    expect(isValidContextWindowOverride("1.5")).toBe(false)
+    expect(isValidContextWindowOverride("9007199254740992")).toBe(false)
+    expect(isValidContextWindowOverride("128000")).toBe(true)
+  })
+
+  it("同一 API 重新打开编辑器时创建新会话并从已保存值回填", () => {
+    const provider = makeProvider({
+      id: "same-provider",
+      contextWindowOverride: 262_144,
+    })
+    expect(contextWindowOverrideEditorSessionOf(provider, false)).not.toBe(
+      contextWindowOverrideEditorSessionOf(provider, true)
+    )
+    expect(contextWindowOverrideInputOf("262144")).toBe(
+      provider.contextWindowOverride
+    )
   })
 })
 

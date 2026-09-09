@@ -403,12 +403,12 @@ pub fn connections_activate_official_account(
     apply_official_account_patch(patch)
 }
 
-pub(crate) fn connections_activate_official_account_checked(
+pub(crate) fn connections_activate_official_account_checked_with_patch(
     codex_home: &Path,
     credential: &CodexAuthCredential,
     managed_model: Option<&str>,
     check_before_write: impl FnOnce() -> Result<(), AppError>,
-) -> Result<(), AppError> {
+) -> Result<AppliedConfigPatch, AppError> {
     let patch = prepare_official_account_patch(codex_home, credential, managed_model)?;
     apply_official_account_patch_checked(patch, check_before_write)
 }
@@ -466,13 +466,13 @@ fn prepare_official_account_patch(
 
 #[cfg(test)]
 fn apply_official_account_patch(patch: OfficialAccountPatch) -> Result<(), AppError> {
-    apply_official_account_patch_checked(patch, || Ok(()))
+    apply_official_account_patch_checked(patch, || Ok(())).map(|_| ())
 }
 
 fn apply_official_account_patch_checked(
     patch: OfficialAccountPatch,
     check_before_write: impl FnOnce() -> Result<(), AppError>,
-) -> Result<(), AppError> {
+) -> Result<AppliedConfigPatch, AppError> {
     let current = CodexFilesSnapshot {
         config: OptionalFileSnapshot::capture(
             patch.original.config.path.clone(),
@@ -505,7 +505,9 @@ fn apply_official_account_patch_checked(
         |path, bytes| atomic_write(path, bytes).map_err(AppError::from),
     );
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(AppliedConfigPatch {
+            original: patch.original,
+        }),
         Err(error) => match restore_codex_files(&patch.original) {
             Ok(()) => Err(error),
             Err(rollback) => Err(AppError::Internal(format!(
@@ -1023,6 +1025,7 @@ mod tests {
             model: String::new(),
 
             model_context_windows: Default::default(),
+            context_window_override: None,
             available_models: vec!["api-model".into()],
             selected_models: None,
             custom_models: Default::default(),
@@ -1319,6 +1322,7 @@ private_setting = "must-also-not-enter-webview"
             model: String::new(),
 
             model_context_windows: Default::default(),
+            context_window_override: None,
             available_models: vec!["deepseek-chat".into()],
             selected_models: None,
             custom_models: Default::default(),

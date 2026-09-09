@@ -71,6 +71,7 @@ import {
   ProviderEditorDialog,
 } from "./provider-editor-dialog"
 import { displayQuotaWindows } from "./quota-estimate"
+import { resetCreditCountText } from "./reset-credits"
 
 type ConnectionPage = "dashboard" | "providers"
 
@@ -125,6 +126,10 @@ function AccountConnectionDetails({
             </span>
           </>
         )}
+        <>
+          <span aria-hidden="true">·</span>
+          <span>{resetCreditCountText(account)}</span>
+        </>
       </div>
 
       {quotaWindows.length ? (

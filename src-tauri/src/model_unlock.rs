@@ -165,12 +165,14 @@ fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
             continue;
         }
         let meta = provider.models_dev_meta.get(slug);
-        let context_window = provider
-            .model_context_windows
-            .get(slug)
-            .copied()
-            .or_else(|| meta.and_then(|meta| meta.context_window))
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let context_window = provider.context_window_override.unwrap_or_else(|| {
+            provider
+                .model_context_windows
+                .get(slug)
+                .copied()
+                .or_else(|| meta.and_then(|meta| meta.context_window))
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+        });
         let display_name = meta
             .and_then(|meta| meta.name.clone())
             .filter(|name| !name.trim().is_empty())
@@ -900,6 +902,7 @@ mod tests {
             active: false,
             model: model.into(),
             model_context_windows: Default::default(),
+            context_window_override: None,
             available_models: if model.trim().is_empty() {
                 Vec::new()
             } else {
@@ -1100,6 +1103,28 @@ mod tests {
         let catalog = build_model_catalog_with_windows_for_provider(&provider);
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn provider_catalog_context_window_override_wins_for_every_model() {
+        let mut provider = provider_with_models("provider", "model-a", &["model-a", "model-b"]);
+        provider.model_context_windows =
+            BTreeMap::from([("model-a".into(), 128_000), ("model-b".into(), 256_000)]);
+        provider.models_dev_meta = BTreeMap::from([(
+            "model-b".into(),
+            crate::models::ProviderModelsDevMeta {
+                context_window: Some(512_000),
+                ..Default::default()
+            },
+        )]);
+        provider.context_window_override = Some(1_000_000);
+
+        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        assert_eq!(catalog.len(), 2);
+        for model in catalog {
+            assert_eq!(model.context_window, Some(1_000_000));
+            assert_eq!(model.max_context_window, Some(1_000_000));
+        }
     }
 
     #[test]

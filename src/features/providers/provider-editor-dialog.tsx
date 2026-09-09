@@ -33,6 +33,9 @@ import {
   addCustomModelTo,
   allModelsSelected,
   effectiveModelsOf,
+  contextWindowOverrideInputOf,
+  contextWindowOverrideEditorSessionOf,
+  isValidContextWindowOverride,
   providerSaveInputOf,
   removeCustomModelFrom,
   toggleModelSelected,
@@ -67,13 +70,7 @@ export function cloneProviderForEditing(provider: Provider): Provider {
   }
 }
 
-export function ProviderEditorDialog({
-  open,
-  onOpenChange,
-  provider,
-  onProviderChange,
-  onSaved,
-}: {
+type ProviderEditorDialogProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
   provider: Provider
@@ -81,20 +78,53 @@ export function ProviderEditorDialog({
     provider: Provider | ((prev: Provider) => Provider)
   ) => void
   onSaved: (provider: Provider) => void
-}) {
+}
+
+export function ProviderEditorDialog(props: ProviderEditorDialogProps) {
+  return (
+    <ProviderEditorDialogContent
+      key={contextWindowOverrideEditorSessionOf(props.provider, props.open)}
+      {...props}
+    />
+  )
+}
+
+function ProviderEditorDialogContent({
+  open,
+  onOpenChange,
+  provider,
+  onProviderChange,
+  onSaved,
+}: ProviderEditorDialogProps) {
   const [saving, setSaving] = useState(false)
   const [modelSearch, setModelSearch] = useState("")
   const [customModelDraft, setCustomModelDraft] = useState("")
+  const [contextWindowOverrideDraft, setContextWindowOverrideDraft] = useState(
+    () => provider.contextWindowOverride?.toString() ?? ""
+  )
 
   // 基于最新 prev 一次合并多个字段，避免渲染快照闭包与 React 批处理下的覆盖。
   const patch = (partial: Partial<Provider>) =>
     onProviderChange((prev) => ({ ...prev, ...partial }))
 
   const save = async () => {
+    if (!isValidContextWindowOverride(contextWindowOverrideDraft)) {
+      toast.add({
+        title: "上下文窗口无效",
+        description: "请输入大于 0 的整数 token。",
+        type: "error",
+      })
+      return
+    }
     setSaving(true)
     try {
       const saved = await call("connections_save_provider", {
-        provider: providerSaveInputOf(provider),
+        provider: {
+          ...providerSaveInputOf(provider),
+          contextWindowOverride: contextWindowOverrideInputOf(
+            contextWindowOverrideDraft
+          ),
+        },
       })
       toast.add({ title: "API 服务已保存", type: "success" })
       onSaved(saved)
@@ -222,6 +252,25 @@ export function ProviderEditorDialog({
                   </SelectGroup>
                 </SelectContent>
               </Select>
+            </Field>
+            <Field data-disabled={saving}>
+              <FieldLabel htmlFor="provider-context-window-override">
+                自定义上下文窗口（token，可选）
+              </FieldLabel>
+              <Input
+                id="provider-context-window-override"
+                type="text"
+                inputMode="numeric"
+                placeholder="留空以自动匹配"
+                value={contextWindowOverrideDraft}
+                disabled={saving}
+                onChange={(event) =>
+                  setContextWindowOverrideDraft(event.target.value)
+                }
+              />
+              <div className="text-xs text-muted-foreground">
+                应用于该 API 的所有模型；留空则自动匹配上下文窗口。
+              </div>
             </Field>
             <Field data-disabled={saving}>
               <FieldLabel>写入 Codex 的模型</FieldLabel>

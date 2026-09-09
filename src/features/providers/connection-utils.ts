@@ -39,8 +39,36 @@ export function providerSaveInputOf(provider: Provider): ProviderSaveInput {
     apiType: provider.apiType,
     selectedModels: provider.selectedModels ?? null,
     customModels: provider.customModels ?? [],
+    contextWindowOverride: provider.contextWindowOverride ?? null,
     apiKey: provider.apiKey,
   }
+}
+
+/** 输入框只接受正整数 token；留空表示恢复当前服务的自动匹配。 */
+export function isValidContextWindowOverride(value: string) {
+  const trimmed = value.trim()
+  return (
+    !trimmed ||
+    (/^[1-9]\d*$/.test(trimmed) && Number.isSafeInteger(Number(trimmed)))
+  )
+}
+
+export function contextWindowOverrideInputOf(value: string): number | null {
+  const trimmed = value.trim()
+  return trimmed ? Number(trimmed) : null
+}
+
+/** 常驻编辑器每次打开或切换服务时用于重置未保存输入的会话标识。 */
+export function contextWindowOverrideEditorSessionOf(
+  provider: Provider,
+  open: boolean
+) {
+  return [
+    open ? "open" : "closed",
+    provider.id,
+    provider.updatedAt,
+    provider.contextWindowOverride ?? "automatic",
+  ].join("\u0000")
 }
 
 /** 有效模型 = /models 同步模型 ∪ 自定义模型（保序去重）。 */

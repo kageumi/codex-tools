@@ -440,6 +440,7 @@ mod tests {
                 model: "gpt-5.6-luna".into(),
 
                 model_context_windows: Default::default(),
+                context_window_override: None,
                 available_models: Default::default(),
                 selected_models: None,
                 custom_models: Default::default(),

@@ -22,6 +22,7 @@ import {
   ItemContent,
   ItemDescription,
   ItemFooter,
+  ItemHeader,
   ItemMedia,
   ItemTitle,
 } from "@/components/ui/item"
@@ -92,23 +93,33 @@ export const ConnectionItem = memo(function ConnectionItem({
     <Item
       size="sm"
       variant={active || selected ? "muted" : "outline"}
+      className="items-start"
       aria-label={`${kind === "account" ? "账号" : "API 服务"} ${name}`}
     >
-      {kind === "provider" && (
-        <ItemMedia variant="icon">
-          <HugeiconsIcon icon={ApiIcon} />
-        </ItemMedia>
-      )}
-      <ItemContent title={description}>
+      <ItemHeader className="min-h-5 items-start">
+        {kind === "provider" && (
+          <ItemMedia variant="icon">
+            <HugeiconsIcon icon={ApiIcon} />
+          </ItemMedia>
+        )}
         <ItemTitle
           className={
             kind === "account"
-              ? "line-clamp-none w-full break-words whitespace-normal"
-              : "w-full"
+              ? "line-clamp-none min-w-0 flex-1 break-words whitespace-normal"
+              : "min-w-0 flex-1"
           }
         >
           {name}
         </ItemTitle>
+        <ItemActions className="max-w-[45%] flex-wrap justify-end gap-1 self-start">
+          {active && <Badge>当前</Badge>}
+          {selected && <Badge variant="secondary">已选</Badge>}
+          {unavailable && (
+            <Badge variant="destructive">{unavailableLabel}</Badge>
+          )}
+        </ItemActions>
+      </ItemHeader>
+      <ItemContent title={description} className="basis-full">
         {details ? (
           <>
             <div
@@ -123,13 +134,8 @@ export const ConnectionItem = memo(function ConnectionItem({
           <ItemDescription>{description}</ItemDescription>
         )}
       </ItemContent>
-      <ItemActions className="max-w-full flex-wrap justify-end gap-1 self-start">
-        {active && <Badge>当前</Badge>}
-        {selected && <Badge variant="secondary">已选</Badge>}
-        {unavailable && <Badge variant="destructive">{unavailableLabel}</Badge>}
-      </ItemActions>
       <ItemFooter className="justify-end gap-1.5">
-        {canView && !selected && (
+        {canView && !selected ? (
           <Button
             type="button"
             size="xs"
@@ -140,6 +146,11 @@ export const ConnectionItem = memo(function ConnectionItem({
           >
             查看
           </Button>
+        ) : (
+          <span
+            aria-hidden="true"
+            className="mr-auto inline-flex h-6 min-w-8"
+          />
         )}
         <Button
           type="button"

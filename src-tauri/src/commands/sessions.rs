@@ -278,6 +278,16 @@ mod tests {
             .unwrap();
         let repair = repair_home_after_activation(&store, home.clone(), "custom".into()).await;
 
+        assert!(
+            repair.repair_complete,
+            "等长切换不应因历史预检产生不完整修复：{:?}",
+            repair.warnings
+        );
+        assert!(
+            repair.warnings.is_empty(),
+            "等长切换不应读取或干预不相关 projection：{:?}",
+            repair.warnings
+        );
         assert_eq!(repair.files_scanned, 2);
         assert_eq!(repair.files_modified, 2);
         assert_eq!(repair.session_meta_updated, 2);
@@ -326,18 +336,22 @@ mod tests {
         let sessions = home.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
-        let rollout = sessions.join("one.jsonl");
-        let rollout_before = concat!(
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"one\",\"model_provider\":\"openai\",\"history_mode\":\"paginated\"}}\n",
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n",
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"keep\"}}\n"
+        let id = "00000000-0000-7000-8000-0000000000ad";
+        let rollout = sessions.join(format!("rollout-2026-09-05T12-00-00-{id}.jsonl"));
+        let rollout_before = format!(
+            concat!(
+                "{{\"timestamp\":\"2026-09-05T12:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"model_provider\":\"codex_tools_openai_relay\",\"history_mode\":\"paginated\"}}}}\n",
+                "{{\"timestamp\":\"2026-09-05T12:00:00.000Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}}}\n",
+                "{{\"timestamp\":\"2026-09-05T12:00:00.000Z\",\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"keep\"}}}}\n"
+            ),
+            id
         );
-        fs::write(&rollout, rollout_before).unwrap();
+        fs::write(&rollout, &rollout_before).unwrap();
 
         let state = home.join("state_5.sqlite");
         let database = Connection::open(&state).unwrap();
         database
-            .execute_batch(
+            .execute_batch(&format!(
                 "CREATE TABLE threads(
                      id TEXT PRIMARY KEY,
                      model_provider TEXT,
@@ -345,11 +359,10 @@ mod tests {
                      archived INTEGER,
                      source TEXT
                  );
-                 INSERT INTO threads VALUES('one','openai','paginated',0,NULL);",
-            )
+                INSERT INTO threads VALUES('{id}','codex_tools_openai_relay','paginated',0,NULL);",
+            ))
             .unwrap();
         drop(database);
-        let state_before = fs::read(&state).unwrap();
 
         let history = home.join("thread_history_1.sqlite");
         let database = Connection::open(&history).unwrap();
@@ -375,7 +388,6 @@ mod tests {
             )
             .unwrap();
         drop(database);
-        let history_before = fs::read(&history).unwrap();
 
         let app = temp.path().join("Custom/Codex.exe");
         fs::create_dir_all(app.parent().unwrap()).unwrap();
@@ -396,7 +408,26 @@ mod tests {
             repair.warnings
         );
         assert_eq!(fs::read_to_string(&rollout).unwrap(), rollout_before);
-        assert_eq!(fs::read(&state).unwrap(), state_before);
-        assert_eq!(fs::read(&history).unwrap(), history_before);
+        for database_path in [&state, &history] {
+            let database = Connection::open_with_flags(
+                database_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            let integrity: String = database
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+        }
+        let provider: String = Connection::open(&state)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "codex_tools_openai_relay");
     }
 }

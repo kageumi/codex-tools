@@ -13,6 +13,9 @@ import type {
   ProviderOverview,
   ProviderSaveInput,
   ProviderTestResult,
+  ResetCredit,
+  ResetCreditConsumeResult,
+  ResetCreditDetails,
   RepairResult,
   RepairScan,
   Session,
@@ -52,6 +55,40 @@ const mockQuota: AccountQuota = {
       },
     }),
   },
+  resetCredits: { availableCount: 4, detailsStatus: "partial" },
+}
+
+const mockResetCredits: Record<string, ResetCredit[]> = {
+  "account-work": [
+    {
+      id: "work-early",
+      title: "优先重置卡",
+      status: "available",
+      expiresAt: Math.floor((now + day) / 1000),
+      description: "演示可用重置卡",
+    },
+    {
+      id: "work-no-expiry",
+      resetType: "rate_limit",
+      status: "available",
+      expiresAt: undefined,
+    },
+    {
+      id: "work-redeemed",
+      title: "已使用卡",
+      status: "redeemed",
+      expiresAt: Math.floor((now + 2 * day) / 1000),
+    },
+    {
+      id: "work-expired",
+      title: "已过期卡",
+      status: "expired",
+      expiresAt: Math.floor((now - day) / 1000),
+    },
+  ],
+  "account-personal": [
+    { id: "personal-available", title: "个人重置卡", status: "available" },
+  ],
 }
 
 const mockProviders: Provider[] = [
@@ -176,7 +213,10 @@ const mockAccounts: OfficialAccountView[] = [
     source: "open_ai_oauth",
     expiresAt: null,
     credentialRefresh: { status: "managed_by_codex" },
-    quota: { status: "never" },
+    quota: {
+      status: "never",
+      resetCredits: { availableCount: 1, detailsStatus: "complete" },
+    },
     active: false,
     createdAt: now - 50 * day,
     updatedAt: now - 4 * day,
@@ -587,6 +627,57 @@ export async function mockCall(
       if (account) account.quota = refreshedQuota
       return refreshedQuota
     }
+    case "connections_get_reset_credits": {
+      const { accountId } = args as { accountId: string }
+      const account = mockAccounts.find(
+        (candidate) => candidate.id === accountId
+      )
+      if (!account) throw new Error(`账号不存在：${accountId}`)
+      const credits = [...(mockResetCredits[accountId] ?? [])]
+      const summary = account.quota.resetCredits ?? {
+        availableCount: undefined,
+        detailsStatus: "unknown" as const,
+      }
+      return { accountId, summary, credits } satisfies ResetCreditDetails
+    }
+    case "connections_consume_reset_credit": {
+      const { accountId, creditId } = args as {
+        accountId: string
+        creditId: string
+        idempotencyKey: string
+      }
+      const account = mockAccounts.find(
+        (candidate) => candidate.id === accountId
+      )
+      const credit = mockResetCredits[accountId]?.find(
+        (candidate) => candidate.id === creditId
+      )
+      if (!account || !credit || credit.status !== "available") {
+        throw new Error("重置卡不可用或不属于该账号。")
+      }
+      credit.status = "redeemed"
+      const previous = account.quota.resetCredits?.availableCount
+      const resetCredits = {
+        availableCount:
+          previous == null ? undefined : Math.max(0, previous - 1),
+        detailsStatus: "partial" as const,
+      }
+      account.quota = {
+        ...account.quota,
+        estimates: [],
+        resetCredits,
+      }
+      const details = {
+        accountId,
+        summary: resetCredits,
+        credits: [...(mockResetCredits[accountId] ?? [])],
+      } satisfies ResetCreditDetails
+      return {
+        outcome: "reset",
+        details,
+        quota: account.quota,
+      } satisfies ResetCreditConsumeResult
+    }
     case "connections_estimate_quota": {
       const { accountId } = args as { accountId: string }
       const account = mockAccounts.find(
@@ -754,6 +845,7 @@ export async function mockCall(
         ],
         selectedModels:
           selectedModels === undefined ? undefined : [...selectedModels],
+        contextWindowOverride: provider.contextWindowOverride ?? undefined,
         createdAt: existing?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
       }

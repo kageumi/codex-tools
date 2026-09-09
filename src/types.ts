@@ -14,6 +14,8 @@ export type Provider = {
   apiType: "responses" | "chat"
   /** 从服务 /models 接口读取的模型上下文窗口（token），写入模型目录时优先使用 */
   modelContextWindows?: Record<string, number>
+  /** 当前服务全部模型统一使用的手动上下文窗口；未设置时自动匹配。 */
+  contextWindowOverride?: number | null
   /** 服务 /models 接口返回的可用模型列表（保存服务时静默获取） */
   availableModels?: string[]
   /** 用户手动添加的自定义模型 id；与 availableModels 一起构成有效模型 */
@@ -42,6 +44,8 @@ export type ProviderSaveInput = Pick<
 > & {
   /** null 表示清除旧筛选并默认使用全部有效模型。 */
   selectedModels: string[] | null
+  /** null 表示清除手动覆盖并恢复自动上下文窗口匹配。 */
+  contextWindowOverride?: number | null
 }
 
 export type Dashboard = {
@@ -243,6 +247,46 @@ export type AccountQuota = {
   error?: string
   errorCode?: string
   estimates?: QuotaEstimate[]
+  resetCredits?: ResetCreditSummary
+}
+
+export type ResetCreditDetailsStatus = "unknown" | "complete" | "partial"
+
+export type ResetCreditSummary = {
+  /** 服务端没有提供时为 undefined，绝不能按 0 张展示。 */
+  availableCount?: number | null
+  detailsStatus: ResetCreditDetailsStatus
+}
+
+export type ResetCredit = {
+  id: string
+  resetType?: string | null
+  status?: string | null
+  grantedAt?: number | null
+  expiresAt?: number | null
+  title?: string | null
+  description?: string | null
+}
+
+export type ResetCreditDetails = {
+  accountId: string
+  summary: ResetCreditSummary
+  credits: ResetCredit[]
+}
+
+export type ResetCreditConsumeOutcome =
+  | "reset"
+  | "already_redeemed"
+  | "nothing_to_reset"
+  | "no_credit"
+  | "failed"
+  | "unknown"
+
+export type ResetCreditConsumeResult = {
+  outcome: ResetCreditConsumeOutcome
+  details: ResetCreditDetails
+  quota?: AccountQuota
+  refreshError?: string
 }
 
 export type QuotaEstimate = {

@@ -998,6 +998,25 @@ impl Store {
         })
     }
 
+    /// 详情请求只更新重置卡摘要，不能用一个较旧的完整额度快照覆盖其它字段。
+    pub fn save_official_account_reset_credit_summary(
+        &self,
+        id: &str,
+        summary: ResetCreditSummary,
+    ) -> Result<(), AppError> {
+        self.update(|state| {
+            let account = state
+                .official_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
+                })?;
+            account.quota.reset_credits = summary;
+            Ok(())
+        })
+    }
+
     /// 仅在某个窗口成功通过完整性门禁后更新该窗口；其它窗口和旧成功结论保持不变。
     pub fn save_official_account_quota_estimates(
         &self,
@@ -1673,6 +1692,9 @@ fn merge_account_quota(
     if merged.error_code.is_none() {
         merged.error_code = older.error_code.clone();
     }
+    if merged.reset_credits.available_count.is_none() {
+        merged.reset_credits = older.reset_credits.clone();
+    }
     merged.fetched_at = max_optional_timestamp(current.fetched_at, legacy.fetched_at);
     merged.last_attempt_at =
         max_optional_timestamp(current.last_attempt_at, legacy.last_attempt_at);
@@ -1720,6 +1742,7 @@ fn quota_is_meaningful(quota: &ProviderAccountQuota) -> bool {
         || quota.error.is_some()
         || quota.error_code.is_some()
         || !quota.estimates.is_empty()
+        || quota.reset_credits.available_count.is_some()
 }
 
 fn max_optional_timestamp(left: Option<i64>, right: Option<i64>) -> Option<i64> {
@@ -2153,6 +2176,7 @@ mod tests {
             model: String::new(),
 
             model_context_windows: Default::default(),
+            context_window_override: None,
             available_models: Default::default(),
             selected_models: None,
             custom_models: Default::default(),
@@ -3128,6 +3152,7 @@ mod tests {
                     model: String::new(),
 
                     model_context_windows: Default::default(),
+                    context_window_override: None,
                     available_models: Default::default(),
                     selected_models: None,
                     custom_models: Default::default(),
@@ -3527,6 +3552,56 @@ mod tests {
         assert_eq!(
             current.selected_models,
             Some(vec!["api-model".into(), "custom-keep".into()])
+        );
+    }
+
+    #[test]
+    fn refresh_models_preserves_context_window_override_and_providers_are_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut first = provider("context-first");
+        first.context_window_override = Some(262_144);
+        let first = store.connections_save_provider(first).unwrap();
+        let source = ProviderSourceFingerprint::from_provider(&first);
+        let mut second = provider("context-second");
+        second.context_window_override = Some(65_536);
+        store.connections_save_provider(second).unwrap();
+
+        store
+            .update_provider_models_if_source_matches(
+                &first.id,
+                &source,
+                None,
+                vec!["new-model".into()],
+                BTreeMap::from([("new-model".into(), 128_000)]),
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.provider(&first.id).unwrap().context_window_override,
+            Some(262_144)
+        );
+        assert_eq!(
+            store
+                .provider("context-second")
+                .unwrap()
+                .context_window_override,
+            Some(65_536)
+        );
+
+        let mut cleared = store.provider(&first.id).unwrap();
+        cleared.context_window_override = None;
+        let cleared = store.connections_save_provider(cleared).unwrap();
+        assert_eq!(cleared.context_window_override, None);
+        drop(store);
+        assert_eq!(
+            Store::open(temp.path().to_path_buf())
+                .unwrap()
+                .provider(&first.id)
+                .unwrap()
+                .context_window_override,
+            None
         );
     }
 

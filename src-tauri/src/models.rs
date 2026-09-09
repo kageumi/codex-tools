@@ -12,6 +12,7 @@ pub(crate) const MAX_CREDENTIAL_CHARS: usize = 262_144;
 const MAX_API_URL_CHARS: usize = 2_048;
 const MAX_API_KEY_CHARS: usize = 65_536;
 const MAX_MODEL_ID_CHARS: usize = 512;
+const MAX_CONTEXT_WINDOW_OVERRIDE: u64 = 9_007_199_254_740_991;
 const MAX_CUSTOM_HEADERS: usize = 64;
 const MAX_HEADER_NAME_CHARS: usize = 256;
 const MAX_HEADER_VALUE_CHARS: usize = 8_192;
@@ -258,6 +259,10 @@ pub struct ProviderProfile {
     /// 写入模型目录时优先使用，没有返回时回退 Codex 默认值。
     #[serde(default)]
     pub model_context_windows: BTreeMap<String, u64>,
+    /// 用户为当前服务手动指定的统一上下文窗口（token）。为空时继续使用
+    /// `/models`、models.dev 和默认值组成的自动匹配链。
+    #[serde(default)]
+    pub context_window_override: Option<u64>,
     /// 服务 `/models` 接口返回的可用模型列表（保存服务时静默获取，用户无感知）；
     /// 只保存接口实际返回的模型 id，是模型目录的唯一来源。
     #[serde(default)]
@@ -313,6 +318,9 @@ pub struct ProviderSaveInput {
     /// 用户手动添加的自定义模型 id；随保存提交，刷新 /models 时不会被清空。
     #[serde(default)]
     pub custom_models: Option<Vec<String>>,
+    /// 用户为当前服务显式指定的统一上下文窗口；`null`/缺省表示自动匹配。
+    #[serde(default)]
+    pub context_window_override: Option<u64>,
 }
 
 impl From<ProviderSaveInput> for ProviderProfile {
@@ -327,6 +335,7 @@ impl From<ProviderSaveInput> for ProviderProfile {
             active: false,
             model: String::new(),
             model_context_windows: BTreeMap::new(),
+            context_window_override: input.context_window_override,
             available_models: Vec::new(),
             selected_models: input.selected_models,
             custom_models: input.custom_models.unwrap_or_default(),
@@ -389,6 +398,14 @@ impl ProviderProfile {
             ));
         }
         self.timeout_secs = self.timeout_secs.clamp(1, 600);
+        if self
+            .context_window_override
+            .is_some_and(|window| window == 0 || window > MAX_CONTEXT_WINDOW_OVERRIDE)
+        {
+            return Err(AppError::InvalidConfig(
+                "上下文窗口必须是 1 到 9,007,199,254,740,991 之间的整数 token。".into(),
+            ));
+        }
         validate_headers(&self.headers)?;
         self.custom_models = Self::normalize_custom_models(
             std::mem::take(&mut self.custom_models),
@@ -536,6 +553,67 @@ pub struct ProviderAccountQuota {
     pub error_code: Option<String>,
     #[serde(default)]
     pub estimates: Vec<QuotaEstimate>,
+    /// OpenAI 额度接口返回的重置卡摘要。`None` 表示旧数据或服务没有提供，不能当作 0 张。
+    #[serde(default)]
+    pub reset_credits: ResetCreditSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetCreditDetailsStatus {
+    #[default]
+    Unknown,
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCreditSummary {
+    /// 服务端摘要的权威数量；缺失时必须保留未知状态。
+    pub available_count: Option<u32>,
+    #[serde(default)]
+    pub details_status: ResetCreditDetailsStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCredit {
+    pub id: String,
+    pub reset_type: Option<String>,
+    pub status: Option<String>,
+    pub granted_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCreditDetails {
+    pub account_id: String,
+    pub summary: ResetCreditSummary,
+    pub credits: Vec<ResetCredit>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetCreditConsumeOutcome {
+    Reset,
+    AlreadyRedeemed,
+    NothingToReset,
+    NoCredit,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCreditConsumeResult {
+    pub outcome: ResetCreditConsumeOutcome,
+    pub details: ResetCreditDetails,
+    pub quota: Option<ProviderAccountQuota>,
+    pub refresh_error: Option<String>,
 }
 
 /// 本机依据已记录用量推算出的额度金额。它不是 OpenAI 返回的账单数据，
@@ -1599,6 +1677,7 @@ mod tests {
             "model": "injected-model",
             "availableModels": ["injected-model"],
             "modelContextWindows": {"injected-model": 999999},
+            "contextWindowOverride": 262144,
             "modelsDevMeta": {"injected-model": {"name": "Injected"}},
             "active": true,
             "hasApiKey": true,
@@ -1612,6 +1691,7 @@ mod tests {
         assert!(profile.model.is_empty());
         assert!(profile.available_models.is_empty());
         assert!(profile.model_context_windows.is_empty());
+        assert_eq!(profile.context_window_override, Some(262_144));
         assert!(profile.models_dev_meta.is_empty());
         assert!(!profile.active);
         assert!(!profile.has_api_key);
@@ -1633,6 +1713,7 @@ mod tests {
             model: String::new(),
 
             model_context_windows: Default::default(),
+            context_window_override: None,
             available_models: Default::default(),
             selected_models: None,
             custom_models: Default::default(),
@@ -1681,6 +1762,22 @@ mod tests {
     }
 
     #[test]
+    fn provider_context_window_override_must_be_positive() {
+        let mut provider: ProviderProfile = serde_json::from_value(serde_json::json!({
+            "name": "provider",
+            "baseUrl": "https://example.test/v1",
+            "contextWindowOverride": 0
+        }))
+        .unwrap();
+        assert!(provider.normalize_and_validate().is_err());
+
+        provider.context_window_override = Some(128_000);
+        assert!(provider.normalize_and_validate().is_ok());
+        provider.context_window_override = Some(MAX_CONTEXT_WINDOW_OVERRIDE + 1);
+        assert!(provider.normalize_and_validate().is_err());
+    }
+
+    #[test]
     fn provider_and_api_key_inputs_have_size_limits() {
         let mut provider = ProviderProfile {
             id: String::new(),
@@ -1693,6 +1790,7 @@ mod tests {
             model: String::new(),
 
             model_context_windows: Default::default(),
+            context_window_override: None,
             available_models: Default::default(),
             selected_models: None,
             custom_models: Default::default(),
@@ -1716,6 +1814,7 @@ mod tests {
             model: String::new(),
 
             model_context_windows: Default::default(),
+            context_window_override: None,
             available_models: Default::default(),
             selected_models: None,
             custom_models: Default::default(),

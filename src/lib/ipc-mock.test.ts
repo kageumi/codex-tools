@@ -1,7 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { filterMockSelectedModels, mockCall } from "./ipc-mock"
-import type { Provider, ProviderSaveInput } from "../types"
+import type {
+  Provider,
+  ProviderOverview,
+  ProviderSaveInput,
+  ResetCreditConsumeResult,
+  ResetCreditDetails,
+} from "../types"
 
 describe("filterMockSelectedModels", () => {
   it("keeps the default all-models selection undefined", () => {
@@ -64,5 +70,89 @@ describe("mockCall", () => {
     })
 
     expect(saved.selectedModels).toBeUndefined()
+  })
+
+  it("persists, clears, and isolates a provider context-window override", async () => {
+    const first = {
+      id: "provider-mock-context-one",
+      name: "Mock context one",
+      baseUrl: "https://mock-context-one.example/v1",
+      headers: {},
+      timeoutSecs: 30,
+      enabled: true,
+      apiType: "responses" as const,
+      apiKey: "secret",
+      selectedModels: null,
+      contextWindowOverride: 262_144,
+    }
+    const second = await saveProvider({
+      ...first,
+      id: "provider-mock-context-two",
+      name: "Mock context two",
+      contextWindowOverride: 65_536,
+    })
+    expect((await saveProvider(first)).contextWindowOverride).toBe(262_144)
+    expect(second.contextWindowOverride).toBe(65_536)
+    expect(
+      (await saveProvider({ ...first, contextWindowOverride: null }))
+        .contextWindowOverride
+    ).toBeUndefined()
+    expect(
+      (
+        await saveProvider({
+          ...first,
+          id: "provider-mock-context-two",
+          name: "Mock context two",
+          contextWindowOverride: 65_536,
+        })
+      ).contextWindowOverride
+    ).toBe(65_536)
+  })
+
+  it("returns server-summary card counts and consumes only the selected mock card", async () => {
+    const detailsRequest = mockCall("connections_get_reset_credits", {
+      accountId: "account-work",
+    })
+    await vi.runAllTimersAsync()
+    const details = (await detailsRequest) as ResetCreditDetails
+    expect(details.summary.availableCount).toBe(4)
+    const target = details.credits.find(
+      (credit) => credit.status === "available"
+    )!
+
+    const consumeRequest = mockCall("connections_consume_reset_credit", {
+      accountId: "account-work",
+      creditId: target.id,
+      idempotencyKey: "reset-credit-mock-operation-0001",
+    })
+    await vi.runAllTimersAsync()
+    const result = (await consumeRequest) as ResetCreditConsumeResult
+    expect(result.outcome).toBe("reset")
+    expect(
+      result.details.credits.find((credit) => credit.id === target.id)?.status
+    ).toBe("redeemed")
+    expect(result.details.summary.availableCount).toBe(3)
+  })
+
+  it("consumes a non-current account card without switching the active connection", async () => {
+    const request = mockCall("connections_consume_reset_credit", {
+      accountId: "account-personal",
+      creditId: "personal-available",
+      idempotencyKey: "reset-credit-personal-operation-0001",
+    })
+    await vi.runAllTimersAsync()
+    await request
+    const overviewRequest = mockCall("connections_list", {})
+    await vi.runAllTimersAsync()
+    const overview = (await overviewRequest) as ProviderOverview
+    expect(
+      overview.officialAccounts.find((account) => account.id === "account-work")
+        ?.active
+    ).toBe(true)
+    expect(
+      overview.officialAccounts.find(
+        (account) => account.id === "account-personal"
+      )?.active
+    ).toBe(false)
   })
 })

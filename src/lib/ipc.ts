@@ -22,6 +22,8 @@ import type {
   ProviderTestResult,
   QuotaRefreshResult,
   QuotaEstimateResult,
+  ResetCreditConsumeResult,
+  ResetCreditDetails,
   RepairResult,
   RepairScan,
   RepriceResult,
@@ -82,6 +84,14 @@ type CommandMap = {
     QuotaEstimateResult
   >
   connections_refresh_all_quota: CommandSpec<undefined, QuotaRefreshResult[]>
+  connections_get_reset_credits: CommandSpec<
+    { accountId: string },
+    ResetCreditDetails
+  >
+  connections_consume_reset_credit: CommandSpec<
+    { accountId: string; creditId: string; idempotencyKey: string },
+    ResetCreditConsumeResult
+  >
   connections_activate: CommandSpec<{ id: string }, RepairResult>
   connections_activate_official: CommandSpec<undefined, RepairResult>
   settings_preview_activation: CommandSpec<undefined, ConfigPatchPreview>
@@ -151,6 +161,8 @@ export const commandInventory = defineCommandInventory([
   "connections_refresh_quota",
   "connections_estimate_quota",
   "connections_refresh_all_quota",
+  "connections_get_reset_credits",
+  "connections_consume_reset_credit",
   "connections_activate",
   "connections_activate_official",
   "settings_preview_activation",
