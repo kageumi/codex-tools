@@ -105,7 +105,7 @@ impl SessionIndex {
 
     /// 只刷新本次修复实际改动过的来源（rollout / 数据库），其余会话保持不变。
     /// 用于切换账号或服务后替代全量重建：缓存未初始化、home 不匹配或没有
-    /// 受影响路径时直接返回；所有来源的 stamp 均未变化时只更新检查时间。
+    /// 受影响路径时直接返回；其它来源也发生变化时使缓存失效。
     pub fn refresh_paths(&self, codex_home: &Path, affected: &[PathBuf]) -> anyhow::Result<()> {
         if affected.is_empty() {
             return Ok(());
@@ -120,10 +120,6 @@ impl SessionIndex {
             return Ok(());
         };
         if cached.home != codex_home {
-            return Ok(());
-        }
-        if cached.sources == sources {
-            cached.checked_at = checked_at;
             return Ok(());
         }
         let mut affected_dbs: Vec<PathBuf> = Vec::new();
@@ -165,14 +161,18 @@ impl SessionIndex {
             *cache = None;
             return Ok(());
         }
-        let sessions = merge_refreshed_sessions(
-            &cached.sessions,
-            &affected_dbs,
-            &affected_rollouts,
-            &database_paths,
-            &rollout_paths,
-        )?;
-        cached.sessions = Arc::new(sessions);
+        // 调用方明确声明这些来源已变更；即使文件系统时间戳粒度不足以区分
+        // 同长度重写，也必须重新读取并合并受影响来源。
+        if !affected_dbs.is_empty() || !affected_rollouts.is_empty() {
+            let sessions = merge_refreshed_sessions(
+                &cached.sessions,
+                &affected_dbs,
+                &affected_rollouts,
+                &database_paths,
+                &rollout_paths,
+            )?;
+            cached.sessions = Arc::new(sessions);
+        }
         cached.sources = sources;
         cached.database_count = database_paths.len();
         cached.checked_at = checked_at;
@@ -639,7 +639,7 @@ mod tests {
         index.load(temp.path()).unwrap();
 
         write_rollout(&a, "one", "custom");
-        write_rollout(&b, "two", "custom");
+        write_rollout(&b, "two", "custom-longer");
         index
             .refresh_paths(temp.path(), std::slice::from_ref(&a))
             .unwrap();
