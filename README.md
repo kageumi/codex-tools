@@ -94,19 +94,19 @@ X-Custom-Header = "<可选请求头>"
 
 ## 本地开发
 
-需要 Node.js 24、Rust 1.85+ 及当前平台的 [Tauri 2 构建依赖](https://v2.tauri.app/start/prerequisites/)（Windows 另需 WebView2、NSIS；macOS 需 Xcode CLT）。
+需要 Bun 1.4、Rust 1.85+ 及当前平台的 [Tauri 2 构建依赖](https://v2.tauri.app/start/prerequisites/)（Windows 另需 WebView2、NSIS；macOS 需 Xcode CLT）。
 
 ```shell
 git clone https://github.com/kageumi/codex-tools.git
 cd codex-tools
-npm ci
-npm run dev
+bun install --frozen-lockfile
+bun run dev
 ```
 
 提交前运行完整检查：
 
 ```shell
-npm run check
+bun run check
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --locked
@@ -115,8 +115,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 本地打包（Windows x64 输出 NSIS 安装包，macOS 输出 DMG）：
 
 ```shell
-npm run dist:win
-npm run dist:mac:arm64
+bun run dist:win
+bun run dist:mac:arm64
 ```
 
 ## 项目状态

@@ -4,9 +4,9 @@
   "version": "0.7.13",
   "identifier": "io.github.irasutoya.codex-tools",
   "build": {
-    "beforeDevCommand": "npm run frontend:dev",
+    "beforeDevCommand": "bun run frontend:dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "bun run build",
     "frontendDist": "../dist"
   },
   "app": {

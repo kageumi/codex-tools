@@ -34,19 +34,18 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: 24
-          cache: npm
+          bun-version: 1.4.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      - run: npm ci
-      - run: npm run verify
-      - run: npm run ${{ matrix.script }}
+      - run: bun install --frozen-lockfile
+      - run: bun run verify
+      - run: bun run ${{ matrix.script }}
       - name: Verify macOS bundle signature
         if: matrix.platform == 'macos'
-        run: npm run ${{ matrix.verify_script }}
+        run: bun run ${{ matrix.verify_script }}

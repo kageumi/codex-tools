@@ -90,7 +90,6 @@ export function checkVersions({ versions, expected, tag }) {
 
 function main() {
   const packageJson = readJson("package.json")
-  const packageLock = readJson("package-lock.json")
   const cargoToml = read("src-tauri/Cargo.toml")
   const cargoPackage = readCargoPackageVersion(cargoToml)
 
@@ -107,8 +106,6 @@ function main() {
   const expected = packageJson.version
   const versions = {
     "package.json": expected,
-    "package-lock.json": packageLock.version,
-    "package-lock.json (root package)": packageLock.packages?.[""]?.version,
     "src-tauri/Cargo.toml": cargoPackage,
     "src-tauri/Cargo.lock (root package)": readCargoLockPackageVersion(
       read("src-tauri/Cargo.lock"),
