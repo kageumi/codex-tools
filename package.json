@@ -1,7 +1,7 @@
 {
   "name": "codex-tools",
   "private": true,
-  "version": "0.7.12",
+  "version": "0.7.13",
   "description": "管理 Codex 的 OpenAI 账号和第三方 Responses API 服务。",
   "author": "Codex Tools contributors",
   "license": "MIT",
