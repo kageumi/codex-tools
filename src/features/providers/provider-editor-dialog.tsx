@@ -11,8 +11,22 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldGroup,
+  FieldLabel,
+  FieldLegend,
+  FieldSet,
+} from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from "@/components/ui/input-group"
 import {
   Select,
   SelectContent,
@@ -96,7 +110,7 @@ const ModelRow = memo(function ModelRow({
   onRemove: (model: string) => void
 }) {
   return (
-    <div className="group flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-muted/60">
+    <div className="group flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm transition-colors duration-150 ease-[var(--motion-ease-out)] hover:bg-muted/60">
       <label className="flex min-w-0 flex-1 items-center gap-2">
         <Checkbox
           checked={selected}
@@ -106,15 +120,17 @@ const ModelRow = memo(function ModelRow({
         <span className="truncate">{model}</span>
       </label>
       {isCustom && (
-        <button
+        <Button
           type="button"
+          size="icon-xs"
+          variant="ghost"
           aria-label={`移除自定义模型 ${model}`}
           disabled={saving}
           onClick={() => onRemove(model)}
-          className="shrink-0 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted hover:text-foreground focus-visible:opacity-100 disabled:opacity-30"
+          className="shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
         >
           <HugeiconsIcon icon={Delete02Icon} />
-        </button>
+        </Button>
       )}
     </div>
   )
@@ -319,7 +335,12 @@ function ProviderEditorDialogContent({
                 </SelectContent>
               </Select>
             </Field>
-            <Field data-disabled={saving}>
+            <Field
+              data-disabled={saving}
+              data-invalid={
+                !isValidContextWindowOverride(contextWindowOverrideDraft)
+              }
+            >
               <FieldLabel htmlFor="provider-context-window-override">
                 自定义上下文窗口（token，可选）
               </FieldLabel>
@@ -330,103 +351,125 @@ function ProviderEditorDialogContent({
                 placeholder="留空以自动匹配"
                 value={contextWindowOverrideDraft}
                 disabled={saving}
+                aria-invalid={
+                  !isValidContextWindowOverride(contextWindowOverrideDraft)
+                }
                 onChange={(event) =>
                   setContextWindowOverrideDraft(event.target.value)
                 }
               />
-              <div className="text-xs text-muted-foreground">
-                应用于该 API 的所有模型；留空则自动匹配上下文窗口。
-              </div>
+              {isValidContextWindowOverride(contextWindowOverrideDraft) ? (
+                <FieldDescription>
+                  应用于该 API 的所有模型；留空则自动匹配上下文窗口。
+                </FieldDescription>
+              ) : (
+                <FieldError>请输入大于 0 的整数 token。</FieldError>
+              )}
             </Field>
-            <Field data-disabled={saving}>
-              <FieldLabel>写入 Codex 的模型</FieldLabel>
-              <label className="sr-only" htmlFor="provider-model-search">
-                搜索模型
-              </label>
-              <Input
-                id="provider-model-search"
-                type="search"
-                placeholder="搜索模型…"
-                value={modelSearch}
-                disabled={saving}
-                onChange={(event) => setModelSearch(event.target.value)}
-                className="mb-2"
-              />
-              <div className="mb-2 flex items-center gap-2">
-                <label className="sr-only" htmlFor="provider-custom-model">
-                  自定义模型 ID
-                </label>
-                <Input
-                  id="provider-custom-model"
-                  placeholder="添加自定义模型 ID…"
-                  value={customModelDraft}
-                  disabled={saving}
-                  onChange={(event) => setCustomModelDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault()
-                      addCustomModel()
-                    }
-                  }}
-                />
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={saving || !customModelDraft.trim()}
-                  onClick={addCustomModel}
-                >
-                  <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
-                  添加
-                </Button>
-              </div>
-              <div className="max-h-48 space-y-1 overflow-y-auto rounded-xl border border-border/60 p-2">
-                {/* 全选按钮放在模型列表容器内部顶部 */}
-                {effectiveModels.length > 0 && (
-                  <div className="mb-1 flex items-center justify-between px-1">
-                    <span className="text-xs text-muted-foreground">
-                      {effectiveModels.length} 个模型
-                    </span>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
+            <FieldSet>
+              <FieldLegend variant="label">写入 Codex 的模型</FieldLegend>
+              <FieldGroup className="gap-2">
+                <Field data-disabled={saving}>
+                  <FieldLabel
+                    htmlFor="provider-model-search"
+                    className="sr-only"
+                  >
+                    搜索模型
+                  </FieldLabel>
+                  <Input
+                    id="provider-model-search"
+                    type="search"
+                    placeholder="搜索模型…"
+                    value={modelSearch}
+                    disabled={saving}
+                    onChange={(event) => setModelSearch(event.target.value)}
+                  />
+                </Field>
+                <Field data-disabled={saving}>
+                  <FieldLabel
+                    htmlFor="provider-custom-model"
+                    className="sr-only"
+                  >
+                    自定义模型 ID
+                  </FieldLabel>
+                  <InputGroup>
+                    <InputGroupInput
+                      id="provider-custom-model"
+                      placeholder="添加自定义模型 ID…"
+                      value={customModelDraft}
                       disabled={saving}
-                      onClick={() =>
-                        onProviderChange((prev) => ({
-                          ...prev,
-                          selectedModels: allModelsSelected(prev)
-                            ? []
-                            : undefined,
-                        }))
+                      onChange={(event) =>
+                        setCustomModelDraft(event.target.value)
                       }
-                    >
-                      {allSelected ? "取消全选" : "全选"}
-                    </Button>
-                  </div>
-                )}
-                {filteredModels.length === 0 ? (
-                  <div className="px-2 py-3 text-center text-xs text-muted-foreground">
-                    未找到匹配的模型
-                  </div>
-                ) : (
-                  filteredModels.map((model) => (
-                    <ModelRow
-                      key={model}
-                      model={model}
-                      selected={selectedSet?.has(model) ?? true}
-                      isCustom={customSet.has(model)}
-                      saving={saving}
-                      onToggle={toggleModel}
-                      onRemove={removeModel}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault()
+                          addCustomModel()
+                        }
+                      }}
                     />
-                  ))
-                )}
-              </div>
-              <div className="text-xs text-muted-foreground">
-                默认全部选中，取消选择后仅将选中模型写入 Codex。
-              </div>
-            </Field>
+                    <InputGroupAddon align="inline-end">
+                      <InputGroupButton
+                        size="sm"
+                        disabled={saving || !customModelDraft.trim()}
+                        onClick={addCustomModel}
+                      >
+                        <HugeiconsIcon
+                          icon={Add01Icon}
+                          data-icon="inline-start"
+                        />
+                        添加
+                      </InputGroupButton>
+                    </InputGroupAddon>
+                  </InputGroup>
+                </Field>
+                <div className="flex max-h-48 flex-col gap-1 overflow-y-auto overscroll-contain rounded-xl border border-border/60 p-2">
+                  {effectiveModels.length > 0 && (
+                    <div className="mb-1 flex items-center justify-between px-1">
+                      <span className="text-xs text-muted-foreground">
+                        {effectiveModels.length} 个模型
+                      </span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        disabled={saving}
+                        onClick={() =>
+                          onProviderChange((prev) => ({
+                            ...prev,
+                            selectedModels: allModelsSelected(prev)
+                              ? []
+                              : undefined,
+                          }))
+                        }
+                      >
+                        {allSelected ? "取消全选" : "全选"}
+                      </Button>
+                    </div>
+                  )}
+                  {filteredModels.length === 0 ? (
+                    <div className="px-2 py-3 text-center text-xs text-muted-foreground">
+                      未找到匹配的模型
+                    </div>
+                  ) : (
+                    filteredModels.map((model) => (
+                      <ModelRow
+                        key={model}
+                        model={model}
+                        selected={selectedSet?.has(model) ?? true}
+                        isCustom={customSet.has(model)}
+                        saving={saving}
+                        onToggle={toggleModel}
+                        onRemove={removeModel}
+                      />
+                    ))
+                  )}
+                </div>
+                <FieldDescription>
+                  默认全部选中，取消选择后仅将选中模型写入 Codex。
+                </FieldDescription>
+              </FieldGroup>
+            </FieldSet>
           </FieldGroup>
         </DialogBody>
         <DialogFooter>

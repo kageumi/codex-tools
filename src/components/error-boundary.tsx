@@ -1,4 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from "react"
+import { InformationCircleIcon } from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -36,6 +38,7 @@ export class ErrorBoundary extends Component<
       const chunkLoadFailed = isLazyChunkLoadError(this.state.error)
       return (
         <Alert variant="destructive" className="m-3">
+          <HugeiconsIcon icon={InformationCircleIcon} />
           <AlertTitle>
             {chunkLoadFailed
               ? "页面资源加载失败"

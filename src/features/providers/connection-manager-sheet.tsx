@@ -149,7 +149,7 @@ function AccountConnectionDetails({
               <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs">
                 <Badge
                   variant="outline"
-                  className="h-4 px-1.5 text-[11px] leading-none"
+                  className="h-4 px-1.5 text-xs leading-none"
                 >
                   {quota.label}
                 </Badge>
@@ -157,7 +157,7 @@ function AccountConnectionDetails({
                   {quota.remainingPercent.toFixed(1)}% 可用
                 </span>
               </div>
-              <div className="mt-0.5 min-w-0 text-[11px] leading-relaxed break-words whitespace-normal text-muted-foreground">
+              <div className="mt-0.5 min-w-0 text-xs leading-relaxed break-words whitespace-normal text-muted-foreground">
                 {quota.resetAt ? formatDate(quota.resetAt, true) : "—"} 重置
               </div>
             </div>

@@ -2,6 +2,7 @@ import { useRef, useState } from "react"
 import {
   Copy01Icon,
   ExternalLinkIcon,
+  InformationCircleIcon,
   Key01Icon,
   Login03Icon,
 } from "@hugeicons/core-free-icons"
@@ -18,6 +19,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty"
 import {
   Field,
   FieldDescription,
@@ -101,6 +110,7 @@ export function AccountLoginDialog({
         <DialogBody>
           {error && (
             <Alert variant="destructive">
+              <HugeiconsIcon icon={InformationCircleIcon} />
               <AlertTitle>无法完成登录</AlertTitle>
               <AlertDescription>{error}</AlertDescription>
             </Alert>
@@ -112,11 +122,11 @@ export function AccountLoginDialog({
           >
             <TabsList className="grid w-full grid-cols-2">
               <TabsTrigger value="browser" disabled={busy}>
-                <HugeiconsIcon icon={Login03Icon} />
+                <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
                 官方授权
               </TabsTrigger>
               <TabsTrigger value="cookie" disabled={busy}>
-                <HugeiconsIcon icon={Key01Icon} />
+                <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
                 Cookie 导入
               </TabsTrigger>
             </TabsList>
@@ -141,21 +151,30 @@ export function AccountLoginDialog({
                   </AlertDescription>
                 </Alert>
               ) : (
-                <div className="flex min-h-24 flex-col items-center justify-center gap-2 rounded-2xl bg-muted px-4 text-center">
-                  {starting ? (
-                    <>
-                      <Spinner />
-                      <div className="text-sm font-medium">正在获取授权码…</div>
-                    </>
-                  ) : (
-                    <>
-                      <div className="text-sm font-medium">
-                        使用 OpenAI 官方设备授权
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        获取一次性授权码后，在 OpenAI
-                        页面确认登录；本应用不会读取浏览器 Cookie。
-                      </div>
+                <Empty className="min-h-24 bg-muted">
+                  <EmptyHeader>
+                    {starting ? (
+                      <>
+                        <EmptyMedia variant="icon">
+                          <Spinner />
+                        </EmptyMedia>
+                        <EmptyTitle>正在获取授权码…</EmptyTitle>
+                      </>
+                    ) : (
+                      <>
+                        <EmptyMedia variant="icon">
+                          <HugeiconsIcon icon={Login03Icon} />
+                        </EmptyMedia>
+                        <EmptyTitle>使用 OpenAI 官方设备授权</EmptyTitle>
+                        <EmptyDescription>
+                          获取一次性授权码后，在 OpenAI
+                          页面确认登录；本应用不会读取浏览器 Cookie。
+                        </EmptyDescription>
+                      </>
+                    )}
+                  </EmptyHeader>
+                  {!starting && (
+                    <EmptyContent>
                       <Button type="button" disabled={busy} onClick={onStart}>
                         <HugeiconsIcon
                           icon={Login03Icon}
@@ -163,9 +182,9 @@ export function AccountLoginDialog({
                         />
                         获取授权码
                       </Button>
-                    </>
+                    </EmptyContent>
                   )}
-                </div>
+                </Empty>
               )}
 
               {authorization && (

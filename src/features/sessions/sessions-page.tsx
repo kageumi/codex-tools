@@ -22,7 +22,9 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Card,
+  CardAction,
   CardContent,
+  CardDescription,
   CardFooter,
   CardHeader,
   CardTitle,
@@ -53,6 +55,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { errorMessage, formatDate, formatInteger } from "@/lib/format"
 import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
@@ -166,7 +169,7 @@ export function SessionsPage({
   if (!result || !scan)
     return (
       <div
-        className="grid grid-rows-[72px_256px] gap-3 px-3 pt-1 pb-3"
+        className="grid min-h-full grid-rows-[minmax(72px,auto)_minmax(256px,1fr)] gap-3 px-3 pt-1 pb-3"
         role="status"
         aria-busy="true"
       >
@@ -246,40 +249,31 @@ export function SessionsPage({
         </CardContent>
       </Card>
       <Card size="sm" className="min-h-64 shrink-0">
-        <CardHeader className="grid grid-cols-[1fr_auto] items-center">
-          <div>
-            <div className="flex items-center gap-2">
-              <CardTitle>会话</CardTitle>
-              <div className="flex rounded-lg bg-muted p-0.5">
-                <Button
-                  size="sm"
-                  variant={status === "active" ? "secondary" : "ghost"}
-                  onClick={() => {
-                    setStatus("active")
-                    setPage(1)
-                  }}
-                >
-                  活跃
-                </Button>
-                <Button
-                  size="sm"
-                  variant={status === "archived" ? "secondary" : "ghost"}
-                  onClick={() => {
-                    setStatus("archived")
-                    setPage(1)
-                  }}
-                >
-                  已归档
-                </Button>
-              </div>
-            </div>
-            <div className="mt-1 text-xs text-muted-foreground">
-              {query
-                ? `“${query}” 的${status === "archived" ? "已归档" : "活跃"}结果`
-                : `全部${status === "archived" ? "已归档" : "活跃"}本地会话`}
-            </div>
+        <CardHeader className="border-b">
+          <div className="flex items-center gap-2">
+            <CardTitle>会话</CardTitle>
+            <ToggleGroup
+              variant="outline"
+              spacing={0}
+              value={[status]}
+              onValueChange={(value) => {
+                if (!value[0]) return
+                setStatus(value[0] as "active" | "archived")
+                setPage(1)
+              }}
+            >
+              <ToggleGroupItem value="active">活跃</ToggleGroupItem>
+              <ToggleGroupItem value="archived">已归档</ToggleGroupItem>
+            </ToggleGroup>
           </div>
-          <Badge variant="outline">{result.total} 条</Badge>
+          <CardDescription>
+            {query
+              ? `“${query}” 的${status === "archived" ? "已归档" : "活跃"}结果`
+              : `全部${status === "archived" ? "已归档" : "活跃"}本地会话`}
+          </CardDescription>
+          <CardAction>
+            <Badge variant="outline">{result.total} 条</Badge>
+          </CardAction>
         </CardHeader>
         <CardContent>
           {result.items.length ? (
@@ -334,7 +328,7 @@ export function SessionsPage({
           )}
         </CardContent>
         {pageCount > 1 && (
-          <CardFooter className="px-3 py-1.5">
+          <CardFooter>
             <Pagination>
               <PaginationContent>
                 <PaginationItem>
@@ -403,7 +397,7 @@ function Summary({
       </div>
       <div>
         <div className="text-xs text-muted-foreground">{label}</div>
-        <div className="font-medium tabular-nums">{value}</div>
+        <div className="text-base font-medium tabular-nums">{value}</div>
       </div>
     </div>
   )

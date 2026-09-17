@@ -38,7 +38,7 @@ createRoot(document.getElementById("root")!).render(
               className="grid min-h-screen place-items-center p-6 text-center"
             >
               <div>
-                <h1 className="mb-2 text-xl font-semibold">
+                <h1 className="mb-2 text-xl font-medium">
                   正在启动 Codex Tools
                 </h1>
                 <p className="text-sm text-muted-foreground">

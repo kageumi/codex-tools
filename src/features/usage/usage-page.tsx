@@ -10,10 +10,22 @@ import {
 import { HugeiconsIcon } from "@hugeicons/react"
 import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts"
 
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import {
+  Alert,
+  AlertAction,
+  AlertDescription,
+  AlertTitle,
+} from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import {
   ChartContainer,
   ChartLegend,
@@ -431,36 +443,34 @@ export function UsagePage({
         </Alert>
       )}
       <Card size="sm" className="shrink-0">
-        <CardHeader className="grid grid-cols-[1fr_auto] items-center">
-          <div>
-            <CardTitle>用量趋势</CardTitle>
-            <div className="mt-0.5 text-xs text-muted-foreground">
-              {formatRange(overview.range)}
-            </div>
-          </div>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={busy}
-            onClick={() => void refreshUsage()}
-          >
-            {busy ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
-            )}
-            扫描
-          </Button>
+        <CardHeader className="border-b">
+          <CardTitle>用量趋势</CardTitle>
+          <CardDescription>{formatRange(overview.range)}</CardDescription>
+          <CardAction>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => void refreshUsage()}
+            >
+              {busy ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
+              )}
+              扫描
+            </Button>
+          </CardAction>
         </CardHeader>
-        <CardContent className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+        <CardContent className="flex flex-col gap-3">
           <ChartContainer
             config={usageChartConfig}
             className="aspect-auto h-28 w-full"
-            initialDimension={{ width: 450, height: 112 }}
+            initialDimension={{ width: 600, height: 112 }}
           >
             <LineChart
               data={points}
-              margin={{ left: 4, right: 8, top: 4, bottom: 0 }}
+              margin={{ left: 4, right: 20, top: 4, bottom: 0 }}
             >
               <CartesianGrid vertical={false} strokeDasharray="4 4" />
               <XAxis
@@ -506,7 +516,7 @@ export function UsagePage({
               />
             </LineChart>
           </ChartContainer>
-          <div className="grid min-w-44 grid-cols-2 gap-x-4 gap-y-3">
+          <div className="grid grid-cols-4 divide-x divide-border">
             <Metric
               label="总 Token"
               value={formatTokens(overview.totals.tokens.totalTokens)}
@@ -533,7 +543,7 @@ export function UsagePage({
           onValueChange={setTab}
           className="flex min-h-0 flex-1 flex-col"
         >
-          <CardHeader className="grid grid-cols-[1fr_auto] items-center">
+          <CardHeader className="grid grid-cols-[1fr_auto] items-center border-b">
             <TabsList>
               <TabsTrigger value="details">明细</TabsTrigger>
               <TabsTrigger value="cache">缓存</TabsTrigger>
@@ -550,7 +560,7 @@ export function UsagePage({
               </Button>
             )}
           </CardHeader>
-          <CardContent className="min-h-0 flex-1 overflow-y-auto">
+          <CardContent className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             <TabsContent value="details" className="mt-0">
               {overview.rows.length ? (
                 <ItemGroup>
@@ -602,45 +612,46 @@ export function UsagePage({
               )}
             </TabsContent>
             <TabsContent value="pricing" className="mt-0">
-              <div className="mb-3 flex items-center gap-3 rounded-xl border border-border/50 bg-muted/40 px-3 py-2.5">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5 text-xs font-medium">
-                    OpenAI 官方参考价格
-                    <Badge variant="secondary">
-                      {officialPricingError
-                        ? "同步失败"
-                        : officialCatalog
-                          ? officialCatalog.status === "waiting"
-                            ? "待同步"
-                            : `${officialCatalog.modelCount} 个模型`
-                          : "读取中"}
-                    </Badge>
-                  </div>
-                  <div className="mt-0.5 truncate text-xs text-muted-foreground">
+              <Alert className="mb-3">
+                <HugeiconsIcon icon={InformationCircleIcon} />
+                <AlertTitle>
+                  OpenAI 官方参考价格
+                  <Badge variant="secondary">
                     {officialPricingError
-                      ? `同步失败：${officialPricingError}`
-                      : officialCatalog?.fetchedAtMs
-                        ? `上次同步 ${formatDate(officialCatalog.fetchedAtMs, true)}`
-                        : "进入用量页会自动同步，也可手动刷新。"}
-                  </div>
-                </div>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={syncing}
-                  onClick={() => void syncOfficialPricing()}
-                >
-                  {syncing ? (
-                    <Spinner data-icon="inline-start" />
-                  ) : (
-                    <HugeiconsIcon
-                      icon={Refresh01Icon}
-                      data-icon="inline-start"
-                    />
-                  )}
-                  {officialPricingError ? "重试" : "同步"}
-                </Button>
-              </div>
+                      ? "同步失败"
+                      : officialCatalog
+                        ? officialCatalog.status === "waiting"
+                          ? "待同步"
+                          : `${officialCatalog.modelCount} 个模型`
+                        : "读取中"}
+                  </Badge>
+                </AlertTitle>
+                <AlertDescription className="truncate">
+                  {officialPricingError
+                    ? `同步失败：${officialPricingError}`
+                    : officialCatalog?.fetchedAtMs
+                      ? `上次同步 ${formatDate(officialCatalog.fetchedAtMs, true)}`
+                      : "进入用量页会自动同步，也可手动刷新。"}
+                </AlertDescription>
+                <AlertAction>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={syncing}
+                    onClick={() => void syncOfficialPricing()}
+                  >
+                    {syncing ? (
+                      <Spinner data-icon="inline-start" />
+                    ) : (
+                      <HugeiconsIcon
+                        icon={Refresh01Icon}
+                        data-icon="inline-start"
+                      />
+                    )}
+                    {officialPricingError ? "重试" : "同步"}
+                  </Button>
+                </AlertAction>
+              </Alert>
               {!rules ? (
                 rulesError ? null : (
                   <Skeleton className="h-24 rounded-xl" />
@@ -787,9 +798,9 @@ export function UsagePage({
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
-    <div>
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="mt-0.5 text-base font-medium tabular-nums">{value}</div>
+    <div className="flex min-w-0 flex-col gap-1 px-3 first:pl-0 last:pr-0">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="text-base font-medium tabular-nums">{value}</span>
     </div>
   )
 }

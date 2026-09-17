@@ -266,7 +266,7 @@ export function EditableContextMenu() {
   }
 
   const itemStyles =
-    "flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-sm outline-none select-none hover:bg-accent focus-visible:bg-accent focus-visible:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
+    "flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-sm outline-none select-none transition-colors duration-150 ease-[var(--motion-ease-out)] hover:bg-accent focus-visible:bg-accent focus-visible:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
 
   return createPortal(
     <div
@@ -275,7 +275,7 @@ export function EditableContextMenu() {
       aria-label="编辑菜单"
       tabIndex={-1}
       className={cn(
-        "fixed z-[120] w-40 rounded-2xl p-1 outline-none",
+        "fixed z-50 w-40 rounded-2xl p-1 outline-none",
         floatingSurfaceStyles
       )}
       style={{ left: menu.x, top: menu.y }}

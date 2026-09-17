@@ -16,17 +16,20 @@ import { Button } from "@/components/ui/button"
 import {
   Card,
   CardContent,
+  CardDescription,
   CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
 import {
   Empty,
+  EmptyContent,
   EmptyHeader,
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
 import { Spinner } from "@/components/ui/spinner"
+import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Progress } from "@/components/ui/progress"
 import { toast } from "@/components/ui/toast"
@@ -345,8 +348,8 @@ export function ProvidersPage({
 
   if (!selected) {
     return (
-      <div className="min-h-full px-3 pt-1 pb-3">
-        <Card size="sm" className="min-h-full justify-center">
+      <div className="flex min-h-full flex-col px-3 pt-1 pb-3">
+        <Card size="sm" className="flex-1 justify-center">
           <Empty>
             <EmptyHeader>
               <EmptyMedia variant="icon">
@@ -354,7 +357,7 @@ export function ProvidersPage({
               </EmptyMedia>
               <EmptyTitle>还没有连接</EmptyTitle>
             </EmptyHeader>
-            <div className="grid w-full grid-cols-3 gap-2">
+            <EmptyContent className="grid w-full max-w-none grid-cols-3 gap-2">
               <Button
                 type="button"
                 variant="outline"
@@ -388,7 +391,7 @@ export function ProvidersPage({
                 <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
                 添加 API 服务
               </Button>
-            </div>
+            </EmptyContent>
           </Empty>
         </Card>
         {connectionEditors}
@@ -434,46 +437,46 @@ export function ProvidersPage({
   return (
     <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
       <Card size="sm" className="shrink-0">
-        <CardContent className="flex flex-col gap-2">
-          <div className="text-sm font-medium">添加连接</div>
-          <div className="grid w-full grid-cols-3 gap-2">
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="min-w-0 px-2 text-xs"
-              disabled={actionBusy}
-              onClick={() => openAccountLogin("browser")}
-            >
-              <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-              OpenAI 授权
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="min-w-0 px-2 text-xs"
-              disabled={actionBusy}
-              onClick={() => openAccountLogin("cookie")}
-            >
-              <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
-              导入 Cookie
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="min-w-0 px-2 text-xs"
-              disabled={actionBusy}
-              onClick={() => {
-                setEditor(emptyProvider())
-                setEditorOpen(true)
-              }}
-            >
-              <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
-              添加 API 服务
-            </Button>
-          </div>
+        <CardHeader className="border-b">
+          <CardTitle>添加连接</CardTitle>
+        </CardHeader>
+        <CardContent className="grid w-full grid-cols-3 gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="min-w-0 px-2 text-xs"
+            disabled={actionBusy}
+            onClick={() => openAccountLogin("browser")}
+          >
+            <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
+            OpenAI 授权
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="min-w-0 px-2 text-xs"
+            disabled={actionBusy}
+            onClick={() => openAccountLogin("cookie")}
+          >
+            <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
+            导入 Cookie
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="min-w-0 px-2 text-xs"
+            disabled={actionBusy}
+            onClick={() => {
+              setEditor(emptyProvider())
+              setEditorOpen(true)
+            }}
+          >
+            <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
+            添加 API 服务
+          </Button>
         </CardContent>
       </Card>
 
@@ -496,9 +499,7 @@ export function ProvidersPage({
               )}
               <Badge variant="outline">API 服务</Badge>
             </div>
-            <div className="text-sm text-muted-foreground">
-              {provider?.baseUrl}
-            </div>
+            <CardDescription>{provider?.baseUrl}</CardDescription>
           </CardHeader>
         )}
         {isAccount ? (
@@ -526,9 +527,7 @@ export function ProvidersPage({
             />
           </CardContent>
         )}
-        <CardFooter
-          className={isAccount ? "flex-wrap gap-2 py-2" : "flex-wrap gap-2"}
-        >
+        <CardFooter className="flex-wrap gap-2">
           {isAccount ? (
             <>
               <Button
@@ -741,7 +740,7 @@ function AccountCardHeader({
           )}
           <Badge variant="secondary">{accountPlanText(account)}</Badge>
         </div>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-muted-foreground">
+        <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
           <span className="break-all">{account.email || "未提供邮箱"}</span>
           <span aria-hidden="true">·</span>
           <span>
@@ -749,7 +748,7 @@ function AccountCardHeader({
               ? "Cookie 登录数据"
               : "OpenAI 官方授权"}
           </span>
-        </div>
+        </CardDescription>
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           <Badge
             variant={loginVerificationVariant(account)}
@@ -770,7 +769,7 @@ function AccountCardHeader({
       <Button
         type="button"
         variant="outline"
-        className="h-auto justify-between gap-5 rounded-xl border-foreground/15 bg-muted/50 px-4 py-3 text-left hover:border-foreground/30 hover:bg-muted min-[480px]:min-w-36"
+        className="h-auto justify-between gap-5 rounded-xl px-4 py-3 text-left min-[480px]:min-w-36"
         onClick={onOpenResetCredits}
         aria-label={`${resetCreditCountText(account)}，打开重置卡列表`}
         aria-haspopup="dialog"
@@ -793,11 +792,7 @@ function AccountCardHeader({
         </span>
         <span className="flex items-center gap-1 self-end text-xs text-muted-foreground">
           查看
-          <HugeiconsIcon
-            icon={ArrowRight01Icon}
-            className="size-3.5"
-            aria-hidden="true"
-          />
+          <HugeiconsIcon icon={ArrowRight01Icon} aria-hidden="true" />
         </span>
       </Button>
     </CardHeader>
@@ -809,7 +804,8 @@ function AccountDetailContent({ account }: { account: OfficialAccountView }) {
 
   return (
     <CardContent className="flex flex-col gap-1.5">
-      <section className="flex flex-col gap-1 border-t pt-1.5">
+      <Separator />
+      <section className="flex flex-col gap-1">
         <div className="text-xs font-medium text-muted-foreground">额度</div>
         {quotaWindows.length ? (
           <div className="flex flex-col gap-1.5">
@@ -868,7 +864,8 @@ function AccountDetailContent({ account }: { account: OfficialAccountView }) {
         )}
       </section>
 
-      <section className="border-t pt-1.5">
+      <Separator />
+      <section>
         <div className="grid min-w-0 grid-cols-3 gap-2">
           <MaintenanceRecord
             label="上次刷新"

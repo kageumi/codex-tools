@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue,
@@ -165,11 +166,13 @@ export function PricingEditor({
                   <SelectValue placeholder="选择适用的第三方 API" />
                 </SelectTrigger>
                 <SelectContent>
-                  {sourceOptions.map((option) => (
-                    <SelectItem key={option.value} value={option.value}>
-                      {option.label}
-                    </SelectItem>
-                  ))}
+                  <SelectGroup>
+                    {sourceOptions.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
                 </SelectContent>
               </Select>
             </Field>
@@ -182,15 +185,20 @@ export function PricingEditor({
                     if (value) setPattern(value)
                   }}
                 >
-                  <SelectTrigger className="w-full">
+                  <SelectTrigger
+                    className="w-full"
+                    aria-label="从已使用模型中选择"
+                  >
                     <SelectValue placeholder="从已使用模型中选择" />
                   </SelectTrigger>
                   <SelectContent>
-                    {modelOptions.map((model) => (
-                      <SelectItem key={model} value={model}>
-                        {model}
-                      </SelectItem>
-                    ))}
+                    <SelectGroup>
+                      {modelOptions.map((model) => (
+                        <SelectItem key={model} value={model}>
+                          {model}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
                   </SelectContent>
                 </Select>
               )}

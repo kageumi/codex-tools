@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from "react"
+import { InformationCircleIcon } from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -9,6 +12,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -20,6 +24,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Empty, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemGroup,
+  ItemTitle,
+} from "@/components/ui/item"
 import { Spinner } from "@/components/ui/spinner"
 import { errorMessage, formatDate } from "@/lib/format"
 import { call } from "@/lib/ipc"
@@ -212,7 +225,11 @@ export function ResetCreditsDialog({
                 <Spinner /> 正在读取重置卡…
               </div>
             ) : loadError && !details ? (
-              <p className="text-sm text-destructive">{loadError}</p>
+              <Alert variant="destructive">
+                <HugeiconsIcon icon={InformationCircleIcon} />
+                <AlertTitle>无法读取重置卡</AlertTitle>
+                <AlertDescription>{loadError}</AlertDescription>
+              </Alert>
             ) : (
               <div className="flex flex-col gap-3">
                 <p className="text-sm text-muted-foreground">
@@ -221,9 +238,12 @@ export function ResetCreditsDialog({
                     : `服务端可用数量：${visibleDetails.summary.availableCount} 张`}
                 </p>
                 {visibleDetails?.summary.detailsStatus === "partial" && (
-                  <p className="rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-                    服务端仅提供了部分卡片详情；数量以上方服务端摘要为准。
-                  </p>
+                  <Alert>
+                    <HugeiconsIcon icon={InformationCircleIcon} />
+                    <AlertDescription>
+                      服务端仅提供了部分卡片详情；数量以上方服务端摘要为准。
+                    </AlertDescription>
+                  </Alert>
                 )}
                 {resultMessage && (
                   <p className="text-sm text-muted-foreground">
@@ -231,64 +251,74 @@ export function ResetCreditsDialog({
                   </p>
                 )}
                 {loadError && (
-                  <p className="text-sm text-destructive">{loadError}</p>
+                  <Alert variant="destructive">
+                    <HugeiconsIcon icon={InformationCircleIcon} />
+                    <AlertTitle>部分重置卡读取失败</AlertTitle>
+                    <AlertDescription>{loadError}</AlertDescription>
+                  </Alert>
                 )}
-                <div className="max-h-[min(50vh,26rem)] overflow-y-auto pr-1">
-                  <div className="flex flex-col gap-2">
+                <div className="max-h-[min(50vh,26rem)] overflow-y-auto overscroll-contain pr-1">
+                  <ItemGroup>
                     {credits.map((credit) => {
                       const key = account
                         ? operationId(account.id, credit.id)
                         : credit.id
                       return (
-                        <div
+                        <Item
                           key={credit.id}
-                          className="flex min-w-0 items-center justify-between gap-3 rounded-lg border border-border/70 px-3 py-2.5"
+                          size="xs"
+                          variant="outline"
+                          className="items-center"
                         >
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span className="font-medium break-words">
+                          <ItemContent className="min-w-0">
+                            <ItemTitle>
+                              <span className="min-w-0 break-words">
                                 {creditTitle(credit)}
                               </span>
                               <Badge variant="outline">
                                 {statusText(credit)}
                               </Badge>
-                            </div>
-                            <p className="mt-1 text-xs text-muted-foreground">
+                            </ItemTitle>
+                            <ItemDescription>
                               到期：
                               {credit.expiresAt == null
                                 ? "未提供到期时间"
                                 : formatDate(credit.expiresAt, true)}
-                            </p>
+                            </ItemDescription>
                             {credit.description && (
-                              <p className="mt-1 text-xs text-muted-foreground">
+                              <ItemDescription>
                                 {credit.description}
-                              </p>
+                              </ItemDescription>
                             )}
-                          </div>
-                          <Button
-                            type="button"
-                            size="sm"
-                            disabled={
-                              !creditIsUsable(credit) ||
-                              unknownOperations.has(key) ||
-                              using
-                            }
-                            onClick={(event) => {
-                              useButton.current = event.currentTarget
-                              setConfirming(credit)
-                            }}
-                          >
-                            使用
-                          </Button>
-                        </div>
+                          </ItemContent>
+                          <ItemActions>
+                            <Button
+                              type="button"
+                              size="sm"
+                              disabled={
+                                !creditIsUsable(credit) ||
+                                unknownOperations.has(key) ||
+                                using
+                              }
+                              onClick={(event) => {
+                                useButton.current = event.currentTarget
+                                setConfirming(credit)
+                              }}
+                            >
+                              使用
+                            </Button>
+                          </ItemActions>
+                        </Item>
                       )
                     })}
                     {!credits.length && (
-                      <p className="py-6 text-center text-sm text-muted-foreground">
-                        暂无可展示的重置卡详情。
-                      </p>
+                      <Empty>
+                        <EmptyHeader>
+                          <EmptyTitle>暂无可展示的重置卡详情</EmptyTitle>
+                        </EmptyHeader>
+                      </Empty>
                     )}
-                  </div>
+                  </ItemGroup>
                 </div>
               </div>
             )}

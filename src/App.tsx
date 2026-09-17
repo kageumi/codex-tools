@@ -750,27 +750,32 @@ function ContextSheet({
           )}
 
           {page === "settings" && (
-            <ToggleGroup
-              orientation="vertical"
-              variant="outline"
-              className="w-full"
-              value={[settingsSection]}
-              onValueChange={(value) => {
-                if (!value[0]) return
-                onSettingsSectionChange(value[0] as SettingsSection)
-                onOpenChange(false)
-              }}
-            >
-              {(
-                Object.entries(settingsSectionLabels) as Array<
-                  [SettingsSection, string]
+            <FieldGroup>
+              <Field>
+                <FieldLabel>设置章节</FieldLabel>
+                <ToggleGroup
+                  orientation="vertical"
+                  variant="outline"
+                  className="w-full"
+                  value={[settingsSection]}
+                  onValueChange={(value) => {
+                    if (!value[0]) return
+                    onSettingsSectionChange(value[0] as SettingsSection)
+                    onOpenChange(false)
+                  }}
                 >
-              ).map(([value, label]) => (
-                <ToggleGroupItem key={value} value={value}>
-                  {label}
-                </ToggleGroupItem>
-              ))}
-            </ToggleGroup>
+                  {(
+                    Object.entries(settingsSectionLabels) as Array<
+                      [SettingsSection, string]
+                    >
+                  ).map(([value, label]) => (
+                    <ToggleGroupItem key={value} value={value}>
+                      {label}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+              </Field>
+            </FieldGroup>
           )}
         </SheetBody>
       </SheetContent>

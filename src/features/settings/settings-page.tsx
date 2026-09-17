@@ -15,7 +15,14 @@ import { HugeiconsIcon } from "@hugeicons/react"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import {
   Dialog,
   DialogBody,
@@ -269,13 +276,13 @@ export function SettingsPage({
             <DialogTitle>配置变更预览</DialogTitle>
             <DialogDescription>{activePreview?.targetPath}</DialogDescription>
           </DialogHeader>
-          <DialogBody className="grid gap-2">
+          <DialogBody>
             {activePreview?.changes.map((change) => (
               <div key={change} className="rounded-2xl bg-muted px-3 py-2">
                 {change}
               </div>
             ))}
-            <pre className="max-h-56 overflow-auto rounded-2xl bg-muted p-3 text-xs whitespace-pre-wrap">
+            <pre className="max-h-56 overflow-auto overscroll-contain rounded-2xl bg-muted p-3 text-xs whitespace-pre-wrap">
               {activePreview?.rendered}
             </pre>
           </DialogBody>
@@ -329,7 +336,7 @@ function ConfigSection({
 }) {
   const inspection = overview.inspection
   return (
-    <Card size="sm" className="min-h-full">
+    <Card size="sm" className="flex-1">
       <CardHeader className="border-b">
         <div className="flex items-center gap-2">
           <CardTitle>当前配置</CardTitle>
@@ -337,7 +344,7 @@ function ConfigSection({
             {inspection.valid ? "配置有效" : "需要处理"}
           </Badge>
         </div>
-        <div className="text-sm text-muted-foreground">{inspection.path}</div>
+        <CardDescription>{inspection.path}</CardDescription>
       </CardHeader>
       <CardContent className="grid gap-3">
         <div className="grid grid-cols-2 gap-4">
@@ -415,18 +422,18 @@ function DiagnosticsSection({
     diagnostics.network.environmentProxyConfigured ||
     diagnostics.network.systemProxyConfigured
   return (
-    <Card size="sm" className="min-h-full">
-      <CardHeader className="grid grid-cols-[1fr_auto] items-center border-b">
-        <div>
-          <CardTitle>诊断信息</CardTitle>
-          <div className="mt-1 text-sm text-muted-foreground">
-            可直接提交给开发者 · {formatDiagnosticTime(diagnostics.generatedAt)}
-          </div>
-        </div>
-        <Button size="sm" variant="outline" onClick={() => void copyReport()}>
-          <HugeiconsIcon icon={Copy01Icon} data-icon="inline-start" />
-          复制支持报告
-        </Button>
+    <Card size="sm" className="flex-1">
+      <CardHeader className="border-b">
+        <CardTitle>诊断信息</CardTitle>
+        <CardDescription>
+          可直接提交给开发者 · {formatDiagnosticTime(diagnostics.generatedAt)}
+        </CardDescription>
+        <CardAction>
+          <Button size="sm" variant="outline" onClick={() => void copyReport()}>
+            <HugeiconsIcon icon={Copy01Icon} data-icon="inline-start" />
+            复制支持报告
+          </Button>
+        </CardAction>
       </CardHeader>
       <CardContent className="grid gap-3">
         <Alert>
@@ -471,7 +478,7 @@ function DiagnosticsSection({
           </Alert>
         )}
 
-        <pre className="max-h-64 overflow-auto rounded-2xl bg-muted p-3 text-xs whitespace-pre-wrap">
+        <pre className="max-h-64 overflow-auto overscroll-contain rounded-2xl bg-muted p-3 text-xs whitespace-pre-wrap">
           {content}
         </pre>
       </CardContent>
@@ -525,12 +532,12 @@ function AppSection({
     }
   }
   return (
-    <Card size="sm" className="min-h-full">
+    <Card size="sm" className="flex-1">
       <CardHeader className="border-b">
         <CardTitle>ChatGPT / Codex 启动程序</CardTitle>
-        <div className="text-sm text-muted-foreground">
+        <CardDescription>
           手动指定用于启动和模型解锁的应用或可执行文件。
-        </div>
+        </CardDescription>
       </CardHeader>
       <CardContent>
         <FieldGroup>
@@ -606,7 +613,7 @@ function UnlockSection({
   onDebug: () => void
 }) {
   return (
-    <Card size="sm" className="min-h-full">
+    <Card size="sm" className="flex-1">
       <CardHeader className="border-b">
         <div className="flex items-center gap-2">
           <CardTitle>模型解锁</CardTitle>
@@ -614,9 +621,9 @@ function UnlockSection({
             {status.injected ? "已注入" : "未注入"}
           </Badge>
         </div>
-        <div className="text-sm text-muted-foreground">
+        <CardDescription>
           向 Codex 桌面端注入当前服务的可用模型。
-        </div>
+        </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-3">
         <ItemGroup>

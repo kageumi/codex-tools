@@ -102,7 +102,7 @@ export function DashboardPage({
       )}
 
       <Card size="sm" className="min-h-60 flex-1">
-        <CardHeader className="grid grid-cols-[1fr_auto] items-center">
+        <CardHeader className="border-b">
           <CardTitle>Token 趋势（最近 7 天）</CardTitle>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-1">
@@ -240,9 +240,7 @@ function Metric({
   return (
     <div className="flex min-w-0 flex-col gap-1 px-3 first:pl-0 last:pr-0">
       <span className="text-xs text-muted-foreground">{label}</span>
-      <span className="text-xl font-medium tracking-tight tabular-nums">
-        {value}
-      </span>
+      <span className="text-base font-medium tabular-nums">{value}</span>
       {detail && (
         <span className="truncate text-xs text-muted-foreground">{detail}</span>
       )}

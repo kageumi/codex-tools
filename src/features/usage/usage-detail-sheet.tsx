@@ -1,5 +1,17 @@
 import { useState } from "react"
-import { Progress, ProgressLabel } from "@/components/ui/progress"
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemGroup,
+  ItemTitle,
+} from "@/components/ui/item"
+import {
+  Progress,
+  ProgressLabel,
+  ProgressValue,
+} from "@/components/ui/progress"
+import { Separator } from "@/components/ui/separator"
 import {
   Sheet,
   SheetBody,
@@ -47,30 +59,30 @@ export function UsageDetail({
             {groupBy === "model" ? display.model : display.sourceName}
           </SheetTitle>
         </SheetHeader>
-        <SheetBody className="grid content-start gap-2">
+        <SheetBody className="gap-2">
           <Progress
             value={hitRate ?? 0}
             className="rounded-2xl bg-muted/40 p-3"
           >
             <ProgressLabel>缓存命中率</ProgressLabel>
-            <span className="ml-auto text-sm text-muted-foreground tabular-nums">
-              {formatPercent(hitRate)}
-            </span>
+            <ProgressValue>{() => formatPercent(hitRate)}</ProgressValue>
           </Progress>
-          {details.map(([label, value]) => (
-            <div
-              key={label}
-              className="flex items-center justify-between rounded-2xl bg-muted px-3 py-2"
-            >
-              <span className="text-muted-foreground">{label}</span>
-              <span className="font-medium tabular-nums">
-                {formatInteger(value)}
-              </span>
-            </div>
-          ))}
-          <div className="flex items-center justify-between border-t pt-4">
+          <ItemGroup>
+            {details.map(([label, value]) => (
+              <Item key={label} size="xs" variant="muted">
+                <ItemContent>
+                  <ItemTitle>{label}</ItemTitle>
+                </ItemContent>
+                <ItemActions className="font-medium tabular-nums">
+                  {formatInteger(value)}
+                </ItemActions>
+              </Item>
+            ))}
+          </ItemGroup>
+          <Separator />
+          <div className="flex items-center justify-between">
             <span className="font-medium">合计</span>
-            <span className="text-lg font-medium tabular-nums">
+            <span className="text-base font-medium tabular-nums">
               {formatInteger(display.tokens.totalTokens)}
             </span>
           </div>
