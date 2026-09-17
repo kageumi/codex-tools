@@ -247,15 +247,13 @@ fn default_reasoning_levels() -> Vec<ReasoningLevelInfo> {
 pub(crate) async fn status(store: &Store) -> Result<ModelUnlockStatus, AppError> {
     let active_kind = store.read(|state| state.active.kind)?;
     let models = model_catalog(store)?;
-    let debug_port = find_codex_debug_port_on(&debug_probe_ports(store)).await;
-    let injected = match debug_port {
-        Some(port) => match codex_page_ws_url(port).await {
-            Some(ws_url) => evaluate(&ws_url, "window.__CODEX_TOOLS_MODEL_UNLOCKED__ === true")
-                .await
-                .map(|value| value.as_bool().unwrap_or(false))
-                .unwrap_or(false),
-            None => false,
-        },
+    let page = find_codex_debug_page_on(&debug_probe_ports(store)).await;
+    let debug_port = page.as_ref().map(|(port, _)| *port);
+    let injected = match page {
+        Some((_, ws_url)) => evaluate(&ws_url, "window.__CODEX_TOOLS_MODEL_UNLOCKED__ === true")
+            .await
+            .map(|value| value.as_bool().unwrap_or(false))
+            .unwrap_or(false),
         None => false,
     };
     let configured = store.codex_app_setting()?;
@@ -312,7 +310,7 @@ async fn unlock_on(
     ports: &[u16],
 ) -> Result<ModelUnlockResult, AppError> {
     let context = model_catalog_write_context(store, activation).await?;
-    let port = find_codex_debug_port_on(ports).await.ok_or_else(|| {
+    let (port, ws_url) = find_codex_debug_page_on(ports).await.ok_or_else(|| {
         AppError::InvalidConfig(
             "未找到带调试端口的 Codex 实例，请先用“以调试模式启动 Codex 并解锁”打开。".into(),
         )
@@ -338,7 +336,7 @@ async fn unlock_on(
     // 刷新 model_catalog_json 指向的目录文件，保证已运行实例也能读到自定义模型。
     let home = crate::codex::home(&store.codex_home_setting()?);
     write_model_catalog(&home, &catalog)?;
-    inject(port, &catalog).await
+    inject(port, &ws_url, &catalog).await
 }
 
 /// 启动 Codex 桌面应用（调试模式）并默认解锁模型；
@@ -369,7 +367,7 @@ pub(crate) async fn launch_with_debug(
         }
     };
     // 已有调试端口的运行实例：直接重新注入，不触碰运行中的进程。
-    if let Some(port) = find_codex_debug_port_on(&debug_probe_ports(store)).await {
+    if let Some((port, ws_url)) = find_codex_debug_page_on(&debug_probe_ports(store)).await {
         let home = crate::codex::home(&store.codex_home_setting()?);
         write_model_catalog(&home, &catalog)?;
         if catalog.is_empty() {
@@ -380,7 +378,7 @@ pub(crate) async fn launch_with_debug(
                 message: empty_message(active_kind),
             });
         }
-        return inject(port, &catalog).await;
+        return inject(port, &ws_url, &catalog).await;
     }
     // 单实例桌面应用通常会忽略第二次启动传入的调试参数；不关闭或重启
     // 用户现有的实例，直接要求用户手动退出后再启动。
@@ -398,9 +396,9 @@ pub(crate) async fn launch_with_debug(
     platform::dashboard_launch_app_with_debug(debug_port, configured.as_deref())
         .map_err(|error| AppError::Internal(format!("无法以调试模式启动 Codex：{error}")))?;
     let deadline = Instant::now() + WAIT_LAUNCH_TIMEOUT;
-    let port = loop {
-        if let Some(port) = find_codex_debug_port_on(&debug_probe_ports(store)).await {
-            break port;
+    let (port, ws_url) = loop {
+        if let Some(page) = find_codex_debug_page_on(&debug_probe_ports(store)).await {
+            break page;
         }
         if Instant::now() >= deadline {
             let hint = if platform::codex_app_running(configured.as_deref()) {
@@ -422,7 +420,7 @@ pub(crate) async fn launch_with_debug(
             message: empty_message(active_kind),
         });
     }
-    inject(port, &catalog).await
+    inject(port, &ws_url, &catalog).await
 }
 
 fn ensure_active_official_account_usable(
@@ -442,20 +440,21 @@ fn ensure_active_official_account_usable(
 }
 
 /// 连接 Codex 的调试端口，先写入模型目录，再执行解锁脚本并校验结果。
-async fn inject(port: u16, catalog: &[CodexModelInfo]) -> Result<ModelUnlockResult, AppError> {
-    let ws_url = codex_page_ws_url(port).await.ok_or_else(|| {
-        AppError::Internal("Codex 调试端口已失效，请重新打开 Codex 后再试。".into())
-    })?;
+async fn inject(
+    port: u16,
+    ws_url: &str,
+    catalog: &[CodexModelInfo],
+) -> Result<ModelUnlockResult, AppError> {
     let catalog_json = serde_json::to_string(&json!({ "models": catalog }))
         .map_err(|error| AppError::Internal(error.to_string()))?;
     let set_catalog = format!("window.__CODEX_TOOLS_MODEL_CATALOG__ = {catalog_json}; true");
-    evaluate(&ws_url, &set_catalog).await?;
-    let result = evaluate(&ws_url, UNLOCK_SCRIPT).await?;
+    evaluate(ws_url, &set_catalog).await?;
+    let result = evaluate(ws_url, UNLOCK_SCRIPT).await?;
     let status = result
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("failed");
-    let injected = evaluate(&ws_url, "window.__CODEX_TOOLS_MODEL_UNLOCKED__ === true")
+    let injected = evaluate(ws_url, "window.__CODEX_TOOLS_MODEL_UNLOCKED__ === true")
         .await?
         .as_bool()
         .unwrap_or(false);
@@ -473,17 +472,12 @@ async fn inject(port: u16, catalog: &[CodexModelInfo]) -> Result<ModelUnlockResu
     })
 }
 
-/// 扫描候选端口，返回 Codex 桌面应用页面目标（`app://-`）的调试 WebSocket
-/// 地址；没有匹配时返回 `None`。
-async fn codex_page_ws_url(port: u16) -> Option<String> {
-    probe_port(port).await
-}
-
-/// 在所有候选端口上查找 Codex 的 CDP 端点。
-async fn find_codex_debug_port_on(ports: &[u16]) -> Option<u16> {
+/// 在所有候选端口上查找 Codex 的 CDP 端点，并复用探测结果里的页面
+/// WebSocket 地址，避免调用方再次探测同一端口。
+async fn find_codex_debug_page_on(ports: &[u16]) -> Option<(u16, String)> {
     for &port in ports {
-        if probe_port(port).await.is_some() {
-            return Some(port);
+        if let Some(ws_url) = probe_port(port).await {
+            return Some((port, ws_url));
         }
     }
     None
@@ -1432,7 +1426,8 @@ mod tests {
             .unwrap();
         store.activate("provider").unwrap();
         let catalog = model_catalog(&store).unwrap();
-        let result = inject(port, &catalog).await.unwrap();
+        let ws_url = probe_port(port).await.unwrap();
+        let result = inject(port, &ws_url, &catalog).await.unwrap();
 
         assert!(result.injected);
         assert_eq!(result.port, port);

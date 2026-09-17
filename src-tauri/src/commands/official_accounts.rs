@@ -201,7 +201,7 @@ async fn connections_import_cookie_in_store(
 }
 
 #[tauri::command]
-pub(crate) fn connections_update_account_remark(
+pub(crate) async fn connections_update_account_remark(
     store: State<'_, Store>,
     id: String,
     remark: String,
@@ -211,7 +211,7 @@ pub(crate) fn connections_update_account_remark(
 }
 
 #[tauri::command]
-pub(crate) fn connections_update_account_remarks(
+pub(crate) async fn connections_update_account_remarks(
     store: State<'_, Store>,
     updates: Vec<AccountRemarkUpdate>,
 ) -> Result<Vec<OfficialAccountView>, AppError> {
@@ -278,6 +278,17 @@ async fn refresh_official_quota(
     activation: &ActivationLock,
     account_id: &str,
 ) -> Result<ProviderAccountQuota, AppError> {
+    let snapshot = fetch_official_quota(store, center, client, activation, account_id).await?;
+    store.save_official_account_quota(account_id, snapshot.clone())
+}
+
+async fn fetch_official_quota(
+    store: &Store,
+    center: &AuthCenter,
+    client: &ApiClient,
+    activation: &ActivationLock,
+    account_id: &str,
+) -> Result<ProviderAccountQuota, AppError> {
     let _quota_guard = client.1.lock().await;
     let stored = store.official_account(account_id)?;
     let now = chrono::Utc::now().timestamp();
@@ -292,7 +303,7 @@ async fn refresh_official_quota(
             };
             snapshot.error = Some(error.to_string());
             snapshot.error_code = None;
-            return store.save_official_account_quota(account_id, snapshot);
+            return Ok(snapshot);
         }
     };
     let http = client.current()?;
@@ -318,7 +329,7 @@ async fn refresh_official_quota(
             snapshot.error_code = error.code;
         }
     }
-    store.save_official_account_quota(account_id, snapshot)
+    Ok(snapshot)
 }
 
 async fn account_for_quota(
@@ -623,15 +634,18 @@ async fn connections_refresh_all_quota_in_store(
             .collect::<Vec<_>>()
     })?;
     let requests = account_ids.into_iter().map(|account_id| async move {
-        Ok::<_, AppError>(QuotaRefreshResult {
-            quota: refresh_official_quota(store, center, client, activation, &account_id).await?,
-            account_id,
-        })
+        let quota = fetch_official_quota(store, center, client, activation, &account_id).await?;
+        Ok::<_, AppError>((account_id, quota))
     });
-    stream::iter(requests)
+    let fetched = stream::iter(requests)
         .buffered(QUOTA_REFRESH_CONCURRENCY)
         .try_collect::<Vec<_>>()
-        .await
+        .await?;
+    store.save_official_account_quotas(&fetched)?;
+    Ok(fetched
+        .into_iter()
+        .map(|(account_id, quota)| QuotaRefreshResult { quota, account_id })
+        .collect())
 }
 
 #[tauri::command]
@@ -1301,6 +1315,16 @@ mod tests {
                 .iter()
                 .all(|result| result.quota.last_attempt_at.is_some())
         );
+        let persisted = store
+            .read(|state| {
+                state
+                    .official_accounts
+                    .iter()
+                    .map(|account| account.quota.status)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert_eq!(persisted, vec![QuotaStatus::Unauthorized; 2]);
     }
 
     #[tokio::test]

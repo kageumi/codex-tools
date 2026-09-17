@@ -197,6 +197,43 @@ fn official_account_subject(account: &StoredOfficialAccount) -> Option<String> {
     credential_subject(&account.credential)
 }
 
+/// 预计算的身份键：把 JWT 解析结果固定下来，供批量比较复用。
+pub(crate) struct OfficialAccountIdentityKey {
+    workspace: String,
+    subject: Option<String>,
+    email: String,
+}
+
+impl OfficialAccountIdentityKey {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        if self.workspace != other.workspace {
+            return false;
+        }
+        match (&self.subject, &other.subject) {
+            (Some(left), Some(right)) => left == right,
+            _ => {
+                if !self.email.is_empty() && !other.email.is_empty() {
+                    return self.email.eq_ignore_ascii_case(&other.email);
+                }
+                self.subject.is_none()
+                    && other.subject.is_none()
+                    && self.email.is_empty()
+                    && other.email.is_empty()
+            }
+        }
+    }
+}
+
+pub(crate) fn official_account_identity_key(
+    account: &StoredOfficialAccount,
+) -> OfficialAccountIdentityKey {
+    OfficialAccountIdentityKey {
+        workspace: account.account_id.trim().to_owned(),
+        subject: official_account_subject(account),
+        email: account.email.trim().to_owned(),
+    }
+}
+
 /// Accounts are scoped to a ChatGPT workspace, then distinguished by the
 /// OpenAI user. Older credentials without a `sub` claim fall back to email;
 /// workspace-only matching is safe only when neither side has a user identity.
@@ -204,26 +241,7 @@ pub(crate) fn official_account_identity_matches(
     left: &StoredOfficialAccount,
     right: &StoredOfficialAccount,
 ) -> bool {
-    if left.account_id.trim() != right.account_id.trim() {
-        return false;
-    }
-
-    let left_subject = official_account_subject(left);
-    let right_subject = official_account_subject(right);
-    if let (Some(left_subject), Some(right_subject)) = (&left_subject, &right_subject) {
-        return left_subject == right_subject;
-    }
-
-    let left_email = left.email.trim();
-    let right_email = right.email.trim();
-    if !left_email.is_empty() && !right_email.is_empty() {
-        return left_email.eq_ignore_ascii_case(right_email);
-    }
-
-    left_subject.is_none()
-        && right_subject.is_none()
-        && left_email.is_empty()
-        && right_email.is_empty()
+    official_account_identity_key(left).matches(&official_account_identity_key(right))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

@@ -140,6 +140,7 @@ export function ProvidersPage({
 
   const finishLoginPoll = useCallback(
     (result: Awaited<ReturnType<typeof call<"connections_login_poll">>>) => {
+      setLoginError(undefined)
       if (result.status === "complete") {
         toast.add({
           title: "OpenAI 账号已保存",

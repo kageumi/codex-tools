@@ -137,6 +137,34 @@ impl SessionIndex {
         }
         affected_dbs.sort();
         affected_rollouts.sort();
+        let covered: std::collections::HashSet<PathBuf> = affected
+            .iter()
+            .flat_map(|path| [path.clone(), sqlite_sidecar(path, "-wal")])
+            .collect();
+        let previous: HashMap<&Path, &SourceStamp> = cached
+            .sources
+            .iter()
+            .map(|stamp| (stamp.path.as_path(), stamp))
+            .collect();
+        let current: HashMap<&Path, &SourceStamp> = sources
+            .iter()
+            .map(|stamp| (stamp.path.as_path(), stamp))
+            .collect();
+        let outside_changed = previous.iter().any(|(path, old)| {
+            if covered.contains(*path) {
+                return false;
+            }
+            match current.get(path) {
+                Some(new) => *old != *new,
+                None => true,
+            }
+        }) || current
+            .iter()
+            .any(|(path, _)| !covered.contains(*path) && !previous.contains_key(path));
+        if outside_changed {
+            *cache = None;
+            return Ok(());
+        }
         let sessions = merge_refreshed_sessions(
             &cached.sessions,
             &affected_dbs,
@@ -174,6 +202,10 @@ fn merge_refreshed_sessions(
 ) -> anyhow::Result<Vec<SessionSummary>> {
     let scope = provider_sync::session_scope(all_databases, all_rollouts)?;
     let affected = rebuild_from_paths_with_scope(affected_dbs, affected_rollouts, &scope)?;
+    let affected_rollout_set: std::collections::HashSet<&Path> =
+        affected_rollouts.iter().map(PathBuf::as_path).collect();
+    let affected_db_set: std::collections::HashSet<&Path> =
+        affected_dbs.iter().map(PathBuf::as_path).collect();
     let mut by_id: HashMap<String, SessionSummary> = existing
         .iter()
         .map(|session| (session.id.clone(), session.clone()))
@@ -181,7 +213,7 @@ fn merge_refreshed_sessions(
     for session in affected {
         match by_id.get_mut(&session.id) {
             Some(current) => {
-                if authoritative_source_affected(current, affected_dbs, affected_rollouts) {
+                if authoritative_source_affected(current, &affected_db_set, &affected_rollout_set) {
                     *current = session;
                 }
             }
@@ -197,16 +229,12 @@ fn merge_refreshed_sessions(
 
 fn authoritative_source_affected(
     session: &SessionSummary,
-    affected_dbs: &[PathBuf],
-    affected_rollouts: &[PathBuf],
+    affected_dbs: &std::collections::HashSet<&Path>,
+    affected_rollouts: &std::collections::HashSet<&Path>,
 ) -> bool {
     match session.source_rollout.as_deref() {
-        Some(path) => affected_rollouts
-            .iter()
-            .any(|item| item.as_path() == Path::new(path)),
-        None => affected_dbs
-            .iter()
-            .any(|item| item.as_path() == Path::new(&session.source_db)),
+        Some(path) => affected_rollouts.contains(Path::new(path)),
+        None => affected_dbs.contains(Path::new(&session.source_db)),
     }
 }
 
@@ -585,6 +613,45 @@ mod tests {
         assert_eq!(
             refreshed.iter().find(|s| s.id == "two").unwrap().provider,
             "openai"
+        );
+    }
+
+    #[test]
+    fn refresh_paths_invalidates_when_unaffected_source_changed() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let a = sessions.join("a.jsonl");
+        let b = sessions.join("b.jsonl");
+        let write_rollout = |path: &Path, id: &str, provider: &str| {
+            fs::write(
+                path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"{provider}\"}}}}\n\
+                     {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{id} title\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_rollout(&a, "one", "openai");
+        write_rollout(&b, "two", "openai");
+        let index = SessionIndex::default();
+        index.load(temp.path()).unwrap();
+
+        write_rollout(&a, "one", "custom");
+        write_rollout(&b, "two", "custom");
+        index
+            .refresh_paths(temp.path(), std::slice::from_ref(&a))
+            .unwrap();
+
+        let refreshed = index.load(temp.path()).unwrap();
+        assert_eq!(
+            refreshed.iter().find(|s| s.id == "one").unwrap().provider,
+            "custom"
+        );
+        assert_eq!(
+            refreshed.iter().find(|s| s.id == "two").unwrap().provider,
+            "custom"
         );
     }
 

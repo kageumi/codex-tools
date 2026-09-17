@@ -71,15 +71,23 @@ export function contextWindowOverrideEditorSessionOf(
   ].join("\u0000")
 }
 
-/** 有效模型 = /models 同步模型 ∪ 自定义模型（保序去重）。 */
-export function effectiveModelsOf(provider: Provider): string[] {
-  const available = provider.availableModels ?? []
-  const availableSet = new Set(available)
-  const models = [...available]
-  for (const model of provider.customModels ?? []) {
+/** 合并 /models 同步模型与自定义模型（保序去重）。 */
+export function mergeModels(
+  available: string[] | undefined,
+  custom: string[] | undefined
+): string[] {
+  const availableList = available ?? []
+  const availableSet = new Set(availableList)
+  const models = [...availableList]
+  for (const model of custom ?? []) {
     if (!availableSet.has(model)) models.push(model)
   }
   return models
+}
+
+/** 有效模型 = /models 同步模型 ∪ 自定义模型（保序去重）。 */
+export function effectiveModelsOf(provider: Provider): string[] {
+  return mergeModels(provider.availableModels, provider.customModels)
 }
 
 /** 有效模型数 = /models 同步模型 ∪ 自定义模型（去重）。 */
@@ -104,12 +112,6 @@ export function allModelsSelected(provider: Provider): boolean {
   if (selected === undefined) return true
   const selectedSet = new Set(selected)
   return effectiveModelsOf(provider).every((model) => selectedSet.has(model))
-}
-
-/** 无选中 = 存在有效模型但 selectedModels 为空数组（此时禁止保存）。 */
-export function noModelsSelected(provider: Provider): boolean {
-  const selected = selectedModelsOf(provider)
-  return effectiveModelCount(provider) > 0 && selected?.length === 0
 }
 
 export function accountIsExpired(account: OfficialAccountView) {

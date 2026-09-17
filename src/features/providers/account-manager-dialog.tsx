@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Delete02Icon } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
 
@@ -59,6 +59,61 @@ type AccountManagerDialogProps = {
   onSelectedIdChange: (id: string) => void
   onRefresh: () => void
 }
+
+const AccountRow = memo(function AccountRow({
+  account,
+  checked,
+  remark,
+  frozen,
+  onToggle,
+  onRemarkChange,
+}: {
+  account: OfficialAccountView
+  checked: boolean
+  remark: string
+  frozen: boolean
+  onToggle: (id: string, checked: boolean) => void
+  onRemarkChange: (id: string, value: string) => void
+}) {
+  const displayName = account.remark || account.name
+  return (
+    <TableRow data-state={checked ? "selected" : undefined}>
+      <TableCell>
+        <Checkbox
+          aria-label={`选择账号 ${displayName}`}
+          checked={checked}
+          disabled={frozen}
+          onCheckedChange={(nextChecked) => onToggle(account.id, nextChecked)}
+        />
+      </TableCell>
+      <TableCell>
+        <div className="max-w-52">
+          <div className="truncate font-medium">{account.name}</div>
+          <div className="truncate text-xs text-muted-foreground">
+            {account.email || account.accountId}
+          </div>
+        </div>
+      </TableCell>
+      <TableCell>
+        {account.active ? (
+          <Badge>当前账号</Badge>
+        ) : (
+          <Badge variant="outline">已保存</Badge>
+        )}
+      </TableCell>
+      <TableCell>
+        <Input
+          aria-label={`${account.name}的账号备注`}
+          disabled={frozen}
+          maxLength={MAX_REMARK_LENGTH}
+          placeholder="未设置备注"
+          value={remark}
+          onChange={(event) => onRemarkChange(account.id, event.target.value)}
+        />
+      </TableCell>
+    </TableRow>
+  )
+})
 
 export function AccountManagerDialog({
   open,
@@ -148,15 +203,26 @@ export function AccountManagerDialog({
     onOpenChange(nextOpen)
   }
 
-  const toggleAccount = (id: string, checked: boolean) => {
-    if (busy) return
-    setSelectedIds((current) => {
-      const next = new Set(current)
-      if (checked) next.add(id)
-      else next.delete(id)
-      return next
-    })
-  }
+  const toggleAccount = useCallback(
+    (id: string, checked: boolean) => {
+      if (busy) return
+      setSelectedIds((current) => {
+        const next = new Set(current)
+        if (checked) next.add(id)
+        else next.delete(id)
+        return next
+      })
+    },
+    [busy]
+  )
+
+  const updateDraft = useCallback(
+    (id: string, value: string) => {
+      if (busy) return
+      setDrafts((current) => ({ ...current, [id]: value }))
+    },
+    [busy]
+  )
 
   const fallbackCandidates = () =>
     buildFallbackCandidates(accounts, providers, selectedIds)
@@ -316,60 +382,17 @@ export function AccountManagerDialog({
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {accounts.map((account) => {
-                    const displayName = account.remark || account.name
-                    const checked = selectedIds.has(account.id)
-                    return (
-                      <TableRow
-                        key={account.id}
-                        data-state={checked ? "selected" : undefined}
-                      >
-                        <TableCell>
-                          <Checkbox
-                            aria-label={`选择账号 ${displayName}`}
-                            checked={checked}
-                            disabled={frozen}
-                            onCheckedChange={(nextChecked) =>
-                              toggleAccount(account.id, nextChecked)
-                            }
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <div className="max-w-52">
-                            <div className="truncate font-medium">
-                              {account.name}
-                            </div>
-                            <div className="truncate text-xs text-muted-foreground">
-                              {account.email || account.accountId}
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          {account.active ? (
-                            <Badge>当前账号</Badge>
-                          ) : (
-                            <Badge variant="outline">已保存</Badge>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Input
-                            aria-label={`${account.name}的账号备注`}
-                            disabled={frozen}
-                            maxLength={MAX_REMARK_LENGTH}
-                            placeholder="未设置备注"
-                            value={drafts[account.id] ?? account.remark}
-                            onChange={(event) => {
-                              if (busy) return
-                              setDrafts((current) => ({
-                                ...current,
-                                [account.id]: event.target.value,
-                              }))
-                            }}
-                          />
-                        </TableCell>
-                      </TableRow>
-                    )
-                  })}
+                  {accounts.map((account) => (
+                    <AccountRow
+                      key={account.id}
+                      account={account}
+                      checked={selectedIds.has(account.id)}
+                      remark={drafts[account.id] ?? account.remark}
+                      frozen={frozen}
+                      onToggle={toggleAccount}
+                      onRemarkChange={updateDraft}
+                    />
+                  ))}
                 </TableBody>
               </Table>
             </div>

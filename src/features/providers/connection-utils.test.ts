@@ -17,7 +17,6 @@ import {
   contextWindowOverrideInputOf,
   contextWindowOverrideEditorSessionOf,
   isValidContextWindowOverride,
-  noModelsSelected,
   providerSaveInputOf,
   removeCustomModelFrom,
   repairWarning,
@@ -398,23 +397,21 @@ describe("effectiveModelsOf", () => {
   })
 })
 
-describe("allModelsSelected / noModelsSelected", () => {
+describe("allModelsSelected", () => {
   it("undefined（未设置）视为全选", () => {
     const provider = makeProvider({
       availableModels: ["a", "b"],
       selectedModels: undefined,
     })
     expect(allModelsSelected(provider)).toBe(true)
-    expect(noModelsSelected(provider)).toBe(false)
   })
 
-  it("空数组不是全选而是无选中", () => {
+  it("空数组不是全选", () => {
     const provider = makeProvider({
       availableModels: ["a", "b"],
       selectedModels: [],
     })
     expect(allModelsSelected(provider)).toBe(false)
-    expect(noModelsSelected(provider)).toBe(true)
   })
 
   it("选中全部时视为全选", () => {
@@ -423,7 +420,6 @@ describe("allModelsSelected / noModelsSelected", () => {
       selectedModels: ["a", "b"],
     })
     expect(allModelsSelected(provider)).toBe(true)
-    expect(noModelsSelected(provider)).toBe(false)
   })
 })
 
@@ -434,7 +430,6 @@ describe("null 处理（后端 Option::None 序列化为 null）", () => {
       selectedModels: null as unknown as string[] | undefined,
     })
     expect(allModelsSelected(provider)).toBe(true)
-    expect(noModelsSelected(provider)).toBe(false)
   })
 
   it("null 时 toggleModelSelected 基于有效模型全选计算", () => {

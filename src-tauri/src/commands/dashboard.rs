@@ -135,7 +135,9 @@ fn settings_overview(store: &Store) -> Result<SettingsOverview, AppError> {
 }
 
 #[tauri::command]
-pub(crate) fn settings_get_overview(store: State<Store>) -> Result<SettingsOverview, AppError> {
+pub(crate) async fn settings_get_overview(
+    store: State<'_, Store>,
+) -> Result<SettingsOverview, AppError> {
     settings_overview(&store)
 }
 
@@ -360,7 +362,9 @@ pub(crate) async fn dashboard_launch(
 
 /// 读取 Codex 应用路径设置（手动配置 + 实际检测结果）。
 #[tauri::command]
-pub(crate) fn settings_get_codex_app(store: State<Store>) -> Result<CodexAppSetting, AppError> {
+pub(crate) async fn settings_get_codex_app(
+    store: State<'_, Store>,
+) -> Result<CodexAppSetting, AppError> {
     let configured = store.codex_app_setting()?;
     Ok(CodexAppSetting {
         configured: configured.clone(),
@@ -371,8 +375,8 @@ pub(crate) fn settings_get_codex_app(store: State<Store>) -> Result<CodexAppSett
 
 /// 保存手动指定的 Codex 应用路径（`.app` 目录或可执行文件）；`None` 恢复自动检测。
 #[tauri::command]
-pub(crate) fn settings_save_codex_app_path(
-    store: State<Store>,
+pub(crate) async fn settings_save_codex_app_path(
+    store: State<'_, Store>,
     path: Option<String>,
 ) -> Result<(), AppError> {
     if let Some(path) = path

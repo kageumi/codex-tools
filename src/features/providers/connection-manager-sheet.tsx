@@ -84,6 +84,7 @@ type DeleteTarget = {
 
 const EMPTY_ACCOUNTS: OfficialAccountView[] = []
 const EMPTY_PROVIDERS: Provider[] = []
+const EMPTY_SELECTION: readonly string[] = []
 const DELETE_NAME_MAX_LENGTH = 16
 
 function truncateDeleteName(name: string) {
@@ -668,7 +669,7 @@ export function ConnectionManagerSheet({
         onOpenChange={setAccountManagerOpen}
         accounts={accounts}
         providers={providers}
-        initialSelectedIds={[]}
+        initialSelectedIds={EMPTY_SELECTION}
         selectedId={selectedId}
         onSelectedIdChange={onSelectedIdChange}
         onRefresh={onChanged}

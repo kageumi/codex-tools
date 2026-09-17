@@ -264,8 +264,7 @@ impl Store {
 
         // 候选状态上的变更和 fsync 都不持有状态写锁，读操作在提交前
         // 继续看到稳定的旧状态。
-        let current = self.current_state_for_update()?;
-        let mut draft = current.clone();
+        let mut draft = self.current_state_for_update()?;
         let result = mutate(&mut draft)?;
         if let Err(error) = persist_files(
             &self.root,
@@ -693,6 +692,29 @@ impl Store {
         })?
     }
 
+    pub(crate) fn official_account_for_maintenance(
+        &self,
+        id: &str,
+    ) -> Result<(StoredOfficialAccount, CredentialRefreshState, bool), AppError> {
+        self.read(|state| {
+            let account = state
+                .official_accounts
+                .iter()
+                .find(|account| account.id == id)
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
+                })?;
+            let active = matches!(state.active.kind, ActiveKind::Official)
+                && state.active.account_id.as_deref() == Some(account.id.as_str());
+            let refresh = state
+                .credential_refresh
+                .get(id)
+                .cloned()
+                .unwrap_or_default();
+            Ok((account.clone(), refresh, active))
+        })?
+    }
+
     pub(crate) fn save_credential_refresh_state(
         &self,
         id: &str,
@@ -995,6 +1017,29 @@ impl Store {
                 })?;
             account.quota = quota.clone();
             Ok(quota)
+        })
+    }
+
+    /// 批量刷新额度时把整批快照合并成一次状态事务，避免每个账号
+    /// 都克隆并重写全部状态文件。已被删除的账号会被跳过。
+    pub fn save_official_account_quotas(
+        &self,
+        quotas: &[(String, ProviderAccountQuota)],
+    ) -> Result<(), AppError> {
+        if quotas.is_empty() {
+            return Ok(());
+        }
+        self.update(|state| {
+            for (id, quota) in quotas {
+                if let Some(account) = state
+                    .official_accounts
+                    .iter_mut()
+                    .find(|account| account.id == *id)
+                {
+                    account.quota = quota.clone();
+                }
+            }
+            Ok(())
         })
     }
 
@@ -1545,19 +1590,18 @@ fn remove_tombstoned_connections(state: &mut AppConfig) -> bool {
 }
 
 fn merge_current_duplicate_official_accounts(state: &mut AppConfig) -> bool {
-    let mut merged_accounts = Vec::with_capacity(state.official_accounts.len());
+    let mut merged_accounts: Vec<StoredOfficialAccount> =
+        Vec::with_capacity(state.official_accounts.len());
+    let mut merged_keys: Vec<OfficialAccountIdentityKey> =
+        Vec::with_capacity(state.official_accounts.len());
     let mut retained_ids = BTreeMap::new();
     let active_account_id = matches!(state.active.kind, ActiveKind::Official)
         .then_some(state.active.account_id.as_deref())
         .flatten();
 
     for account in std::mem::take(&mut state.official_accounts) {
-        if let Some(index) = merged_accounts
-            .iter()
-            .position(|saved: &StoredOfficialAccount| {
-                official_account_identity_matches(saved, &account)
-            })
-        {
+        let key = official_account_identity_key(&account);
+        if let Some(index) = merged_keys.iter().position(|saved| saved.matches(&key)) {
             let active_duplicate = active_account_id == Some(account.id.as_str());
             let existing = merged_accounts[index].clone();
             let replacement = if active_duplicate {
@@ -1566,10 +1610,12 @@ fn merge_current_duplicate_official_accounts(state: &mut AppConfig) -> bool {
                 merge_legacy_official_account(&existing, &account)
             };
             let previous = std::mem::replace(&mut merged_accounts[index], replacement);
+            merged_keys[index] = official_account_identity_key(&merged_accounts[index]);
             let retained_id = merged_accounts[index].id.clone();
             retained_ids.insert(previous.id, retained_id.clone());
             retained_ids.insert(account.id, retained_id);
         } else {
+            merged_keys.push(key);
             merged_accounts.push(account);
         }
     }

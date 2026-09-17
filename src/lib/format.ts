@@ -67,8 +67,8 @@ export function formatRange(range: UsageRange) {
   return `${formatDate(range.startAtMs)} – ${formatDate(range.endAtMs - 1)}`
 }
 
-export function todayRange(days = 1): UsageRange {
-  const end = new Date()
+export function todayRange(days = 1, now: Date = new Date()): UsageRange {
+  const end = new Date(now)
   end.setHours(24, 0, 0, 0)
   const start = new Date(end)
   start.setDate(start.getDate() - days)

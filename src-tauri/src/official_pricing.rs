@@ -169,12 +169,16 @@ pub(crate) fn resolve_model<'a>(
         catalog
             .models
             .iter()
-            .filter(|(candidate, _)| normalized.starts_with(&format!("{candidate}-")))
+            .filter(|(candidate, _)| {
+                normalized.starts_with(candidate.as_str())
+                    && normalized.as_bytes().get(candidate.len()) == Some(&b'-')
+            })
             .max_by_key(|(candidate, _)| candidate.len())
             .map(|(_, rate)| rate)
     })
 }
 
+#[cfg(test)]
 pub(crate) fn calculate(
     catalog: &OfficialPricingCatalog,
     usage: &TokenUsage,
@@ -182,6 +186,13 @@ pub(crate) fn calculate(
 ) -> Result<i64, String> {
     let rate =
         resolve_model(catalog, model).ok_or_else(|| "官方价格目录暂未收录此模型。".to_owned())?;
+    calculate_with_rate(rate, usage)
+}
+
+pub(crate) fn calculate_with_rate(
+    rate: &OfficialModelRate,
+    usage: &TokenUsage,
+) -> Result<i64, String> {
     let rates = if rate
         .long_context_threshold
         .is_some_and(|threshold| usage.input_tokens > threshold)

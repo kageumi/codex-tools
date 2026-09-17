@@ -20,7 +20,7 @@ export default defineConfig({
           if (!id.includes("node_modules")) return
           if (/\/node_modules\/(react|react-dom|scheduler)\//.test(id)) return "react"
           if (/\/node_modules\/@base-ui\/react\//.test(id)) return "baseui"
-          if (/\/node_modules\/(sonner|next-themes|class-variance-authority|clsx|tailwind-merge)\//.test(id)) return "ui"
+          if (/\/node_modules\/(next-themes|class-variance-authority|clsx|tailwind-merge)\//.test(id)) return "ui"
         },
       },
     },

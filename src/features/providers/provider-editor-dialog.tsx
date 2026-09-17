@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { memo, useCallback, useMemo, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -32,10 +32,10 @@ import type { Provider } from "@/types"
 import {
   addCustomModelTo,
   allModelsSelected,
-  effectiveModelsOf,
   contextWindowOverrideInputOf,
   contextWindowOverrideEditorSessionOf,
   isValidContextWindowOverride,
+  mergeModels,
   providerSaveInputOf,
   removeCustomModelFrom,
   toggleModelSelected,
@@ -79,6 +79,46 @@ type ProviderEditorDialogProps = {
   ) => void
   onSaved: (provider: Provider) => void
 }
+
+const ModelRow = memo(function ModelRow({
+  model,
+  selected,
+  isCustom,
+  saving,
+  onToggle,
+  onRemove,
+}: {
+  model: string
+  selected: boolean
+  isCustom: boolean
+  saving: boolean
+  onToggle: (model: string, checked: boolean) => void
+  onRemove: (model: string) => void
+}) {
+  return (
+    <div className="group flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-muted/60">
+      <label className="flex min-w-0 flex-1 items-center gap-2">
+        <Checkbox
+          checked={selected}
+          disabled={saving}
+          onCheckedChange={(checked) => onToggle(model, Boolean(checked))}
+        />
+        <span className="truncate">{model}</span>
+      </label>
+      {isCustom && (
+        <button
+          type="button"
+          aria-label={`移除自定义模型 ${model}`}
+          disabled={saving}
+          onClick={() => onRemove(model)}
+          className="shrink-0 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted hover:text-foreground focus-visible:opacity-100 disabled:opacity-30"
+        >
+          <HugeiconsIcon icon={Delete02Icon} />
+        </button>
+      )}
+    </div>
+  )
+})
 
 export function ProviderEditorDialog(props: ProviderEditorDialogProps) {
   return (
@@ -139,22 +179,53 @@ function ProviderEditorDialogContent({
     }
   }
 
-  const customModels = provider.customModels ?? []
-  // 有效模型 = /models 同步的模型 ∪ 用户手动添加的自定义模型（保序去重）。
-  const effectiveModels = effectiveModelsOf(provider)
-  const selectedSet = provider.selectedModels
-    ? new Set(provider.selectedModels)
-    : undefined
-  const customSet = new Set(customModels)
-  const allSelected =
-    !selectedSet || effectiveModels.every((model) => selectedSet.has(model))
+  const customModels = useMemo(
+    () => provider.customModels ?? [],
+    [provider.customModels]
+  )
+  const effectiveModels = useMemo(
+    () => mergeModels(provider.availableModels, provider.customModels),
+    [provider.availableModels, provider.customModels]
+  )
+  const selectedSet = useMemo(
+    () =>
+      provider.selectedModels ? new Set(provider.selectedModels) : undefined,
+    [provider.selectedModels]
+  )
+  const customSet = useMemo(() => new Set(customModels), [customModels])
+  const allSelected = useMemo(
+    () =>
+      !selectedSet || effectiveModels.every((model) => selectedSet.has(model)),
+    [effectiveModels, selectedSet]
+  )
   const noneSelected = effectiveModels.length > 0 && selectedSet?.size === 0
   const normalizedSearch = modelSearch.trim().toLowerCase()
-  const filteredModels = normalizedSearch
-    ? effectiveModels.filter((model) =>
-        model.toLowerCase().includes(normalizedSearch)
-      )
-    : effectiveModels
+  const filteredModels = useMemo(
+    () =>
+      normalizedSearch
+        ? effectiveModels.filter((model) =>
+            model.toLowerCase().includes(normalizedSearch)
+          )
+        : effectiveModels,
+    [effectiveModels, normalizedSearch]
+  )
+
+  const toggleModel = useCallback(
+    (model: string, checked: boolean) => {
+      onProviderChange((prev) => ({
+        ...prev,
+        selectedModels: toggleModelSelected(prev, model, checked),
+      }))
+    },
+    [onProviderChange]
+  )
+
+  const removeModel = useCallback(
+    (model: string) => {
+      onProviderChange((prev) => removeCustomModelFrom(prev, model))
+    },
+    [onProviderChange]
+  )
 
   const addCustomModel = () => {
     const trimmed = customModelDraft.trim()
@@ -165,11 +236,6 @@ function ProviderEditorDialogContent({
     setCustomModelDraft("")
     // 一次合并 customModels + selectedModels，避免双 update 覆盖。
     onProviderChange((prev) => addCustomModelTo(prev, trimmed))
-  }
-
-  const removeCustomModel = (model: string) => {
-    // 一次合并 customModels + selectedModels。
-    onProviderChange((prev) => removeCustomModelFrom(prev, model))
   }
 
   return (
@@ -344,46 +410,17 @@ function ProviderEditorDialogContent({
                     未找到匹配的模型
                   </div>
                 ) : (
-                  filteredModels.map((model) => {
-                    const selected = selectedSet?.has(model) ?? true
-                    const isCustom = customSet.has(model)
-                    return (
-                      <div
-                        key={model}
-                        className="group flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-muted/60"
-                      >
-                        <label className="flex min-w-0 flex-1 items-center gap-2">
-                          <Checkbox
-                            checked={selected}
-                            disabled={saving}
-                            onCheckedChange={(checked) =>
-                              // 函数式更新：基于最新 prev 计算，避免陈旧闭包。
-                              onProviderChange((prev) => ({
-                                ...prev,
-                                selectedModels: toggleModelSelected(
-                                  prev,
-                                  model,
-                                  Boolean(checked)
-                                ),
-                              }))
-                            }
-                          />
-                          <span className="truncate">{model}</span>
-                        </label>
-                        {isCustom && (
-                          <button
-                            type="button"
-                            aria-label={`移除自定义模型 ${model}`}
-                            disabled={saving}
-                            onClick={() => removeCustomModel(model)}
-                            className="shrink-0 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted hover:text-foreground focus-visible:opacity-100 disabled:opacity-30"
-                          >
-                            <HugeiconsIcon icon={Delete02Icon} />
-                          </button>
-                        )}
-                      </div>
-                    )
-                  })
+                  filteredModels.map((model) => (
+                    <ModelRow
+                      key={model}
+                      model={model}
+                      selected={selectedSet?.has(model) ?? true}
+                      isCustom={customSet.has(model)}
+                      saving={saving}
+                      onToggle={toggleModel}
+                      onRemove={removeModel}
+                    />
+                  ))
                 )}
               </div>
               <div className="text-xs text-muted-foreground">

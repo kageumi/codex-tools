@@ -104,16 +104,27 @@ static SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, ProxySnapshot)>>> = OnceL
 /// 带短 TTL 缓存的系统代理快照：短时间内重复调用不会重复执行子进程/
 /// 注册表探测，适合每请求调用的热路径（额度轮询、模型同步、转换代理转发）。
 fn cached_proxy_snapshot() -> ProxySnapshot {
+    {
+        let cache = SNAPSHOT_CACHE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("网络客户端缓存锁已损坏");
+        if let Some((fetched_at, snapshot)) = cache.as_ref()
+            && fetched_at.elapsed() < PROXY_SNAPSHOT_CACHE_TTL
+        {
+            return snapshot.clone();
+        }
+    }
+    let snapshot = proxy_snapshot();
     let mut cache = SNAPSHOT_CACHE
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("网络客户端缓存锁已损坏");
-    if let Some((fetched_at, snapshot)) = cache.as_ref()
+    if let Some((fetched_at, cached)) = cache.as_ref()
         && fetched_at.elapsed() < PROXY_SNAPSHOT_CACHE_TTL
     {
-        return snapshot.clone();
+        return cached.clone();
     }
-    let snapshot = proxy_snapshot();
     *cache = Some((Instant::now(), snapshot.clone()));
     snapshot
 }
@@ -152,10 +163,13 @@ impl ClientCache {
         cached_proxy_snapshot()
     }
 
-    /// 按当前系统代理构建一个独立客户端（不参与本缓存）。
+    /// 按给定系统代理快照构建一个独立客户端（不参与本缓存）。
     /// `timeout` 为 `None` 时不设置整体超时，适合长时间流式请求。
-    pub(crate) fn build_standalone(timeout: Option<Duration>) -> Result<Client, reqwest::Error> {
-        let builder = client_builder_for(&proxy_snapshot())?
+    pub(crate) fn build_standalone(
+        snapshot: &ProxySnapshot,
+        timeout: Option<Duration>,
+    ) -> Result<Client, reqwest::Error> {
+        let builder = client_builder_for(snapshot)?
             .connect_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -283,6 +297,8 @@ fn no_proxy(entries: &[String]) -> Option<NoProxy> {
         .flat_map(|entry| {
             if entry.eq_ignore_ascii_case("<local>") {
                 vec!["localhost", "127.0.0.1", "::1"]
+            } else if entry == "*" {
+                vec!["*"]
             } else {
                 vec![entry.trim_start_matches('*')]
             }
@@ -544,6 +560,14 @@ mod tests {
                 .and_then(ClientBuilder::build)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn keeps_bare_wildcard_and_local_hosts_in_no_proxy_list() {
+        assert!(no_proxy(&["*".into()]).is_some());
+        assert!(no_proxy(&["<local>".into()]).is_some());
+        assert!(no_proxy(&["".into()]).is_none());
+        assert!(no_proxy(&["  ".into()]).is_none());
     }
 
     #[test]

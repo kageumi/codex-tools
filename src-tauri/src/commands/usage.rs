@@ -88,10 +88,14 @@ pub(crate) async fn usage_get_trend(
 }
 
 #[tauri::command]
-pub(crate) fn usage_get_official_pricing(
-    ledger: State<UsageLedger>,
+pub(crate) async fn usage_get_official_pricing(
+    ledger: State<'_, UsageLedger>,
 ) -> Result<OfficialPricingCatalogView, AppError> {
-    catalog_view(ledger.official_pricing_catalog()?)
+    let ledger = ledger.inner().clone();
+    let catalog = tokio::task::spawn_blocking(move || ledger.official_pricing_catalog())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))??;
+    catalog_view(catalog)
 }
 
 #[tauri::command]
@@ -162,8 +166,14 @@ pub(crate) async fn usage_refresh_official_pricing(
     let now = chrono::Utc::now().timestamp_millis();
     let catalog = official_pricing::build_catalog(&document, now, etag, last_modified)
         .map_err(AppError::Internal)?;
-    ledger.save_official_pricing_catalog(&catalog, now)?;
-    ledger.reprice_current_cycle(now)?;
+    let ledger = ledger.inner().clone();
+    let catalog = tokio::task::spawn_blocking(move || {
+        ledger.save_official_pricing_catalog(&catalog, now)?;
+        ledger.reprice_current_cycle(now)?;
+        Ok::<_, AppError>(catalog)
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))??;
     catalog_view(Some(catalog))
 }
 
@@ -215,35 +225,47 @@ fn token_rates_view(rates: official_pricing::TokenRates) -> TokenRatesView {
 }
 
 #[tauri::command]
-pub(crate) fn usage_list_pricing_rules(
-    ledger: State<UsageLedger>,
+pub(crate) async fn usage_list_pricing_rules(
+    ledger: State<'_, UsageLedger>,
     scope: Option<PricingScope>,
 ) -> Result<Vec<PricingRule>, AppError> {
-    ledger.usage_list_pricing_rules(scope)
+    let ledger = ledger.inner().clone();
+    tokio::task::spawn_blocking(move || ledger.usage_list_pricing_rules(scope))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn usage_save_pricing_rule(
-    ledger: State<UsageLedger>,
+pub(crate) async fn usage_save_pricing_rule(
+    ledger: State<'_, UsageLedger>,
     input: SavePricingRule,
 ) -> Result<PricingRule, AppError> {
-    ledger.usage_save_pricing_rule(input)
+    let ledger = ledger.inner().clone();
+    tokio::task::spawn_blocking(move || ledger.usage_save_pricing_rule(input))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn usage_delete_pricing_rule(
-    ledger: State<UsageLedger>,
+pub(crate) async fn usage_delete_pricing_rule(
+    ledger: State<'_, UsageLedger>,
     id: String,
 ) -> Result<(), AppError> {
-    ledger.usage_delete_pricing_rule(&id)
+    let ledger = ledger.inner().clone();
+    tokio::task::spawn_blocking(move || ledger.usage_delete_pricing_rule(&id))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn usage_reprice(
-    ledger: State<UsageLedger>,
+pub(crate) async fn usage_reprice(
+    ledger: State<'_, UsageLedger>,
     range: UsageRange,
 ) -> Result<RepriceResult, AppError> {
-    ledger.reprice(range)
+    let ledger = ledger.inner().clone();
+    tokio::task::spawn_blocking(move || ledger.reprice(range))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 pub(crate) fn local_today_range() -> UsageRange {

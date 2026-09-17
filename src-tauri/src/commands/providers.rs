@@ -25,7 +25,9 @@ fn require_api_key(provider: &ProviderProfile) -> Result<&str, AppError> {
 }
 
 #[tauri::command]
-pub(crate) fn connections_list(store: State<Store>) -> Result<ProviderOverview, AppError> {
+pub(crate) async fn connections_list(
+    store: State<'_, Store>,
+) -> Result<ProviderOverview, AppError> {
     store.provider_overview()
 }
 

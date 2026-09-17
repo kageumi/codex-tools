@@ -219,11 +219,7 @@ async fn maintain_account_with_running(
 ) -> Result<CredentialMaintenanceResult, AppError> {
     let _guard = activation.0.lock().await;
     let now = chrono::Utc::now().timestamp();
-    let (account, mut state, active) = store
-        .official_accounts_for_maintenance()?
-        .into_iter()
-        .find(|(account, _, _)| account.id == id)
-        .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))?;
+    let (account, mut state, active) = store.official_account_for_maintenance(id)?;
     let home = codex::home(&store.codex_home_setting()?);
     let configured = store.codex_app_setting()?;
     if active && running(configured.as_deref()) {
@@ -308,7 +304,12 @@ async fn maintain_account_with_running(
                 }
                 Err(error) => {
                     store.save_credential_refresh_state(&account.id, retry_state(&state, now))?;
-                    let _ = error;
+                    tracing::warn!(
+                        operation = "credential_maintenance_refresh",
+                        account_id = account.id.as_str(),
+                        error = %error,
+                        "credential refresh failed; retry scheduled"
+                    );
                     return Ok(CredentialMaintenanceResult {
                         account: store.official_account_view(&account.id)?,
                         outcome: CredentialMaintenanceOutcome::WaitingRetry,
@@ -345,11 +346,7 @@ pub(crate) fn record_login_verification(
     quota: &ProviderAccountQuota,
 ) -> Result<(), AppError> {
     let now = chrono::Utc::now().timestamp();
-    let (_, previous, _) = store
-        .official_accounts_for_maintenance()?
-        .into_iter()
-        .find(|(account, _, _)| account.id == id)
-        .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))?;
+    let (_, previous, _) = store.official_account_for_maintenance(id)?;
     let verification = match quota.status {
         QuotaStatus::Success => LoginVerificationStatus::Valid,
         QuotaStatus::Unauthorized

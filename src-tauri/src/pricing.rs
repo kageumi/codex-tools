@@ -117,7 +117,7 @@ pub(crate) fn price_with_official_catalog(
         };
     };
     let rule_id = format!("{OFFICIAL_PRICING_RULE_PREFIX}:{}", rate.model);
-    match crate::official_pricing::calculate(catalog, usage, context.model) {
+    match crate::official_pricing::calculate_with_rate(rate, usage) {
         Ok(cost_microusd) => PricingOutcome::Estimated {
             cost_microusd,
             rule_id,

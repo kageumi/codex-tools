@@ -57,6 +57,7 @@ import {
   usageChartConfig,
 } from "@/lib/chart"
 import { useAsync } from "@/hooks/use-async"
+import { useToday } from "@/hooks/use-today"
 import { call } from "@/lib/ipc"
 import { createRequestGate } from "@/lib/request-gate"
 import type {
@@ -135,9 +136,10 @@ export function UsagePage({
     }
   }, [overviewRequestGate])
 
+  const today = useToday()
   const query = useMemo(
-    () => ({ range: todayRange(days), groupBy }),
-    [days, groupBy]
+    () => ({ range: todayRange(days, today), groupBy }),
+    [days, groupBy, today]
   )
   const activeQuery = useRef(query)
   useEffect(() => {

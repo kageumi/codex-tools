@@ -2547,12 +2547,13 @@ impl RepairBackup {
     fn add_bytes(&mut self, original: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let backup = self.dir.join(format!("{:04}.bak", self.entries.len()));
         fs::write(&backup, bytes)?;
+        let digest = file_sha256_bytes(bytes);
         self.entries.push(BackupEntry {
             original: original.to_path_buf(),
             backup,
             kind: BackupEntryKind::Bytes {
-                original_sha256: file_sha256_bytes(bytes),
-                snapshot_sha256: file_sha256_bytes(bytes),
+                original_sha256: digest.clone(),
+                snapshot_sha256: digest,
             },
         });
         self.write_manifest()?;

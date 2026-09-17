@@ -306,7 +306,7 @@ impl ProxyClient {
             {
                 return Ok(client.clone());
             }
-            let client = ClientCache::build_standalone(None).map_err(|error| {
+            let client = ClientCache::build_standalone(&snapshot, None).map_err(|error| {
                 AppError::Internal(format!(
                     "无法初始化本机转换代理的网络客户端：{}",
                     error.without_url()

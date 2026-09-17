@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry},
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -1080,6 +1080,7 @@ impl UsageLedger {
             .map(|epoch| range.start_at_ms.max(epoch))
             .unwrap_or(range.end_at_ms);
         let rules = load_pricing_rule_records(&connection).map_err(AppError::from)?;
+        let rule_labels = pricing_rule_labels(&rules);
         let official_catalog = load_official_catalog(&connection).map_err(AppError::from)?;
         let mut statement = connection
             .prepare(
@@ -1192,7 +1193,7 @@ impl UsageLedger {
                     true,
                 ),
             };
-            let rule_name = pricing_rule_label(rule_id.as_deref(), &rules);
+            let rule_name = pricing_rule_label_from(rule_id.as_deref(), &rule_labels);
             transaction
                 .execute(
                     "UPDATE usage_events SET cost_status = ?1,
@@ -2848,6 +2849,18 @@ fn pricing_rule_label(id: Option<&str>, rules: &[PricingRuleRecord]) -> Option<S
             .find(|rule| rule.id == id)
             .map(|rule| rule.model_pattern.clone())
     })
+}
+
+fn pricing_rule_labels(rules: &[PricingRuleRecord]) -> HashMap<&str, &str> {
+    rules
+        .iter()
+        .map(|rule| (rule.id.as_str(), rule.model_pattern.as_str()))
+        .collect()
+}
+
+fn pricing_rule_label_from(id: Option<&str>, labels: &HashMap<&str, &str>) -> Option<String> {
+    let id = id?;
+    official_pricing_rule_name(id).or_else(|| labels.get(id).map(|label| (*label).to_owned()))
 }
 
 #[derive(Debug)]
