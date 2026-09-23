@@ -82,7 +82,9 @@ fn pick_debug_port() -> u16 {
 /// 未匹配到任何元数据时使用的上下文窗口：取最保守、最兼容的 128K，
 /// 避免高估模型上下文导致溢出。
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
-const DEFAULT_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+// /models often omits effort metadata. Keep the existing compatibility ladder and
+// expose its top end in Codex; an explicit empty ladder from the provider wins.
+const DEFAULT_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 /// Codex CLI 的 `model_catalog_json` 要求 `base_instructions` 为字符串。
 /// 保持通用、不绑定具体模型（不写“based on GPT-5”），以适配软件更新。
 const CODEX_BASE_INSTRUCTIONS: &str =
@@ -177,6 +179,28 @@ fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
             .and_then(|meta| meta.name.clone())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| slug.to_string());
+        let mut reasoning_levels = meta
+            .and_then(|meta| meta.supported_reasoning_levels.as_ref())
+            .cloned()
+            .unwrap_or_else(default_reasoning_levels);
+        // `max` is the upstream API effort. Codex exposes its Ultra mode as a
+        // separate picker entry and converts it to a valid request effort.
+        if reasoning_levels.iter().any(|effort| effort == "max")
+            && !reasoning_levels.iter().any(|effort| effort == "ultra")
+        {
+            reasoning_levels.push("ultra".into());
+        }
+        let default_reasoning_level = meta
+            .and_then(|meta| meta.default_reasoning_level.as_ref())
+            .filter(|effort| reasoning_levels.contains(effort))
+            .cloned()
+            .or_else(|| {
+                reasoning_levels
+                    .iter()
+                    .find(|effort| effort.as_str() == "low")
+                    .cloned()
+            })
+            .or_else(|| reasoning_levels.first().cloned());
         by_slug.insert(
             slug.to_string(),
             catalog_entry(
@@ -184,7 +208,8 @@ fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
                 &display_name,
                 context_window,
                 meta.and_then(|meta| meta.description.clone()),
-                false,
+                reasoning_levels,
+                default_reasoning_level,
             ),
         );
     }
@@ -196,7 +221,8 @@ fn catalog_entry(
     display_name: &str,
     context_window: u64,
     description: Option<String>,
-    reasoning: bool,
+    reasoning_levels: Vec<String>,
+    default_reasoning_level: Option<String>,
 ) -> CodexModelInfo {
     CodexModelInfo {
         slug: slug.to_string(),
@@ -204,8 +230,16 @@ fn catalog_entry(
         description: description.filter(|value| !value.trim().is_empty()),
         context_window: Some(context_window),
         max_context_window: Some(context_window),
-        default_reasoning_level: Some((if reasoning { "medium" } else { "low" }).to_string()),
-        supported_reasoning_levels: Some(default_reasoning_levels()),
+        default_reasoning_level,
+        supported_reasoning_levels: Some(
+            reasoning_levels
+                .into_iter()
+                .map(|effort| ReasoningLevelInfo {
+                    description: Some(format!("{effort} effort")),
+                    effort,
+                })
+                .collect(),
+        ),
         base_instructions: Some(CODEX_BASE_INSTRUCTIONS.into()),
         visibility: Some("list".into()),
         supported_in_api: Some(true),
@@ -232,13 +266,10 @@ pub(crate) fn write_model_catalog(
     Ok(format!("{MODEL_CATALOG_DIR}/{MODEL_CATALOG_FILE}"))
 }
 
-fn default_reasoning_levels() -> Vec<ReasoningLevelInfo> {
+fn default_reasoning_levels() -> Vec<String> {
     DEFAULT_REASONING_LEVELS
         .iter()
-        .map(|effort| ReasoningLevelInfo {
-            effort: (*effort).to_string(),
-            description: Some(format!("{effort} effort")),
-        })
+        .map(|effort| (*effort).to_string())
         .collect()
 }
 
@@ -642,19 +673,22 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
   }
   function descriptor(slug, entries) {
     var meta = metaFor(slug, entries) || {};
-    var levels = meta.supported_reasoning_levels || meta.supportedReasoningLevels || [];
+    var levels = meta.supported_reasoning_levels || meta.supportedReasoningLevels;
     var supported;
-    if (Array.isArray(levels) && levels.length) {
+    if (Array.isArray(levels)) {
       supported = levels.map(function (l) { return { reasoningEffort: l.effort, description: l.description || l.effort }; });
     } else {
       supported = ["low", "medium", "high"].map(function (e) { return { reasoningEffort: e, description: e + " effort" }; });
     }
+    var defaultEffort = meta.default_reasoning_level;
+    if (!defaultEffort && supported.length) defaultEffort = supported[0].reasoningEffort;
+    if (!defaultEffort && !Array.isArray(levels)) defaultEffort = "low";
     return {
       id: slug, model: slug, slug: slug, name: slug,
       displayName: meta.display_name || meta.displayName || slug,
       description: meta.description || meta.description || "Codex Tools 解锁模型",
       hidden: false, isDefault: false,
-      defaultReasoningEffort: meta.default_reasoning_level || "medium",
+      defaultReasoningEffort: defaultEffort,
       supportedReasoningEfforts: supported,
       input_modalities: ["text", "image"], supports_personality: false,
       service_tiers: [], default_service_tier: null, additional_speed_tiers: [],
@@ -675,6 +709,15 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
         if (item.hidden !== false) { item.hidden = false; changed = true; }
         var meta = metaFor(item.model, models.entries);
         if (meta && meta.display_name && item.displayName !== meta.display_name) { item.displayName = meta.display_name; changed = true; }
+        var providerDescriptor = descriptor(item.model, models.entries);
+        if (JSON.stringify(item.supportedReasoningEfforts) !== JSON.stringify(providerDescriptor.supportedReasoningEfforts)) {
+          item.supportedReasoningEfforts = providerDescriptor.supportedReasoningEfforts;
+          changed = true;
+        }
+        if (item.defaultReasoningEffort !== providerDescriptor.defaultReasoningEffort) {
+          item.defaultReasoningEffort = providerDescriptor.defaultReasoningEffort;
+          changed = true;
+        }
       }
     }
     for (var j = 0; j < models.names.length; j++) {
@@ -1043,6 +1086,8 @@ mod tests {
                 name: Some("DeepSeek V4 Pro".into()),
                 context_window: Some(1_000_000),
                 description: Some("百万 token 上下文旗舰模型".into()),
+                supported_reasoning_levels: None,
+                default_reasoning_level: None,
             },
         )]);
 

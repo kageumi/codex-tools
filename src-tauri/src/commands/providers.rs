@@ -530,17 +530,22 @@ async fn sync_provider_models(
     // 先并入 /models 返回的简介（服务商自己的数据优先），再补 models.dev 元数据。
     let mut meta = details
         .iter()
-        .filter_map(|detail| {
-            detail.description.clone().map(|description| {
-                (
-                    detail.id.clone(),
-                    ProviderModelsDevMeta {
-                        name: None,
-                        context_window: None,
-                        description: Some(description),
-                    },
-                )
-            })
+        .filter(|detail| {
+            detail.description.is_some()
+                || detail.reasoning_levels.is_some()
+                || detail.default_reasoning_level.is_some()
+        })
+        .map(|detail| {
+            (
+                detail.id.clone(),
+                ProviderModelsDevMeta {
+                    name: None,
+                    context_window: None,
+                    description: detail.description.clone(),
+                    supported_reasoning_levels: detail.reasoning_levels.clone(),
+                    default_reasoning_level: detail.default_reasoning_level.clone(),
+                },
+            )
         })
         .collect::<BTreeMap<_, _>>();
     if let Ok(dev_meta) = dev_meta_result {
