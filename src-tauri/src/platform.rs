@@ -357,10 +357,18 @@ pub fn dashboard_launch_app_with_debug(port: u16, configured: Option<&str>) -> s
     }
     #[cfg(windows)]
     {
-        let exe = codex_app_path(configured).ok_or_else(|| {
+        let target = windows_codex_launch_target(configured).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "未找到 Codex 桌面应用")
         })?;
-        Command::new(exe).args(&debug_args).spawn().map(|_| ())
+        match target {
+            WindowsCodexLaunchTarget::Packaged(app_user_model_id) => {
+                let arguments = debug_args.join(" ");
+                activate_windows_app(&app_user_model_id, &arguments)
+            }
+            WindowsCodexLaunchTarget::Executable(exe) => {
+                Command::new(exe).args(&debug_args).spawn().map(|_| ())
+            }
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -425,6 +433,13 @@ fn escape_extended_regex(value: &str) -> String {
 
 #[cfg(windows)]
 fn windows_codex_exe() -> Option<PathBuf> {
+    windows_codex_app_package()
+        .map(|package| package.executable)
+        .or_else(windows_codex_exe_unpacked)
+}
+
+#[cfg(windows)]
+fn windows_codex_exe_unpacked() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")?;
     let local = Path::new(&local);
     let standard = [
@@ -440,6 +455,159 @@ fn windows_codex_exe() -> Option<PathBuf> {
     }
     // 从注册表卸载信息中查找自定义安装路径
     windows_codex_exe_from_registry()
+}
+
+#[cfg(windows)]
+struct WindowsCodexPackage {
+    executable: PathBuf,
+    app_user_model_id: String,
+}
+
+#[cfg(windows)]
+enum WindowsCodexLaunchTarget {
+    Packaged(String),
+    Executable(PathBuf),
+}
+
+#[cfg(windows)]
+fn windows_codex_app_package() -> Option<WindowsCodexPackage> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const PACKAGE_QUERY: &str = concat!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
+        "$package = Get-AppxPackage -Name 'OpenAI.Codex' | ",
+        "Sort-Object Version -Descending | Select-Object -First 1; ",
+        "if ($package) { ",
+        "$application = (Get-AppxPackageManifest -Package $package).Package.Applications.Application | ",
+        "Where-Object { $_.Id -eq 'App' } | Select-Object -First 1; ",
+        "if ($application) { ",
+        "$package.PackageFamilyName + \"`t\" + $package.InstallLocation + \"`t\" + ",
+        "$application.Id + \"`t\" + $application.Executable } }"
+    );
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            PACKAGE_QUERY,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let output = String::from_utf8_lossy(&output.stdout);
+    let mut fields = output.trim().splitn(4, '\t');
+    let package_family_name = fields.next()?;
+    let install_location = fields.next()?;
+    let application_id = fields.next()?;
+    let executable = fields.next()?;
+    if !package_family_name.starts_with("OpenAI.Codex_")
+        || install_location.is_empty()
+        || application_id.is_empty()
+        || executable.is_empty()
+    {
+        return None;
+    }
+
+    Some(WindowsCodexPackage {
+        executable: Path::new(install_location).join(executable.replace('/', "\\")),
+        app_user_model_id: format!("{package_family_name}!{application_id}"),
+    })
+}
+
+#[cfg(windows)]
+fn windows_codex_launch_target(configured: Option<&str>) -> Option<WindowsCodexLaunchTarget> {
+    let configured_path = configured.and_then(|path| validate_codex_app_path(path).ok());
+    let package = windows_codex_app_package();
+
+    if let Some(path) = configured_path {
+        if let Some(package) =
+            package.filter(|package| windows_paths_equal(&path, &package.executable))
+        {
+            return Some(WindowsCodexLaunchTarget::Packaged(
+                package.app_user_model_id,
+            ));
+        }
+        return Some(WindowsCodexLaunchTarget::Executable(path));
+    }
+
+    if let Some(package) = package {
+        return Some(WindowsCodexLaunchTarget::Packaged(
+            package.app_user_model_id,
+        ));
+    }
+
+    windows_codex_exe_unpacked().map(WindowsCodexLaunchTarget::Executable)
+}
+
+#[cfg(windows)]
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/']))
+}
+
+#[cfg(windows)]
+fn activate_windows_app(app_user_model_id: &str, arguments: &str) -> std::io::Result<()> {
+    let app_user_model_id = app_user_model_id.to_owned();
+    let arguments = arguments.to_owned();
+    std::thread::Builder::new()
+        .name("windows-app-activation".to_owned())
+        .spawn(move || activate_windows_app_on_sta(&app_user_model_id, &arguments))
+        .map_err(|error| std::io::Error::other(format!("无法创建应用激活线程：{error}")))?
+        .join()
+        .map_err(|_| std::io::Error::other("Windows 应用激活线程异常退出。"))?
+}
+
+#[cfg(windows)]
+fn activate_windows_app_on_sta(app_user_model_id: &str, arguments: &str) -> std::io::Result<()> {
+    use windows::{
+        Win32::{
+            System::Com::{
+                CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoUninitialize,
+            },
+            UI::Shell::{AO_NONE, ApplicationActivationManager, IApplicationActivationManager},
+        },
+        core::PCWSTR,
+    };
+
+    struct ComApartment;
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    initialized
+        .ok()
+        .map_err(|error| std::io::Error::other(format!("无法初始化 Windows 应用激活：{error}")))?;
+    let _apartment = ComApartment;
+
+    let manager: IApplicationActivationManager =
+        unsafe { CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER) }
+            .map_err(|error| {
+                std::io::Error::other(format!("无法创建 Windows 应用激活器：{error}"))
+            })?;
+
+    let app_user_model_id: Vec<u16> = app_user_model_id.encode_utf16().chain(Some(0)).collect();
+    let arguments: Vec<u16> = arguments.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        manager.ActivateApplication(
+            PCWSTR::from_raw(app_user_model_id.as_ptr()),
+            PCWSTR::from_raw(arguments.as_ptr()),
+            AO_NONE,
+        )
+    }
+    .map(|_| ())
+    .map_err(|error| std::io::Error::other(format!("无法激活 Codex 桌面应用：{error}")))
 }
 
 #[cfg(windows)]
