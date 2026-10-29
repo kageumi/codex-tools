@@ -22,6 +22,13 @@ const MAX_SESSION_PATH_CHARS: usize = 4_096;
 #[derive(Clone, Default)]
 pub struct SessionIndex {
     cache: Arc<RwLock<Option<CachedIndex>>>,
+    live_catalog: Arc<RwLock<Option<LiveCatalog>>>,
+}
+
+struct LiveCatalog {
+    home: PathBuf,
+    states: HashMap<String, bool>,
+    roots: Vec<SessionSummary>,
 }
 
 struct CachedIndex {
@@ -80,7 +87,41 @@ impl SessionIndex {
             return Ok((sessions, database_count));
         }
 
-        let sessions = Arc::new(rebuild_from_paths(&database_paths, &rollout_paths)?);
+        let mut sessions = rebuild_from_paths(&database_paths, &rollout_paths)?;
+        if let Some(catalog) = self
+            .live_catalog
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|catalog| catalog.home == codex_home)
+        {
+            let native_roots: HashMap<_, _> = catalog
+                .roots
+                .iter()
+                .map(|root| (root.id.as_str(), root))
+                .collect();
+            sessions.retain_mut(|session| match catalog.states.get(&session.id) {
+                Some(archived) => {
+                    session.archived = *archived;
+                    if let Some(native) = native_roots.get(session.id.as_str()) {
+                        session.title.clone_from(&native.title);
+                    }
+                    true
+                }
+                None => false,
+            });
+            let existing: std::collections::HashSet<_> =
+                sessions.iter().map(|s| s.id.clone()).collect();
+            sessions.extend(
+                catalog
+                    .roots
+                    .iter()
+                    .filter(|s| !existing.contains(&s.id))
+                    .cloned(),
+            );
+            sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+        }
+        let sessions = Arc::new(sessions);
         let database_count = database_paths.len();
         let result = (sessions.clone(), database_count);
         *self
@@ -101,6 +142,22 @@ impl SessionIndex {
             .cache
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// The running desktop's native catalog wins over old databases and duplicate
+    /// rollouts. Keep the last verified view while disconnected; mutations remain disabled.
+    pub fn set_live_catalog(
+        &self,
+        home: PathBuf,
+        states: HashMap<String, bool>,
+        roots: Vec<SessionSummary>,
+    ) {
+        *self.live_catalog.write().unwrap_or_else(|p| p.into_inner()) = Some(LiveCatalog {
+            home,
+            states,
+            roots,
+        });
+        self.invalidate();
     }
 
     /// 只刷新本次修复实际改动过的来源（rollout / 数据库），其余会话保持不变。
@@ -465,6 +522,70 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_rename_overrides_stale_source_title_and_search_without_changing_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(temp.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,model_provider TEXT,title TEXT,cwd TEXT,archived INTEGER,updated_at INTEGER);INSERT INTO threads VALUES('root','openai','old name','C:/work',0,1);").unwrap();
+        let index = SessionIndex::default();
+        let previous = index.load_recent(temp.path()).unwrap()[0].clone();
+        let mut native = previous.clone();
+        native.title = "renamed title".into();
+        native.identity = "native#root".into();
+        native.source_db.clear();
+        index.set_live_catalog(
+            temp.path().to_path_buf(),
+            HashMap::from([("root".into(), false)]),
+            vec![native],
+        );
+        let current = index.load_recent(temp.path()).unwrap();
+        assert_eq!(current[0].title, "renamed title");
+        assert_eq!(current[0].identity, previous.identity);
+        assert_eq!(current[0].source_db, previous.source_db);
+        assert_eq!(
+            session_page(&index, temp.path(), "renamed", 1, 6, false)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert!(
+            session_page(&index, temp.path(), "old name", 1, 6, false)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let stored_title: String = db
+            .query_row("SELECT title FROM threads WHERE id='root'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored_title, "old name");
+    }
+    #[test]
+    fn native_catalog_prevents_stale_source_resurrection_and_restores_missing_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(temp.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,model_provider TEXT,title TEXT,cwd TEXT,archived INTEGER,updated_at INTEGER);INSERT INTO threads VALUES('keep','openai','keep','C:/work',0,1),('stale','openai','stale','C:/work',0,1);").unwrap();
+        let index = SessionIndex::default();
+        let base = index.load_recent(temp.path()).unwrap();
+        assert_eq!(base.len(), 2);
+        let mut restored = base[0].clone();
+        restored.id = "restored".into();
+        restored.identity = "native#restored".into();
+        restored.archived = false;
+        index.set_live_catalog(
+            temp.path().to_path_buf(),
+            HashMap::from([("keep".into(), true), ("restored".into(), false)]),
+            vec![restored],
+        );
+        let current = index.load_recent(temp.path()).unwrap();
+        assert_eq!(current.len(), 2);
+        assert!(!current.iter().any(|s| s.id == "stale"));
+        assert!(current.iter().find(|s| s.id == "keep").unwrap().archived);
+        assert!(current.iter().any(|s| s.id == "restored" && !s.archived));
+    }
     use rusqlite::Connection;
 
     #[test]

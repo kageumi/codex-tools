@@ -1776,7 +1776,7 @@ fn rollout_recovery_info(path: &Path, original: &[u8]) -> anyhow::Result<Rollout
     })
 }
 
-fn rollout_ids_from_path(path: &Path) -> anyhow::Result<(String, String)> {
+pub(crate) fn rollout_ids_from_path(path: &Path) -> anyhow::Result<(String, String)> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())

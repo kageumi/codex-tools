@@ -9,8 +9,39 @@ import {
   overlaySurfaceStyles,
 } from "@/components/ui/overlay-styles"
 
-function AlertDialog({ ...props }: AlertDialogPrimitive.Root.Props) {
-  return <AlertDialogPrimitive.Root data-slot="alert-dialog" {...props} />
+function AlertDialog({
+  open,
+  actionsRef,
+  onOpenChangeComplete,
+  ...props
+}: AlertDialogPrimitive.Root.Props) {
+  const internalActions = React.useRef<AlertDialogPrimitive.Root.Actions>(null)
+  const closeCompleted = React.useRef(true)
+  React.useEffect(() => {
+    if (open) {
+      closeCompleted.current = false
+      return
+    }
+    if (open !== false || actionsRef || closeCompleted.current) return
+    // A theme change can cancel an exit transition after Base UI starts waiting
+    // for it. Release the closed modal after our 200ms motion has finished.
+    const timer = setTimeout(() => {
+      if (!closeCompleted.current) internalActions.current?.unmount()
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [open, actionsRef])
+  return (
+    <AlertDialogPrimitive.Root
+      data-slot="alert-dialog"
+      open={open}
+      actionsRef={actionsRef ?? internalActions}
+      onOpenChangeComplete={(nextOpen) => {
+        if (!nextOpen) closeCompleted.current = true
+        onOpenChangeComplete?.(nextOpen)
+      }}
+      {...props}
+    />
+  )
 }
 
 function AlertDialogTrigger({ ...props }: AlertDialogPrimitive.Trigger.Props) {
@@ -32,7 +63,11 @@ function AlertDialogOverlay({
   return (
     <AlertDialogPrimitive.Backdrop
       data-slot="alert-dialog-overlay"
-      className={cn(overlayBackdropStyles, className)}
+      className={cn(
+        overlayBackdropStyles,
+        "data-closed:pointer-events-none",
+        className
+      )}
       {...props}
     />
   )
@@ -57,6 +92,7 @@ function AlertDialogContent({
           "group/alert-dialog-content fixed top-1/2 left-1/2 z-50 grid max-h-[calc(100dvh-1rem)] w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 overflow-y-auto overscroll-contain rounded-3xl p-5 outline-none data-[size=default]:max-w-md data-[size=sm]:max-w-sm",
           overlaySurfaceStyles,
           modalMotionStyles,
+          "data-closed:pointer-events-none",
           className
         )}
         {...props}

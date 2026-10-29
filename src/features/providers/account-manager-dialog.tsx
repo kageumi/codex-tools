@@ -442,9 +442,9 @@ export function AccountManagerDialog({
           <AlertDialogHeader>
             <AlertDialogTitle>删除 {selectedCount} 个账号？</AlertDialogTitle>
             <AlertDialogDescription>
-              {activeSelected
-                ? "所选包含当前账号。程序会先依次尝试切换到其他可用连接，再原子删除所选账号。"
-                : "此操作会移除所选账号在本机保存的登录信息，无法撤销。"}
+              {activeSelected &&
+                "所选包含当前账号。程序会先切换到其他可用连接，再删除所选账号。"}
+              此操作会移除所选账号在本机保存的登录信息，无法撤销。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

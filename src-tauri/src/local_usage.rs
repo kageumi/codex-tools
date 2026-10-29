@@ -31,7 +31,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const OFFICIAL_IDENTITY_PROVIDER_ID: &str = "__official__";
 const MISSING_IDENTITY_PROVIDER_ID: &str = "__missing_provider__";
 const MAX_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -43,7 +43,7 @@ const COLLECTION_MODE_METADATA_KEY: &str = "usage_collection_mode";
 const PARSER_VERSION_METADATA_KEY: &str = "usage_parser_version";
 const COLLECTION_MODE: &str = "after_update";
 const COLLECTION_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PARSER_VERSION: &str = "5";
+const PARSER_VERSION: &str = "6";
 const USAGE_RETENTION_DAYS: i64 = 90;
 const USAGE_RETENTION_MS: i64 = USAGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const FREELIST_VACUUM_THRESHOLD: i64 = 1024;
@@ -53,8 +53,8 @@ const UPSERT_USAGE_CURSOR_SQL: &str = r#"
         rollout_id, last_path, byte_offset, next_event_ordinal,
         last_model, last_model_provider, usage_boundary_passed,
         usage_boundary_state, subagent_boundary_mode,
-        file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        file_length, file_modified_at_ms, prefix_sha256, updated_at_ms, last_cumulative_usage
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
     ON CONFLICT(rollout_id) DO UPDATE SET
       last_path = excluded.last_path,
       byte_offset = excluded.byte_offset,
@@ -67,7 +67,8 @@ const UPSERT_USAGE_CURSOR_SQL: &str = r#"
       file_length = excluded.file_length,
       file_modified_at_ms = excluded.file_modified_at_ms,
       prefix_sha256 = excluded.prefix_sha256,
-      updated_at_ms = excluded.updated_at_ms
+      updated_at_ms = excluded.updated_at_ms,
+      last_cumulative_usage = excluded.last_cumulative_usage
 "#;
 
 struct BoundedLine {
@@ -131,12 +132,23 @@ struct FileRefreshResult {
     warnings: Vec<UsageWarning>,
 }
 
+#[derive(Clone, Copy)]
+struct UsageScanContext<'a> {
+    now_utc_ms: i64,
+    collection_epoch: i64,
+    activations: &'a [ActivationSnapshot],
+    pricing_rules: &'a [PricingRuleRecord],
+    official_catalog: Option<&'a OfficialPricingCatalog>,
+}
+
 #[derive(Debug, Clone)]
 struct DiscoveredRollout {
     rollout_id: String,
+    logical_rollout_id: String,
     model_provider: Option<String>,
     is_subagent: bool,
     boundary_marker_required: bool,
+    parent_rollout_id: Option<String>,
 }
 
 struct RepriceEvent {
@@ -163,6 +175,7 @@ struct StoredCursor {
     file_length: u64,
     file_modified_at_ms: Option<i64>,
     prefix_sha256: Option<String>,
+    last_cumulative_usage: Option<crate::usage_log::TokenUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,7 +338,6 @@ impl UsageLedger {
                 now_utc_ms
             }
         };
-        rebuild_usage_for_parser_upgrade(&mut connection, collection_epoch)?;
 
         let activations = load_activations(&connection).map_err(AppError::from)?;
         let official_catalog = load_official_catalog(&connection).map_err(AppError::from)?;
@@ -337,16 +349,25 @@ impl UsageLedger {
         let mut transaction = connection
             .transaction()
             .map_err(|error| AppError::Internal(format!("开始保存本机用量事务失败：{error}")))?;
+        let discoveries = rebuild_usage_for_parser_upgrade(&transaction, &paths, collection_epoch)?;
+        let upgrading = discoveries.is_some();
+        let context = UsageScanContext {
+            now_utc_ms,
+            collection_epoch,
+            activations: &activations,
+            pricing_rules: &pricing_rules,
+            official_catalog: official_catalog.as_ref(),
+        };
         for path in paths {
             result.files_scanned += 1;
             match refresh_file(
                 &mut transaction,
                 &path,
-                now_utc_ms,
-                collection_epoch,
-                &activations,
-                &pricing_rules,
-                official_catalog.as_ref(),
+                context,
+                discoveries
+                    .as_ref()
+                    .and_then(|files| files.get(&path))
+                    .cloned(),
             ) {
                 Ok(file_result) => {
                     result.events_added += file_result.events_added;
@@ -354,6 +375,12 @@ impl UsageLedger {
                     result.partial_lines += file_result.partial_lines;
                     result.files_skipped += usize::from(file_result.file_skipped);
                     result.warnings.extend(file_result.warnings);
+                }
+                Err(error) if upgrading => {
+                    return Err(AppError::Internal(format!(
+                        "升级用量解析器失败，原账本已保留（{}）：{error}",
+                        path.display()
+                    )));
                 }
                 Err(error) => result.warnings.push(UsageWarning {
                     path: Some(path.display().to_string()),
@@ -367,6 +394,27 @@ impl UsageLedger {
 
         result.files_opened = result.files_scanned.saturating_sub(result.files_skipped);
         result.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let mut persisted_warnings = result.warnings.clone();
+        if result.partial_lines > 0 {
+            persisted_warnings.push(UsageWarning {
+                path: None,
+                message: format!(
+                    "有 {} 条日志行尚未写完，将在下一次刷新时继续读取。",
+                    result.partial_lines
+                ),
+            });
+        }
+        connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES ('last_refresh_warnings', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![
+                    serde_json::to_string(&persisted_warnings)
+                        .map_err(|error| AppError::Internal(error.to_string()))?
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("保存用量扫描警告失败：{error}")))?;
 
         // 成功扫描后清理超过保留期的明细。保留游标，旧日志不会被重新导入；
         // 即使清理 90 天前的数据，也不会删除任何 Codex 原始会话。
@@ -461,6 +509,13 @@ impl UsageLedger {
             .and_then(|value| value.parse::<i64>().ok());
         let collection_started_version =
             read_metadata(&connection, COLLECTION_VERSION_METADATA_KEY)?;
+        let warnings = read_metadata(&connection, "last_refresh_warnings")?
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| AppError::Internal(format!("读取用量扫描警告失败：{error}")))
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         let rows = aggregates
             .into_values()
@@ -493,7 +548,7 @@ impl UsageLedger {
             last_refreshed_at_ms,
             collection_started_at_ms: collection_epoch,
             collection_started_version,
-            warnings: vec![],
+            warnings,
             trend_points: trend_points.into_values().collect(),
         })
     }
@@ -1305,7 +1360,8 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                 file_length INTEGER NOT NULL,
                 file_modified_at_ms INTEGER,
                 prefix_sha256 TEXT,
-                 updated_at_ms INTEGER NOT NULL
+                 updated_at_ms INTEGER NOT NULL,
+                 last_cumulative_usage TEXT
               );
               CREATE INDEX IF NOT EXISTS usage_cursors_path_idx
                 ON usage_cursors(last_path, file_length, file_modified_at_ms);
@@ -1355,7 +1411,7 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              );
              CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
                ON official_pricing_catalogs(active, fetched_at_ms DESC);
-              PRAGMA user_version = 8;
+              PRAGMA user_version = 9;
              COMMIT;",
         )?;
         return Ok(());
@@ -1568,6 +1624,19 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
             )?;
         }
     }
+    if version > 0 && version < 9 {
+        let cursors_exist: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_cursors')",
+            [], |row| row.get(0),
+        )?;
+        let migration = if cursors_exist {
+            "BEGIN; ALTER TABLE usage_cursors ADD COLUMN last_cumulative_usage TEXT;
+             PRAGMA user_version = 9; COMMIT;"
+        } else {
+            "PRAGMA user_version = 9;"
+        };
+        connection.execute_batch(migration)?;
+    }
     // 只有目标表与列已存在时才补建索引。CREATE INDEX IF NOT EXISTS 在表或列
     // 不存在时仍会报错，极简旧版夹具/降级库可能缺表或缺列。
     let usage_events_exists: bool = connection.query_row(
@@ -1615,36 +1684,54 @@ fn read_collection_epoch(connection: &Connection) -> Result<Option<i64>, AppErro
 }
 
 fn rebuild_usage_for_parser_upgrade(
-    connection: &mut Connection,
+    connection: &Connection,
+    paths: &[PathBuf],
     collection_epoch: i64,
-) -> Result<(), AppError> {
+) -> Result<Option<HashMap<PathBuf, DiscoveredRollout>>, AppError> {
     if read_metadata(connection, PARSER_VERSION_METADATA_KEY)?.as_deref() == Some(PARSER_VERSION) {
-        return Ok(());
+        return Ok(None);
     }
-
-    let transaction = connection
-        .transaction()
-        .map_err(|error| AppError::Internal(format!("开始升级本机用量解析器失败：{error}")))?;
-    transaction
-        .execute(
-            "DELETE FROM usage_events WHERE occurred_at_ms >= ?1",
-            params![collection_epoch],
-        )
-        .map_err(|error| AppError::Internal(format!("清理当前统计周期用量失败：{error}")))?;
-    transaction
+    // Runs inside the scan transaction: failure rolls back deletion and version.
+    // Preserve history whose source files are no longer available for replay.
+    let mut discoveries = HashMap::new();
+    for path in paths {
+        let discovered = discover_rollout(path).map_err(AppError::Internal)?;
+        let Some(discovered) = discovered else {
+            return Err(AppError::Internal(format!(
+                "无法确认日志身份，未升级账本：{}",
+                path.display()
+            )));
+        };
+        connection
+            .execute(
+                "DELETE FROM usage_events WHERE rollout_id = ?1 AND occurred_at_ms >= ?2",
+                params![discovered.rollout_id, collection_epoch],
+            )
+            .map_err(|error| AppError::Internal(format!("清理待重建用量失败：{error}")))?;
+        for previous_owner in std::iter::once(&discovered.logical_rollout_id)
+            .chain(discovered.parent_rollout_id.iter())
+        {
+            connection
+                .execute(
+                    "DELETE FROM usage_events WHERE occurred_at_ms >= ?1 AND rollout_id = ?2
+                 AND EXISTS(SELECT 1 FROM usage_cursors WHERE rollout_id = ?2 AND last_path = ?3)",
+                    params![collection_epoch, previous_owner, path.display().to_string()],
+                )
+                .map_err(|error| AppError::Internal(format!("清理旧会话身份用量失败：{error}")))?;
+        }
+        discoveries.insert(path.clone(), discovered);
+    }
+    connection
         .execute("DELETE FROM usage_cursors", [])
         .map_err(|error| AppError::Internal(format!("重置本机用量游标失败：{error}")))?;
-    transaction
+    connection
         .execute(
             "INSERT INTO usage_metadata(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![PARSER_VERSION_METADATA_KEY, PARSER_VERSION],
         )
         .map_err(|error| AppError::Internal(format!("保存本机用量解析器版本失败：{error}")))?;
-    transaction
-        .commit()
-        .map_err(|error| AppError::Internal(format!("提交本机用量解析器升级失败：{error}")))?;
-    Ok(())
+    Ok(Some(discoveries))
 }
 
 fn initialize_collection_epoch(
@@ -1755,6 +1842,8 @@ fn initialize_collection_epoch(
                         .and_then(|value| i64::try_from(value.as_millis()).ok()),
                     prefix_sha256,
                     now_utc_ms,
+                    serde_json::to_string(&replayed_state.last_cumulative_usage)
+                        .map_err(|error| AppError::Internal(error.to_string()))?,
                 ],
             )
             .map_err(|error| AppError::Internal(format!("保存本机用量文件游标失败：{error}")))?;
@@ -1826,12 +1915,16 @@ fn update_activation_status(
 fn refresh_file(
     transaction: &mut rusqlite::Transaction<'_>,
     path: &Path,
-    now_utc_ms: i64,
-    collection_epoch: i64,
-    activations: &[ActivationSnapshot],
-    pricing_rules: &[PricingRuleRecord],
-    official_catalog: Option<&OfficialPricingCatalog>,
+    context: UsageScanContext<'_>,
+    discovered: Option<DiscoveredRollout>,
 ) -> Result<FileRefreshResult, String> {
+    let UsageScanContext {
+        now_utc_ms,
+        collection_epoch,
+        activations,
+        pricing_rules,
+        official_catalog,
+    } = context;
     let metadata = fs::metadata(path).map_err(|error| format!("无法读取会话文件：{error}"))?;
     if metadata.len() > MAX_ROLLOUT_BYTES {
         return Err("会话文件超过 256 MB，已跳过以避免占用过多内存。".into());
@@ -1848,7 +1941,11 @@ fn refresh_file(
             warnings: vec![],
         });
     }
-    let Some(discovered) = discover_rollout(path)? else {
+    let discovered = match discovered {
+        Some(discovered) => Some(discovered),
+        None => discover_rollout(path)?,
+    };
+    let Some(discovered) = discovered else {
         return Ok(FileRefreshResult {
             events_added: 0,
             events_skipped: 0,
@@ -1919,6 +2016,8 @@ fn refresh_file(
                     UsageBoundaryState::Regular
                 },
                 boundary_marker_required: discovered.boundary_marker_required,
+                last_cumulative_usage: cursor.last_cumulative_usage,
+                parent_rollout_id: discovered.parent_rollout_id.clone(),
             },
         ),
         _ => {
@@ -2040,6 +2139,8 @@ fn refresh_file(
                 file_modified_at_ms,
                 prefix_hasher.finalize_hex(),
                 now_utc_ms,
+                serde_json::to_string(&state.last_cumulative_usage)
+                    .map_err(|error| format!("保存累计 Token 基线失败：{error}"))?,
             ],
         )
         .map_err(|error| format!("保存本机用量游标失败：{error}"))?;
@@ -2113,6 +2214,8 @@ fn initial_parser_state(discovered: &DiscoveredRollout) -> ParserState {
             UsageBoundaryState::Regular
         },
         boundary_marker_required: discovered.boundary_marker_required,
+        last_cumulative_usage: None,
+        parent_rollout_id: discovered.parent_rollout_id.clone(),
     }
 }
 
@@ -2277,11 +2380,20 @@ fn discover_rollout(path: &Path) -> Result<Option<DiscoveredRollout>, String> {
         return Ok(None);
     };
     let is_subagent = state.usage_boundary != UsageBoundaryState::Regular;
+    // Paginated logs share a logical ID but have independent physical cursors.
+    // Only trust a filename identity when its logical UUID matches the header.
+    let physical_id = provider_sync::rollout_ids_from_path(path)
+        .ok()
+        .filter(|(logical, _)| logical == &rollout_id)
+        .map(|(_, physical)| physical)
+        .unwrap_or_else(|| rollout_id.clone());
     Ok(Some(DiscoveredRollout {
-        rollout_id,
+        rollout_id: physical_id,
+        logical_rollout_id: rollout_id,
         model_provider: state.model_provider,
         is_subagent,
         boundary_marker_required: is_subagent && boundary_marker_required,
+        parent_rollout_id: state.parent_rollout_id,
     }))
 }
 
@@ -2290,7 +2402,7 @@ fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<Store
         .query_row(
             "SELECT last_path, byte_offset, next_event_ordinal, last_model,
                     last_model_provider, usage_boundary_passed, usage_boundary_state,
-                    subagent_boundary_mode, file_length, file_modified_at_ms, prefix_sha256
+                    subagent_boundary_mode, file_length, file_modified_at_ms, prefix_sha256, last_cumulative_usage
              FROM usage_cursors WHERE rollout_id = ?1",
             params![rollout_id],
             |row| {
@@ -2308,6 +2420,10 @@ fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<Store
                     file_length: i64_to_u64(row.get::<_, i64>(8)?)?,
                     file_modified_at_ms: row.get(9)?,
                     prefix_sha256: row.get(10)?,
+                    last_cumulative_usage: row.get::<_, Option<String>>(11)?
+                        .map(|value| serde_json::from_str(&value).map_err(|error|
+                            rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(error))))
+                        .transpose()?.flatten(),
                 })
             },
         )
@@ -4000,7 +4116,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, super::SCHEMA_VERSION);
         let aliases: Vec<(String, String)> = connection
             .prepare(
                 "SELECT provider_id, canonical_account_id
@@ -4070,7 +4186,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, super::SCHEMA_VERSION);
         let migrated_mode: String = connection
             .query_row(
                 "SELECT billing_mode FROM pricing_rules WHERE id = 'legacy-subscription'",
@@ -4156,7 +4272,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, super::SCHEMA_VERSION);
     }
 
     #[test]
@@ -4480,6 +4596,282 @@ mod tests {
         );
         assert_eq!(unchanged.files_skipped, unchanged.files_scanned);
         assert_eq!(query(&ledger).totals.requests, 1);
+    }
+
+    fn cumulative_snapshot(timestamp: &str, input: u64, output: u64, cumulative: u64) -> String {
+        let usage = serde_json::json!({
+            "input_tokens": input, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+            "output_tokens": output, "reasoning_output_tokens": 0, "total_tokens": input + output
+        });
+        let mut total = usage.clone();
+        total["input_tokens"] = serde_json::json!(input * cumulative);
+        total["output_tokens"] = serde_json::json!(output * cumulative);
+        total["total_tokens"] = serde_json::json!((input + output) * cumulative);
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": timestamp, "type": "event_msg", "payload": {
+                    "type": "token_count", "info": {"last_token_usage": usage, "total_token_usage": total}
+                }
+            })
+        )
+    }
+
+    #[test]
+    fn usage_replay_keeps_parent_and_children_separate_across_refreshes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let app = temp.path().join("app");
+        let ledger = UsageLedger::open(&app).unwrap();
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        let snapshot = cumulative_snapshot("2026-08-01T10:00:01Z", 100, 8, 1);
+        let parent = write_rollout(&home, &format!("{}{snapshot}", rollout_prefix()));
+        for (child, input) in [("child-a", 11), ("child-b", 22)] {
+            let header = serde_json::json!({"type":"session_meta", "payload": {
+                "id":child, "model_provider":"openai",
+                "source":{"subagent":{"thread_spawn":{"parent_thread_id":"rollout-ledger"}}}
+            }});
+            let boundary = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n{\"type\":\"inter_agent_communication_metadata\",\"payload\":{\"trigger_turn\":true}}\n";
+            fs::write(
+                parent.with_file_name(format!("z-{child}.jsonl")),
+                format!(
+                    "{header}\n{}{snapshot}{boundary}{}",
+                    rollout_prefix(),
+                    cumulative_snapshot("2026-08-01T10:00:02Z", input, 4, 1)
+                ),
+            )
+            .unwrap();
+        }
+        ledger.refresh(&home, 1_754_121_001_000).unwrap();
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 149);
+        assert_eq!(query(&ledger).totals.requests, 3);
+        drop(ledger);
+        let ledger = UsageLedger::open(&app).unwrap();
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(parent).unwrap();
+        file.write_all(cumulative_snapshot("2026-08-01T10:00:03Z", 100, 8, 1).as_bytes())
+            .unwrap();
+        let refreshed = ledger.refresh(&home, 1_754_121_002_000).unwrap();
+        assert_eq!(refreshed.events_added, 0);
+        file.write_all(cumulative_snapshot("2026-08-01T10:00:04Z", 100, 8, 2).as_bytes())
+            .unwrap();
+        ledger.refresh(&home, 1_754_121_003_000).unwrap();
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 257);
+        assert_eq!(query(&ledger).totals.requests, 4);
+    }
+
+    #[test]
+    fn usage_replay_ignores_repeated_cumulative_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        write_rollout(
+            &home,
+            &format!(
+                "{}{}{}{}",
+                rollout_prefix(),
+                cumulative_snapshot("2026-08-01T10:00:01Z", 100, 8, 1),
+                cumulative_snapshot("2026-08-01T10:00:02Z", 100, 8, 1),
+                cumulative_snapshot("2026-08-01T10:00:03Z", 100, 8, 2)
+            ),
+        );
+        ledger.refresh(&home, 1_754_121_001_000).unwrap();
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 216);
+        assert_eq!(query(&ledger).totals.requests, 2);
+    }
+
+    #[test]
+    fn usage_replay_upgrade_failure_preserves_events_cursors_and_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        write_rollout(
+            &home,
+            &format!(
+                "{}{}",
+                rollout_prefix(),
+                cumulative_snapshot("2026-08-01T10:00:01Z", 100, 8, 1)
+            ),
+        );
+        ledger.refresh(&home, 1_754_121_001_000).unwrap();
+        let connection = ledger.open_connection().unwrap();
+        connection
+            .execute_batch(
+                "UPDATE usage_metadata SET value = '5' WHERE key = 'usage_parser_version';
+            CREATE TRIGGER fail_rebuild BEFORE INSERT ON usage_events BEGIN
+                SELECT RAISE(ABORT, 'simulated insert failure'); END;",
+            )
+            .unwrap();
+        assert!(ledger.refresh(&home, 1_754_121_002_000).is_err());
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 108);
+        assert_eq!(
+            super::read_metadata(&connection, super::PARSER_VERSION_METADATA_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("5")
+        );
+        let cursors: i64 = connection
+            .query_row("SELECT count(*) FROM usage_cursors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cursors, 1);
+        connection
+            .execute_batch("DROP TRIGGER fail_rebuild;")
+            .unwrap();
+        ledger.refresh(&home, 1_754_121_003_000).unwrap();
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 108);
+        assert_eq!(
+            super::read_metadata(&connection, super::PARSER_VERSION_METADATA_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(super::PARSER_VERSION)
+        );
+    }
+
+    #[test]
+    fn usage_replay_upgrade_preserves_history_without_source_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        let old = write_rollout(
+            &home,
+            &format!(
+                "{}{}",
+                rollout_prefix(),
+                cumulative_snapshot("2026-08-01T10:00:01Z", 100, 8, 1)
+            ),
+        );
+        ledger.refresh(&home, 1_754_121_001_000).unwrap();
+        fs::remove_file(old).unwrap();
+        write_rollout(
+            &home,
+            &format!(
+                "{}{}",
+                rollout_prefix().replace("rollout-ledger", "new-rollout"),
+                cumulative_snapshot("2026-08-01T10:00:02Z", 11, 4, 1)
+            ),
+        );
+        ledger
+            .open_connection()
+            .unwrap()
+            .execute(
+                "UPDATE usage_metadata SET value = '5' WHERE key = 'usage_parser_version'",
+                [],
+            )
+            .unwrap();
+        ledger.refresh(&home, 1_754_121_002_000).unwrap();
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 123);
+        assert_eq!(query(&ledger).totals.requests, 2);
+    }
+
+    #[test]
+    fn usage_replay_keeps_scan_warnings_visible_in_overview() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        write_rollout(
+            &home,
+            &format!(
+                "{}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{}}}}}}\n",
+                rollout_prefix()
+            ),
+        );
+        let refreshed = ledger.refresh(&home, 1_754_121_001_000).unwrap();
+        assert_eq!(refreshed.warnings.len(), 1);
+        let overview = query(&ledger);
+        assert_eq!(overview.warnings.len(), 1);
+        assert_eq!(overview.warnings[0].message, refreshed.warnings[0].message);
+    }
+
+    #[test]
+    fn usage_replay_paginated_files_keep_independent_physical_cursors() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        let logical = "01a0e2e9-a50b-79a2-a0ec-0fef03758d95";
+        let physical = "01a0e2eb-a8a1-7492-8005-9ff6e0941e8b";
+        let prefix = rollout_prefix().replace("rollout-ledger", logical);
+        let first = write_rollout(
+            &home,
+            &format!(
+                "{prefix}{}",
+                cumulative_snapshot("2026-08-01T10:00:01Z", 100, 8, 1)
+            ),
+        );
+        let parent = first.parent().unwrap().to_path_buf();
+        fs::rename(
+            &first,
+            parent.join(format!("rollout-2026-08-01T10-00-00-{logical}.jsonl")),
+        )
+        .unwrap();
+        fs::write(
+            parent.join(format!(
+                "rollout-2026-08-01T10-00-02-{logical}_{physical}.jsonl"
+            )),
+            format!(
+                "{prefix}{}",
+                cumulative_snapshot("2026-08-01T10:00:03Z", 100, 8, 2)
+            ),
+        )
+        .unwrap();
+        ledger.refresh(&home, 1_754_121_001_000).unwrap();
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 216);
+        assert_eq!(query(&ledger).totals.requests, 2);
+        let refreshed = ledger.refresh(&home, 1_754_121_002_000).unwrap();
+        assert_eq!(refreshed.events_added, 0);
+        assert_eq!(refreshed.files_opened, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a frozen local diagnostic snapshot; never points at live app data"]
+    fn usage_replay_diagnostic_snapshot() {
+        let snapshot = std::env::var("CODEX_TOOLS_USAGE_SNAPSHOT").expect("snapshot directory");
+        let root = Path::new(&snapshot);
+        assert!(root.join("snapshot.json").is_file());
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("snapshot.json")).unwrap()).unwrap();
+        let ledger = UsageLedger::open(&root.join("data")).unwrap();
+        let refreshed = ledger
+            .refresh(&root.join("home"), metadata["nowMs"].as_i64().unwrap())
+            .unwrap();
+        assert!(
+            refreshed
+                .warnings
+                .iter()
+                .all(|warning| warning.message == "跳过超过 8 MB 的会话日志行。"),
+            "{:?}",
+            refreshed.warnings
+        );
+        let overview = ledger
+            .query(UsageQuery {
+                range: UsageRange {
+                    start_at_ms: metadata["startMs"].as_i64().unwrap(),
+                    end_at_ms: metadata["nowMs"].as_i64().unwrap() + 1,
+                },
+                group_by: UsageGroupBy::Model,
+            })
+            .unwrap();
+        assert_eq!(
+            overview.totals.tokens.total_tokens,
+            metadata["expectedTotal"].as_u64().unwrap()
+        );
+        assert_eq!(
+            overview.totals.requests,
+            metadata["expectedRecords"].as_u64().unwrap()
+        );
+        let unchanged = ledger
+            .refresh(&root.join("home"), metadata["nowMs"].as_i64().unwrap())
+            .unwrap();
+        assert_eq!(unchanged.events_added, 0);
+        assert_eq!(unchanged.files_opened, 0);
+        println!(
+            "verified snapshot: {} tokens, {} records; unchanged scan opens 0 files",
+            overview.totals.tokens.total_tokens, overview.totals.requests
+        );
     }
 
     #[test]

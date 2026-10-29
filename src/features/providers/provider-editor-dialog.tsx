@@ -6,14 +6,12 @@ import {
   Dialog,
   DialogBody,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
 import {
   Field,
-  FieldDescription,
   FieldError,
   FieldGroup,
   FieldLabel,
@@ -42,6 +40,7 @@ import { toast } from "@/components/ui/toast"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
 import type { Provider } from "@/types"
+import { useAsyncAction } from "@/hooks/use-async-action"
 
 import {
   addCustomModelTo,
@@ -148,11 +147,45 @@ export function ProviderEditorDialog(props: ProviderEditorDialogProps) {
 function ProviderEditorDialogContent({
   open,
   onOpenChange,
+  ...props
+}: ProviderEditorDialogProps) {
+  const [saving, setSaving] = useState(false)
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && saving) return
+        onOpenChange(nextOpen)
+      }}
+    >
+      <DialogContent showCloseButton={!saving} aria-busy={saving}>
+        <DialogHeader>
+          <DialogTitle>
+            {props.provider.id ? "编辑 API 服务" : "添加 API 服务"}
+          </DialogTitle>
+        </DialogHeader>
+        <ProviderEditorForm
+          {...props}
+          onCancel={() => onOpenChange(false)}
+          onSavingChange={setSaving}
+        />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+export function ProviderEditorForm({
   provider,
   onProviderChange,
   onSaved,
-}: ProviderEditorDialogProps) {
-  const [saving, setSaving] = useState(false)
+  onCancel,
+  onSavingChange,
+}: Omit<ProviderEditorDialogProps, "open" | "onOpenChange"> & {
+  onCancel: () => void
+  onSavingChange: (saving: boolean) => void
+}) {
+  const { busy, begin, end } = useAsyncAction<"save">()
+  const saving = busy === "save"
   const [modelSearch, setModelSearch] = useState("")
   const [customModelDraft, setCustomModelDraft] = useState("")
   const [contextWindowOverrideDraft, setContextWindowOverrideDraft] = useState(
@@ -172,7 +205,8 @@ function ProviderEditorDialogContent({
       })
       return
     }
-    setSaving(true)
+    if (!begin("save")) return
+    onSavingChange(true)
     try {
       const saved = await call("connections_save_provider", {
         provider: {
@@ -191,7 +225,8 @@ function ProviderEditorDialogContent({
         type: "error",
       })
     } finally {
-      setSaving(false)
+      end("save")
+      onSavingChange(false)
     }
   }
 
@@ -255,244 +290,214 @@ function ProviderEditorDialogContent({
   }
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen && saving) return
-        if (!nextOpen) setModelSearch("")
-        onOpenChange(nextOpen)
-      }}
-    >
-      <DialogContent showCloseButton={!saving} aria-busy={saving}>
-        <DialogHeader>
-          <DialogTitle>
-            {provider.id ? "编辑 API 服务" : "添加 API 服务"}
-          </DialogTitle>
-          <DialogDescription>
-            填写与 OpenAI 兼容的接口信息，模型列表将从 API 自动同步。
-          </DialogDescription>
-        </DialogHeader>
-        <DialogBody>
-          <FieldGroup>
-            <Field data-disabled={saving}>
-              <FieldLabel htmlFor="provider-name">名称</FieldLabel>
-              <Input
-                id="provider-name"
-                disabled={saving}
-                value={provider.name}
-                onChange={(event) => patch({ name: event.target.value })}
-              />
-            </Field>
-            <Field data-disabled={saving}>
-              <FieldLabel htmlFor="provider-url">Base URL</FieldLabel>
-              <Input
-                id="provider-url"
-                disabled={saving}
-                value={provider.baseUrl}
-                onChange={(event) => patch({ baseUrl: event.target.value })}
-              />
-            </Field>
-            <Field data-disabled={saving}>
-              <FieldLabel htmlFor="provider-key">API Key</FieldLabel>
-              <Input
-                id="provider-key"
-                autoComplete="off"
-                autoCapitalize="none"
-                autoCorrect="off"
-                data-1p-ignore
-                data-lpignore="true"
-                disabled={saving}
-                spellCheck={false}
-                type="password"
-                value={provider.apiKey ?? ""}
-                placeholder={
-                  provider.hasApiKey ? "留空以保留现有密钥" : "sk-..."
-                }
-                onChange={(event) => patch({ apiKey: event.target.value })}
-              />
-            </Field>
-            <Field data-disabled={saving}>
-              <FieldLabel>接口类型</FieldLabel>
-              <Select
-                items={[
-                  { label: "Responses API", value: "responses" },
-                  { label: "Chat Completions", value: "chat" },
-                ]}
-                value={provider.apiType}
-                disabled={saving}
-                onValueChange={(value) =>
-                  value && patch({ apiType: value as Provider["apiType"] })
-                }
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="responses">Responses API</SelectItem>
-                    <SelectItem value="chat">Chat Completions</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field
-              data-disabled={saving}
-              data-invalid={
-                !isValidContextWindowOverride(contextWindowOverrideDraft)
+    <>
+      <DialogBody>
+        <FieldGroup>
+          <Field data-disabled={saving}>
+            <FieldLabel htmlFor="provider-name">名称</FieldLabel>
+            <Input
+              id="provider-name"
+              disabled={saving}
+              value={provider.name}
+              onChange={(event) => patch({ name: event.target.value })}
+            />
+          </Field>
+          <Field data-disabled={saving}>
+            <FieldLabel htmlFor="provider-url">Base URL</FieldLabel>
+            <Input
+              id="provider-url"
+              disabled={saving}
+              value={provider.baseUrl}
+              onChange={(event) => patch({ baseUrl: event.target.value })}
+            />
+          </Field>
+          <Field data-disabled={saving}>
+            <FieldLabel htmlFor="provider-key">API Key</FieldLabel>
+            <Input
+              id="provider-key"
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              data-1p-ignore
+              data-lpignore="true"
+              disabled={saving}
+              spellCheck={false}
+              type="password"
+              value={provider.apiKey ?? ""}
+              placeholder={provider.hasApiKey ? "留空以保留现有密钥" : "sk-..."}
+              onChange={(event) => patch({ apiKey: event.target.value })}
+            />
+          </Field>
+          <Field data-disabled={saving}>
+            <FieldLabel htmlFor="provider-api-type">接口类型</FieldLabel>
+            <Select
+              items={[
+                { label: "Responses API", value: "responses" },
+                { label: "Chat Completions", value: "chat" },
+              ]}
+              value={provider.apiType}
+              disabled={saving}
+              onValueChange={(value) =>
+                value && patch({ apiType: value as Provider["apiType"] })
               }
             >
-              <FieldLabel htmlFor="provider-context-window-override">
-                自定义上下文窗口（token，可选）
-              </FieldLabel>
-              <Input
-                id="provider-context-window-override"
-                type="text"
-                inputMode="numeric"
-                placeholder="留空以自动匹配"
-                value={contextWindowOverrideDraft}
-                disabled={saving}
-                aria-invalid={
-                  !isValidContextWindowOverride(contextWindowOverrideDraft)
-                }
-                onChange={(event) =>
-                  setContextWindowOverrideDraft(event.target.value)
-                }
-              />
-              {isValidContextWindowOverride(contextWindowOverrideDraft) ? (
-                <FieldDescription>
-                  应用于该 API 的所有模型；留空则自动匹配上下文窗口。
-                </FieldDescription>
-              ) : (
-                <FieldError>请输入大于 0 的整数 token。</FieldError>
-              )}
-            </Field>
-            <FieldSet>
-              <FieldLegend variant="label">写入 Codex 的模型</FieldLegend>
-              <FieldGroup className="gap-2">
-                <Field data-disabled={saving}>
-                  <FieldLabel
-                    htmlFor="provider-model-search"
-                    className="sr-only"
-                  >
-                    搜索模型
-                  </FieldLabel>
-                  <Input
-                    id="provider-model-search"
-                    type="search"
-                    placeholder="搜索模型…"
-                    value={modelSearch}
-                    disabled={saving}
-                    onChange={(event) => setModelSearch(event.target.value)}
-                  />
-                </Field>
-                <Field data-disabled={saving}>
-                  <FieldLabel
-                    htmlFor="provider-custom-model"
-                    className="sr-only"
-                  >
-                    自定义模型 ID
-                  </FieldLabel>
-                  <InputGroup>
-                    <InputGroupInput
-                      id="provider-custom-model"
-                      placeholder="添加自定义模型 ID…"
-                      value={customModelDraft}
-                      disabled={saving}
-                      onChange={(event) =>
-                        setCustomModelDraft(event.target.value)
-                      }
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault()
-                          addCustomModel()
-                        }
-                      }}
-                    />
-                    <InputGroupAddon align="inline-end">
-                      <InputGroupButton
-                        size="sm"
-                        disabled={saving || !customModelDraft.trim()}
-                        onClick={addCustomModel}
-                      >
-                        <HugeiconsIcon
-                          icon={Add01Icon}
-                          data-icon="inline-start"
-                        />
-                        添加
-                      </InputGroupButton>
-                    </InputGroupAddon>
-                  </InputGroup>
-                </Field>
-                <div className="flex max-h-48 flex-col gap-1 overflow-y-auto overscroll-contain rounded-xl border border-border/60 p-2">
-                  {effectiveModels.length > 0 && (
-                    <div className="mb-1 flex items-center justify-between px-1">
-                      <span className="text-xs text-muted-foreground">
-                        {effectiveModels.length} 个模型
-                      </span>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        disabled={saving}
-                        onClick={() =>
-                          onProviderChange((prev) => ({
-                            ...prev,
-                            selectedModels: allModelsSelected(prev)
-                              ? []
-                              : undefined,
-                          }))
-                        }
-                      >
-                        {allSelected ? "取消全选" : "全选"}
-                      </Button>
-                    </div>
-                  )}
-                  {filteredModels.length === 0 ? (
-                    <div className="px-2 py-3 text-center text-xs text-muted-foreground">
-                      未找到匹配的模型
-                    </div>
-                  ) : (
-                    filteredModels.map((model) => (
-                      <ModelRow
-                        key={model}
-                        model={model}
-                        selected={selectedSet?.has(model) ?? true}
-                        isCustom={customSet.has(model)}
-                        saving={saving}
-                        onToggle={toggleModel}
-                        onRemove={removeModel}
-                      />
-                    ))
-                  )}
-                </div>
-                <FieldDescription>
-                  默认全部选中，取消选择后仅将选中模型写入 Codex。
-                </FieldDescription>
-              </FieldGroup>
-            </FieldSet>
-          </FieldGroup>
-        </DialogBody>
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            disabled={saving}
-            onClick={() => onOpenChange(false)}
-          >
-            取消
-          </Button>
-          <Button
-            type="button"
-            disabled={
-              saving || !provider.name || !provider.baseUrl || noneSelected
+              <SelectTrigger id="provider-api-type" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="responses">Responses API</SelectItem>
+                  <SelectItem value="chat">Chat Completions</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field
+            data-disabled={saving}
+            data-invalid={
+              !isValidContextWindowOverride(contextWindowOverrideDraft)
             }
-            onClick={() => void save()}
           >
-            {saving && <Spinner data-icon="inline-start" />}
-            保存
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+            <FieldLabel htmlFor="provider-context-window-override">
+              自定义上下文窗口（token，可选）
+            </FieldLabel>
+            <Input
+              id="provider-context-window-override"
+              type="text"
+              inputMode="numeric"
+              placeholder="留空以自动匹配"
+              value={contextWindowOverrideDraft}
+              disabled={saving}
+              aria-invalid={
+                !isValidContextWindowOverride(contextWindowOverrideDraft)
+              }
+              onChange={(event) =>
+                setContextWindowOverrideDraft(event.target.value)
+              }
+            />
+            {!isValidContextWindowOverride(contextWindowOverrideDraft) && (
+              <FieldError>请输入大于 0 的整数 token。</FieldError>
+            )}
+          </Field>
+          <FieldSet>
+            <FieldLegend variant="label">写入 Codex 的模型</FieldLegend>
+            <FieldGroup className="gap-2">
+              <Field data-disabled={saving}>
+                <FieldLabel htmlFor="provider-model-search" className="sr-only">
+                  搜索模型
+                </FieldLabel>
+                <Input
+                  id="provider-model-search"
+                  type="search"
+                  placeholder="搜索模型…"
+                  value={modelSearch}
+                  disabled={saving}
+                  onChange={(event) => setModelSearch(event.target.value)}
+                />
+              </Field>
+              <Field data-disabled={saving}>
+                <FieldLabel htmlFor="provider-custom-model" className="sr-only">
+                  自定义模型 ID
+                </FieldLabel>
+                <InputGroup>
+                  <InputGroupInput
+                    id="provider-custom-model"
+                    placeholder="添加自定义模型 ID…"
+                    value={customModelDraft}
+                    disabled={saving}
+                    onChange={(event) =>
+                      setCustomModelDraft(event.target.value)
+                    }
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault()
+                        addCustomModel()
+                      }
+                    }}
+                  />
+                  <InputGroupAddon align="inline-end">
+                    <InputGroupButton
+                      size="sm"
+                      disabled={saving || !customModelDraft.trim()}
+                      onClick={addCustomModel}
+                    >
+                      <HugeiconsIcon
+                        icon={Add01Icon}
+                        data-icon="inline-start"
+                      />
+                      添加
+                    </InputGroupButton>
+                  </InputGroupAddon>
+                </InputGroup>
+              </Field>
+              <div className="flex max-h-48 flex-col gap-1 overflow-y-auto overscroll-contain rounded-xl border border-border/60 p-2">
+                {effectiveModels.length > 0 && (
+                  <div className="mb-1 flex items-center justify-between px-1">
+                    <span className="text-xs text-muted-foreground">
+                      {effectiveModels.length} 个模型
+                    </span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled={saving}
+                      onClick={() =>
+                        onProviderChange((prev) => ({
+                          ...prev,
+                          selectedModels: allModelsSelected(prev)
+                            ? []
+                            : undefined,
+                        }))
+                      }
+                    >
+                      {allSelected ? "取消全选" : "全选"}
+                    </Button>
+                  </div>
+                )}
+                {filteredModels.length === 0 ? (
+                  <div className="px-2 py-3 text-center text-xs text-muted-foreground">
+                    {effectiveModels.length === 0
+                      ? "模型尚未同步"
+                      : "未找到匹配的模型"}
+                  </div>
+                ) : (
+                  filteredModels.map((model) => (
+                    <ModelRow
+                      key={model}
+                      model={model}
+                      selected={selectedSet?.has(model) ?? true}
+                      isCustom={customSet.has(model)}
+                      saving={saving}
+                      onToggle={toggleModel}
+                      onRemove={removeModel}
+                    />
+                  ))
+                )}
+              </div>
+            </FieldGroup>
+          </FieldSet>
+        </FieldGroup>
+      </DialogBody>
+      <DialogFooter>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={saving}
+          onClick={onCancel}
+        >
+          取消
+        </Button>
+        <Button
+          type="button"
+          disabled={
+            saving || !provider.name || !provider.baseUrl || noneSelected
+          }
+          onClick={() => void save()}
+        >
+          {saving && <Spinner data-icon="inline-start" />}
+          保存
+        </Button>
+      </DialogFooter>
+    </>
   )
 }

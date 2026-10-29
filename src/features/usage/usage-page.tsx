@@ -17,6 +17,16 @@ import {
   AlertTitle,
 } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -127,6 +137,7 @@ export function UsagePage({
   }>()
   const [ruleOpen, setRuleOpen] = useState(false)
   const [editingRule, setEditingRule] = useState<PricingRule>()
+  const [deleteTarget, setDeleteTarget] = useState<PricingRule>()
   const [busy, setBusy] = useState(false)
   const [pricingMutation, setPricingMutation] = useState<string>()
   const pricingMutationActive = useRef(false)
@@ -335,6 +346,7 @@ export function UsagePage({
     setPricingMutation(id)
     try {
       await call("usage_delete_pricing_rule", { id })
+      setDeleteTarget(undefined)
       setRules((current) => (current ?? []).filter((rule) => rule.id !== id))
       try {
         await call("usage_reprice", { range: query.range })
@@ -445,7 +457,12 @@ export function UsagePage({
       <Card size="sm" className="shrink-0">
         <CardHeader className="border-b">
           <CardTitle>用量趋势</CardTitle>
-          <CardDescription>{formatRange(overview.range)}</CardDescription>
+          <CardDescription>
+            {formatRange(overview.range)} ·{" "}
+            {overview.lastRefreshedAtMs
+              ? `扫描于 ${formatDate(overview.lastRefreshedAtMs, true)}`
+              : "尚未扫描"}
+          </CardDescription>
           <CardAction>
             <Button
               size="sm"
@@ -604,9 +621,6 @@ export function UsagePage({
                       <HugeiconsIcon icon={InformationCircleIcon} />
                     </EmptyMedia>
                     <EmptyTitle>暂无用量</EmptyTitle>
-                    <EmptyDescription>
-                      扫描 Codex 会话后会显示详细数据。
-                    </EmptyDescription>
                   </EmptyHeader>
                 </Empty>
               )}
@@ -626,13 +640,15 @@ export function UsagePage({
                         : "读取中"}
                   </Badge>
                 </AlertTitle>
-                <AlertDescription className="truncate">
-                  {officialPricingError
-                    ? `同步失败：${officialPricingError}`
-                    : officialCatalog?.fetchedAtMs
-                      ? `上次同步 ${formatDate(officialCatalog.fetchedAtMs, true)}`
-                      : "进入用量页会自动同步，也可手动刷新。"}
-                </AlertDescription>
+                {officialPricingError ? (
+                  <AlertDescription className="truncate">
+                    同步失败：{officialPricingError}
+                  </AlertDescription>
+                ) : officialCatalog?.fetchedAtMs ? (
+                  <AlertDescription className="truncate">
+                    上次同步 {formatDate(officialCatalog.fetchedAtMs, true)}
+                  </AlertDescription>
+                ) : null}
                 <AlertAction>
                   <Button
                     size="sm"
@@ -692,7 +708,7 @@ export function UsagePage({
                           variant="ghost"
                           aria-label="删除规则"
                           disabled={Boolean(pricingMutation)}
-                          onClick={() => void deleteRule(rule.id)}
+                          onClick={() => setDeleteTarget(rule)}
                         >
                           {pricingMutation === rule.id ? (
                             <Spinner />
@@ -758,9 +774,6 @@ export function UsagePage({
                       <HugeiconsIcon icon={Database02Icon} />
                     </EmptyMedia>
                     <EmptyTitle>暂无缓存数据</EmptyTitle>
-                    <EmptyDescription>
-                      当前范围内没有检测到缓存读取或写入 Token。
-                    </EmptyDescription>
                   </EmptyHeader>
                 </Empty>
               )}
@@ -774,6 +787,37 @@ export function UsagePage({
         groupBy={groupBy}
         onOpenChange={(open) => !open && setSelection(undefined)}
       />
+      <AlertDialog
+        open={Boolean(deleteTarget)}
+        onOpenChange={(open) => {
+          if (!open && !pricingMutation) setDeleteTarget(undefined)
+        }}
+      >
+        <AlertDialogContent aria-busy={Boolean(pricingMutation)}>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="break-all">
+              删除价格规则“{deleteTarget?.modelPattern}”？
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              将移除该规则，并重算 {formatRange(query.range)}{" "}
+              的历史费用估算。此操作无法撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={Boolean(pricingMutation)}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={Boolean(pricingMutation)}
+              onClick={() => deleteTarget && void deleteRule(deleteTarget.id)}
+            >
+              {pricingMutation && <Spinner data-icon="inline-start" />}
+              删除并重算
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <PricingEditor
         key={`${ruleOpen ? "open" : "closed"}-${editingRule?.id ?? "new"}`}
         open={ruleOpen}

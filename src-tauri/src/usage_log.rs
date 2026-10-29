@@ -1,4 +1,5 @@
 use chrono::DateTime;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[cfg(test)]
@@ -11,7 +12,7 @@ pub(crate) enum UsageQuality {
     CompatibleFallback,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenUsage {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
@@ -48,6 +49,8 @@ pub(crate) struct ParserState {
     pub next_event_ordinal: u64,
     pub usage_boundary: UsageBoundaryState,
     pub boundary_marker_required: bool,
+    pub last_cumulative_usage: Option<TokenUsage>,
+    pub parent_rollout_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -122,6 +125,11 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
 
     match record_type {
         Some("session_meta") => {
+            // Child logs contain copied parent metadata after their own header.
+            // The file owner is immutable; inherited metadata cannot replace it.
+            if state.rollout_id.is_some() {
+                return Ok(LineResult::Ignored);
+            }
             let payload = value.get("payload").and_then(Value::as_object);
             if let Some(id) = payload
                 .and_then(|payload| payload.get("id"))
@@ -138,6 +146,13 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
                 .is_some()
             {
                 state.usage_boundary = UsageBoundaryState::AwaitingSubagentTaskStart;
+                state.parent_rollout_id = payload
+                    .and_then(|payload| payload.get("source"))
+                    .and_then(|source| source.get("subagent"))
+                    .and_then(|subagent| subagent.get("thread_spawn"))
+                    .and_then(|spawn| spawn.get("parent_thread_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
             }
             if let Some(provider) = payload
                 .and_then(|payload| {
@@ -274,6 +289,11 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
             };
 
             let (usage, quality) = parse_usage(usage)?;
+            let (usage, quality) = match incremental_usage(info, usage, quality, state) {
+                Ok(Some(usage)) => usage,
+                Ok(None) => return Ok(LineResult::Ignored),
+                Err(warning) => return Ok(LineResult::Warning(warning)),
+            };
             Ok(LineResult::Event(ParsedUsageEvent {
                 ordinal,
                 occurred_at_ms: timestamp,
@@ -284,6 +304,68 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
             }))
         }
         _ => Ok(LineResult::Ignored),
+    }
+}
+
+fn incremental_usage(
+    info: &Value,
+    last: TokenUsage,
+    quality: UsageQuality,
+    state: &mut ParserState,
+) -> Result<Option<(TokenUsage, UsageQuality)>, String> {
+    let Some(raw) = info
+        .get("total_token_usage")
+        .filter(|value| !value.is_null())
+    else {
+        // Do not bridge a gap whose cumulative baseline is unknown.
+        state.last_cumulative_usage = None;
+        return Ok(Some((last, quality)));
+    };
+    let (current, _) = parse_usage(raw)?;
+    if [
+        ["input_tokens", "inputTokens"],
+        ["output_tokens", "outputTokens"],
+        ["total_tokens", "totalTokens"],
+    ]
+    .iter()
+    .any(|names| read_count(raw, names).1)
+        || current.input_tokens.checked_add(current.output_tokens) != Some(current.total_tokens)
+    {
+        state.last_cumulative_usage = None;
+        return Err("累计 Token 快照字段缺失或不一致，未计入该快照。".into());
+    }
+    let previous = state.last_cumulative_usage.replace(current);
+    let Some(previous) = previous else {
+        // The first cumulative value may include usage before collection began.
+        return Ok(Some((last, quality)));
+    };
+    if current == previous {
+        return Ok(None);
+    }
+    let delta = (|| {
+        Some(TokenUsage {
+            input_tokens: current.input_tokens.checked_sub(previous.input_tokens)?,
+            cached_input_tokens: current
+                .cached_input_tokens
+                .checked_sub(previous.cached_input_tokens)?,
+            cache_write_input_tokens: current
+                .cache_write_input_tokens
+                .checked_sub(previous.cache_write_input_tokens)?,
+            output_tokens: current.output_tokens.checked_sub(previous.output_tokens)?,
+            reasoning_output_tokens: current
+                .reasoning_output_tokens
+                .checked_sub(previous.reasoning_output_tokens)?,
+            total_tokens: current.total_tokens.checked_sub(previous.total_tokens)?,
+        })
+    })();
+    match delta {
+        Some(delta) if delta.total_tokens == 0 => Ok(None),
+        Some(delta) => Ok(Some((delta, quality))),
+        // A reset is unambiguous only when the new counter equals this request.
+        None if current == last => Ok(Some((last, UsageQuality::CompatibleFallback))),
+        None => {
+            Err("累计 Token 计数回退且无法确认重置边界，未计入该快照；后续从新基线继续。".into())
+        }
     }
 }
 
@@ -368,6 +450,42 @@ pub(crate) fn is_inter_agent_trigger_line(line: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{TokenUsage, parse_rollout_text};
+
+    #[test]
+    fn repeated_snapshots_and_confirmed_resets_do_not_inflate_usage() {
+        let usage = serde_json::json!({"input_tokens":10,"output_tokens":2,"total_tokens":12});
+        let lines = [1, 1, 2, 1, 2].map(|multiple| {
+            serde_json::json!({"type":"token_count","timestamp":"2026-08-01T10:00:01Z",
+                "payload":{"info":{"last_token_usage":usage,
+                    "total_token_usage":{"input_tokens":10*multiple,"output_tokens":2*multiple,"total_tokens":12*multiple}}}
+            }).to_string()
+        }).join("\n") + "\n";
+        let parsed = parse_rollout_text(&lines);
+        assert_eq!(parsed.events.len(), 4);
+        assert_eq!(
+            parsed
+                .events
+                .iter()
+                .map(|event| event.usage.total_tokens)
+                .sum::<u64>(),
+            48
+        );
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_counter_rollback_is_reported_and_rebaselined() {
+        let lines = [(100, 10), (50, 10), (60, 10)].map(|(total, last)| {
+            serde_json::json!({"type":"token_count","timestamp":"2026-08-01T10:00:01Z",
+                "payload":{"info":{"last_token_usage":{"input_tokens":last,"output_tokens":0,"total_tokens":last},
+                    "total_token_usage":{"input_tokens":total,"output_tokens":0,"total_tokens":total}}}
+            }).to_string()
+        }).join("\n") + "\n";
+        let parsed = parse_rollout_text(&lines);
+        assert_eq!(parsed.events.len(), 2);
+        assert_eq!(parsed.warnings.len(), 1);
+        assert_eq!(parsed.events[1].usage.total_tokens, 10);
+    }
 
     #[test]
     fn parses_model_context_and_incremental_token_usage() {

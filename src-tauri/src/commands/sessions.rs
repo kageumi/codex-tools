@@ -3,8 +3,12 @@ use crate::platform;
 use crate::{
     activation::ensure_codex_stopped,
     codex,
-    models::{AppError, PageResult, RepairResult, RepairScan, SessionSummary},
+    models::{
+        AppError, PageResult, RepairResult, RepairScan, SessionAction, SessionDeletePreview,
+        SessionMutationResult, SessionSummary, SessionSyncStatus,
+    },
     provider_sync,
+    session_bridge::SessionBridge,
     session_index::{self, SessionIndex},
     storage::Store,
 };
@@ -218,6 +222,263 @@ pub(crate) async fn sessions_list(
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+fn validate_thread_id(id: &str) -> Result<(), AppError> {
+    uuid::Uuid::parse_str(id)
+        .map_err(|_| AppError::InvalidConfig("会话 ID 无效，请刷新列表。".into()))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn sessions_sync_status(
+    store: State<'_, Store>,
+    bridge: State<'_, SessionBridge>,
+    thread_ids: Vec<String>,
+) -> Result<SessionSyncStatus, AppError> {
+    if thread_ids.len() > 100 {
+        return Err(AppError::InvalidConfig(
+            "每次最多查询 100 条会话状态。".into(),
+        ));
+    }
+    let home = codex::home(&store.codex_home_setting()?);
+    let uncertain = bridge.uncertain.lock().await.clone();
+    let mut unresolved = std::collections::HashSet::new();
+    for id in &thread_ids {
+        if let Some((action, affected)) = uncertain.get(id) {
+            if bridge
+                .confirm_applied(action, id, affected, &home)
+                .await
+                .unwrap_or(false)
+            {
+                bridge.uncertain.lock().await.remove(id);
+            } else {
+                unresolved.insert(id.clone());
+            }
+        }
+    }
+    let mut status = bridge.status(&thread_ids, &home);
+    for thread in &mut status.threads {
+        if unresolved.contains(&thread.thread_id) {
+            thread.state = "unknown".into();
+            thread.blocked_reason = Some("上次操作结果尚未确认，为避免重复提交暂不能操作。".into());
+        }
+    }
+    Ok(status)
+}
+
+async fn ensure_indexed(
+    index: &SessionIndex,
+    home: &std::path::Path,
+    id: &str,
+) -> Result<(), AppError> {
+    validate_thread_id(id)?;
+    let sessions = index
+        .load_recent(home)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if !sessions.iter().any(|t| t.id == id) {
+        return Err(AppError::InvalidConfig(
+            "此会话不在当前本地会话范围内，请刷新列表。".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn sessions_prepare_delete(
+    store: State<'_, Store>,
+    index: State<'_, SessionIndex>,
+    bridge: State<'_, SessionBridge>,
+    thread_id: String,
+) -> Result<SessionDeletePreview, AppError> {
+    let home = codex::home(&store.codex_home_setting()?);
+    ensure_indexed(&index, &home, &thread_id).await?;
+    let (affected, blocked_reason) = bridge.affected(&thread_id, &home).await?;
+    Ok(SessionDeletePreview {
+        thread_id,
+        affected_threads: affected,
+        blocked_reason,
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn sessions_mutate(
+    app: tauri::AppHandle,
+    store: State<'_, Store>,
+    index: State<'_, SessionIndex>,
+    bridge: State<'_, SessionBridge>,
+    thread_id: String,
+    action: SessionAction,
+    confirmed_thread_ids: Option<Vec<String>>,
+) -> Result<SessionMutationResult, AppError> {
+    validate_thread_id(&thread_id)?;
+    // try_lock rejects queued duplicate clicks instead of replaying the write later.
+    let _operation = bridge
+        .operation
+        .try_lock()
+        .map_err(|_| AppError::InvalidConfig("正在处理会话操作，请稍候。".into()))?;
+    let home = codex::home(&store.codex_home_setting()?);
+    let (method, label) = match action {
+        SessionAction::Archive => ("thread/archive", "已归档会话"),
+        SessionAction::Unarchive => ("thread/unarchive", "已取消归档"),
+        SessionAction::Delete => ("thread/delete", "已永久删除会话"),
+    };
+    let short_action = method.strip_prefix("thread/").unwrap_or_default();
+    let pending = bridge.uncertain.lock().await.get(&thread_id).cloned();
+    if let Some((previous, ids)) = pending {
+        bridge.refresh_catalog(&app).await?;
+        if bridge
+            .confirm_applied(&previous, &thread_id, &ids, &home)
+            .await?
+        {
+            bridge.uncertain.lock().await.remove(&thread_id);
+            // Reconcile the previously submitted write; never submit it a second time.
+            if previous == short_action {
+                return Ok(SessionMutationResult {
+                    message: label.into(),
+                });
+            }
+        } else {
+            return Err(AppError::InvalidConfig(
+                "上次操作结果尚未确认，为避免重复提交暂不能再次操作。请核对 Codex 中的会话状态。"
+                    .into(),
+            ));
+        }
+    }
+    ensure_indexed(&index, &home, &thread_id).await?;
+    let root = bridge.thread(&thread_id, &home)?;
+    if action == SessionAction::Archive && root.archived
+        || action == SessionAction::Unarchive && !root.archived
+    {
+        return Ok(SessionMutationResult {
+            message: label.into(),
+        });
+    }
+    let affected = if action == SessionAction::Unarchive {
+        vec![crate::models::SessionAffectedThread {
+            id: root.id,
+            title: root.title,
+        }]
+    } else {
+        let (affected, blocked_reason) = bridge.affected(&thread_id, &home).await?;
+        if let Some(reason) = blocked_reason {
+            return Err(AppError::InvalidConfig(reason));
+        }
+        affected
+    };
+    let ids: Vec<_> = affected.iter().map(|t| t.id.clone()).collect();
+    if action == SessionAction::Delete {
+        let mut confirmed = confirmed_thread_ids
+            .ok_or_else(|| AppError::InvalidConfig("永久删除必须先确认受影响的会话。".into()))?;
+        let mut current = ids.clone();
+        confirmed.sort();
+        confirmed.dedup();
+        current.sort();
+        current.dedup();
+        if confirmed != current {
+            return Err(AppError::InvalidConfig(
+                "派生会话范围已变化，请关闭弹窗并重新确认删除范围。".into(),
+            ));
+        }
+    }
+    let attempt = match bridge.mutate(method, &thread_id, &ids).await {
+        Ok(outcome)
+            if outcome
+                .get("dispatched")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false) =>
+        {
+            return Err(AppError::InvalidConfig(
+                outcome
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("无法确认运行状态。")
+                    .into(),
+            ));
+        }
+        Ok(outcome) if outcome.get("error").is_some() => Err(AppError::Internal(
+            outcome
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("会话操作结果未知。")
+                .into(),
+        )),
+        Ok(outcome)
+            if outcome
+                .get("dispatched")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            Ok(outcome)
+        }
+        Ok(_) => Err(AppError::Internal(
+            "会话操作响应无效，结果尚未确认。".into(),
+        )),
+        Err(error) => Err(error),
+    };
+    match attempt {
+        Ok(outcome) => {
+            let native_confirmed =
+                bridge.record_success(short_action, &thread_id, &ids, &home, &outcome);
+            // The response precedes native notifications. Reconcile once to verify
+            // partial subtree behavior and make the returned success authoritative.
+            if let Err(error) = bridge.refresh_catalog(&app).await {
+                bridge
+                    .uncertain
+                    .lock()
+                    .await
+                    .insert(thread_id.clone(), (short_action.into(), ids));
+                return Err(AppError::Internal(format!(
+                    "Codex 已处理操作，但同步核对失败：{error}"
+                )));
+            }
+            if !native_confirmed
+                && !bridge
+                    .confirm_applied(short_action, &thread_id, &ids, &home)
+                    .await
+                    .unwrap_or(false)
+            {
+                bridge
+                    .uncertain
+                    .lock()
+                    .await
+                    .insert(thread_id, (short_action.into(), ids));
+                return Err(AppError::Internal(
+                    "Codex 返回成功，但会话状态尚未确认，请核对后再操作。".into(),
+                ));
+            }
+            Ok(SessionMutationResult {
+                message: label.into(),
+            })
+        }
+        Err(error) => {
+            {
+                bridge
+                    .uncertain
+                    .lock()
+                    .await
+                    .insert(thread_id.clone(), (short_action.into(), ids));
+                // A read may confirm success after a lost response; it never repeats a write.
+                if bridge.refresh_catalog(&app).await.is_ok()
+                    && bridge
+                        .confirm_applied(
+                            short_action,
+                            &thread_id,
+                            &affected.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+                            &home,
+                        )
+                        .await
+                        .unwrap_or(false)
+                {
+                    bridge.uncertain.lock().await.remove(&thread_id);
+                    return Ok(SessionMutationResult {
+                        message: label.into(),
+                    });
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]

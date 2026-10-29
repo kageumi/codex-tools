@@ -28,6 +28,10 @@ import type {
   RepairScan,
   RepriceResult,
   Session,
+  SessionAction,
+  SessionDeletePreview,
+  SessionMutationResult,
+  SessionSyncStatus,
   SettingsOverview,
   SupportDiagnostics,
   UsageOverview,
@@ -101,6 +105,15 @@ type CommandMap = {
   settings_launch_codex_debug: CommandSpec<undefined, ModelUnlockResult>
   sessions_scan: CommandSpec<undefined, RepairScan>
   sessions_repair: CommandSpec<{ targetProvider: string }, RepairResult>
+  sessions_sync_status: CommandSpec<{ threadIds: string[] }, SessionSyncStatus>
+  sessions_prepare_delete: CommandSpec<
+    { threadId: string },
+    SessionDeletePreview
+  >
+  sessions_mutate: CommandSpec<
+    { threadId: string; action: SessionAction; confirmedThreadIds?: string[] },
+    SessionMutationResult
+  >
   sessions_list: CommandSpec<
     {
       query?: string
@@ -172,6 +185,9 @@ export const commandInventory = defineCommandInventory([
   "settings_launch_codex_debug",
   "sessions_scan",
   "sessions_repair",
+  "sessions_sync_status",
+  "sessions_prepare_delete",
+  "sessions_mutate",
   "sessions_list",
   "dashboard_launch",
   "usage_get_overview",

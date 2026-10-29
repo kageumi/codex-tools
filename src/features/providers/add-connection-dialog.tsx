@@ -1,5 +1,6 @@
 import { useRef, useState } from "react"
 import {
+  Add01Icon,
   Copy01Icon,
   ExternalLinkIcon,
   InformationCircleIcon,
@@ -22,17 +23,11 @@ import {
 import {
   Empty,
   EmptyContent,
-  EmptyDescription,
   EmptyHeader,
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
-import {
-  Field,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-} from "@/components/ui/field"
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -40,15 +35,18 @@ import { Textarea } from "@/components/ui/textarea"
 import { toast } from "@/components/ui/toast"
 import { writeClipboardText } from "@/lib/clipboard"
 import { errorMessage } from "@/lib/format"
-import type { DeviceAuthorization } from "@/types"
+import type { DeviceAuthorization, Provider } from "@/types"
+
+import { emptyProvider } from "./connection-utils"
+import { ProviderEditorForm } from "./provider-editor-dialog"
 
 const MAX_DISPLAY_NAME_LENGTH = 128
 const MAX_ACCOUNT_ID_LENGTH = 512
 const MAX_COOKIE_CREDENTIAL_LENGTH = 262_144
 
-export type AccountLoginMode = "browser" | "cookie"
+export type AddConnectionMode = "browser" | "cookie" | "api"
 
-export function AccountLoginDialog({
+export function AddConnectionDialog({
   open,
   mode,
   onModeChange,
@@ -62,16 +60,18 @@ export function AccountLoginDialog({
   onOpenPage,
   onCheck,
   onImport,
+  onProviderSaved,
 }: {
   open: boolean
-  mode: AccountLoginMode
-  onModeChange: (mode: AccountLoginMode) => void
+  mode: AddConnectionMode
+  onModeChange: (mode: AddConnectionMode) => void
   onOpenChange: (open: boolean) => void
   authorization?: DeviceAuthorization
   starting: boolean
   polling: boolean
   importing: boolean
   error?: string
+  onProviderSaved: (provider: Provider) => void
   onStart: () => void
   onOpenPage: () => void
   onCheck: () => void
@@ -85,7 +85,9 @@ export function AccountLoginDialog({
   const [accountId, setAccountId] = useState("")
   const [hasContent, setHasContent] = useState(false)
   const contentRef = useRef<HTMLTextAreaElement>(null)
-  const busy = starting || polling || importing
+  const [provider, setProvider] = useState<Provider>(emptyProvider)
+  const [saving, setSaving] = useState(false)
+  const busy = starting || polling || importing || saving
 
   const copyAuthorizationCode = async () => {
     if (!authorization) return
@@ -101,37 +103,49 @@ export function AccountLoginDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (busy) return
+        onOpenChange(nextOpen)
+      }}
+    >
       <DialogContent showCloseButton={!busy} aria-busy={busy}>
         <DialogHeader>
-          <DialogTitle>登录 OpenAI 账号</DialogTitle>
+          <DialogTitle>添加连接</DialogTitle>
         </DialogHeader>
 
-        <DialogBody>
-          {error && (
-            <Alert variant="destructive">
-              <HugeiconsIcon icon={InformationCircleIcon} />
-              <AlertTitle>无法完成登录</AlertTitle>
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          )}
+        <Tabs
+          className="min-h-0 gap-4"
+          value={mode}
+          onValueChange={(value) => {
+            if (!busy) onModeChange(value as AddConnectionMode)
+          }}
+        >
+          <TabsList className="grid w-full shrink-0 grid-cols-3">
+            <TabsTrigger value="browser" disabled={busy}>
+              <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
+              官方授权
+            </TabsTrigger>
+            <TabsTrigger value="cookie" disabled={busy}>
+              <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
+              Cookie 导入
+            </TabsTrigger>
+            <TabsTrigger value="api" disabled={busy}>
+              <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
+              API 服务
+            </TabsTrigger>
+          </TabsList>
 
-          <Tabs
-            value={mode}
-            onValueChange={(value) => onModeChange(value as AccountLoginMode)}
-          >
-            <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="browser" disabled={busy}>
-                <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-                官方授权
-              </TabsTrigger>
-              <TabsTrigger value="cookie" disabled={busy}>
-                <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
-                Cookie 导入
-              </TabsTrigger>
-            </TabsList>
-
-            <TabsContent value="browser" className="flex flex-col gap-3 pt-1">
+          <TabsContent value="browser" className="flex min-h-0 flex-col gap-4">
+            <DialogBody className="gap-3">
+              {error && (
+                <Alert variant="destructive">
+                  <HugeiconsIcon icon={InformationCircleIcon} />
+                  <AlertTitle>无法完成登录</AlertTitle>
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
               {authorization ? (
                 <Alert>
                   <HugeiconsIcon icon={Login03Icon} />
@@ -146,8 +160,7 @@ export function AccountLoginDialog({
                     </Badge>
                   </AlertTitle>
                   <AlertDescription>
-                    请在 OpenAI
-                    授权页面输入此代码。授权完成后，本应用会自动保存账号并更新登录状态。
+                    请在 OpenAI 授权页面输入此代码。
                   </AlertDescription>
                 </Alert>
               ) : (
@@ -166,10 +179,6 @@ export function AccountLoginDialog({
                           <HugeiconsIcon icon={Login03Icon} />
                         </EmptyMedia>
                         <EmptyTitle>使用 OpenAI 官方设备授权</EmptyTitle>
-                        <EmptyDescription>
-                          获取一次性授权码后，在 OpenAI
-                          页面确认登录；本应用不会读取浏览器 Cookie。
-                        </EmptyDescription>
                       </>
                     )}
                   </EmptyHeader>
@@ -221,9 +230,22 @@ export function AccountLoginDialog({
                   </Button>
                 </div>
               )}
-            </TabsContent>
+            </DialogBody>
+          </TabsContent>
 
-            <TabsContent value="cookie" className="pt-1">
+          <TabsContent
+            value="cookie"
+            keepMounted
+            className="flex min-h-0 flex-col [&[hidden]]:hidden"
+          >
+            <DialogBody>
+              {error && (
+                <Alert variant="destructive">
+                  <HugeiconsIcon icon={InformationCircleIcon} />
+                  <AlertTitle>无法完成登录</AlertTitle>
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
               <FieldGroup>
                 <Field data-disabled={busy}>
                   <FieldLabel htmlFor="cookie-account-name">
@@ -251,10 +273,6 @@ export function AccountLoginDialog({
                     value={accountId}
                     onChange={(event) => setAccountId(event.target.value)}
                   />
-                  <FieldDescription>
-                    用于识别团队空间和查询额度。导入内容已包含 Account ID
-                    时无需重复填写。
-                  </FieldDescription>
                 </Field>
                 <Field data-disabled={busy}>
                   <FieldLabel htmlFor="cookie-account-content">
@@ -280,49 +298,59 @@ export function AccountLoginDialog({
                       setHasContent(/\S/.test(event.currentTarget.value))
                     }
                   />
-                  <FieldDescription>
-                    支持单个 Token、单账号 JSON 和账号数组，并可识别
-                    CPA、Sub2API、Cockpit、9router
-                    的导出格式。只会提取登录所需字段，原始内容不会保存。
-                  </FieldDescription>
                 </Field>
               </FieldGroup>
-            </TabsContent>
-          </Tabs>
-        </DialogBody>
-
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            disabled={busy}
-            onClick={() => onOpenChange(false)}
+            </DialogBody>
+          </TabsContent>
+          <TabsContent
+            value="api"
+            keepMounted
+            className="flex min-h-0 flex-col gap-4 [&[hidden]]:hidden"
           >
-            取消
-          </Button>
-          {mode === "cookie" && (
+            <ProviderEditorForm
+              provider={provider}
+              onProviderChange={setProvider}
+              onSavingChange={setSaving}
+              onCancel={() => onOpenChange(false)}
+              onSaved={onProviderSaved}
+            />
+          </TabsContent>
+        </Tabs>
+
+        {mode !== "api" && (
+          <DialogFooter>
             <Button
               type="button"
-              disabled={busy || !hasContent}
-              onClick={() => {
-                const content = contentRef.current?.value ?? ""
-                if (!content.trim()) return
-                onImport(
-                  name.trim() || undefined,
-                  accountId.trim() || undefined,
-                  content
-                )
-              }}
+              variant="outline"
+              disabled={busy}
+              onClick={() => onOpenChange(false)}
             >
-              {importing ? (
-                <Spinner data-icon="inline-start" />
-              ) : (
-                <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
-              )}
-              {importing ? "正在验证并导入…" : "导入 Cookie 数据"}
+              取消
             </Button>
-          )}
-        </DialogFooter>
+            {mode === "cookie" && (
+              <Button
+                type="button"
+                disabled={busy || !hasContent}
+                onClick={() => {
+                  const content = contentRef.current?.value ?? ""
+                  if (!content.trim()) return
+                  onImport(
+                    name.trim() || undefined,
+                    accountId.trim() || undefined,
+                    content
+                  )
+                }}
+              >
+                {importing ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
+                )}
+                {importing ? "正在验证并导入…" : "导入 Cookie 数据"}
+              </Button>
+            )}
+          </DialogFooter>
+        )}
       </DialogContent>
     </Dialog>
   )

@@ -19,6 +19,9 @@ import type {
   RepairResult,
   RepairScan,
   Session,
+  SessionAction,
+  SessionDeletePreview,
+  SessionSyncStatus,
   SettingsOverview,
   SupportDiagnostics,
   UsageOverview,
@@ -441,6 +444,52 @@ export async function mockCall(
         ],
         warnings: [],
       } satisfies RepairScan
+    case "sessions_sync_status": {
+      const { threadIds } = args as { threadIds: string[] }
+      return {
+        connected: true,
+        message: "已连接 Codex，会话操作将自动同步。",
+        threads: threadIds.map((threadId) => ({ threadId, state: "idle" })),
+      } satisfies SessionSyncStatus
+    }
+    case "sessions_prepare_delete": {
+      const { threadId } = args as { threadId: string }
+      const session = mockSessions.find(
+        (candidate) => candidate.id === threadId
+      )
+      if (!session) throw new Error("会话已不存在，请刷新列表。")
+      return {
+        threadId,
+        affectedThreads: [{ id: session.id, title: session.title }],
+      } satisfies SessionDeletePreview
+    }
+    case "sessions_mutate": {
+      const { threadId, action, confirmedThreadIds } = args as {
+        threadId: string
+        action: SessionAction
+        confirmedThreadIds?: string[]
+      }
+      const index = mockSessions.findIndex(
+        (candidate) => candidate.id === threadId
+      )
+      const session = mockSessions[index]
+      if (!session) throw new Error("会话已不存在，请刷新列表。")
+      if (action === "delete") {
+        if (!confirmedThreadIds?.includes(threadId))
+          throw new Error("请先确认删除范围。")
+        mockSessions.splice(index, 1)
+      } else {
+        session.archived = action === "archive"
+      }
+      return {
+        message:
+          action === "delete"
+            ? "会话已永久删除，历史用量已保留。"
+            : action === "archive"
+              ? "会话已归档。"
+              : "已取消归档。",
+      }
+    }
     case "sessions_repair":
       return mockRepair
     case "connections_activate_official": {

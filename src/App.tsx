@@ -425,7 +425,11 @@ export default function App() {
 
           <main
             ref={mainRef}
-            className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
+            className={
+              page === "providers"
+                ? "min-h-0 flex-1 overflow-hidden"
+                : "min-h-0 flex-1 overflow-y-auto overscroll-contain"
+            }
           >
             {stateError &&
               ((page === "dashboard" && !dashboard) ||
@@ -435,7 +439,14 @@ export default function App() {
                   <Alert variant="destructive">
                     <HugeiconsIcon icon={InformationCircleIcon} />
                     <AlertTitle>无法读取应用状态</AlertTitle>
-                    <AlertDescription>{stateError}</AlertDescription>
+                    <AlertDescription
+                      className={
+                        page === "providers" ? "line-clamp-3" : undefined
+                      }
+                      title={page === "providers" ? stateError : undefined}
+                    >
+                      {stateError}
+                    </AlertDescription>
                   </Alert>
                 </div>
               )}

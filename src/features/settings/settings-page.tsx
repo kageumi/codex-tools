@@ -426,7 +426,7 @@ function DiagnosticsSection({
       <CardHeader className="border-b">
         <CardTitle>诊断信息</CardTitle>
         <CardDescription>
-          可直接提交给开发者 · {formatDiagnosticTime(diagnostics.generatedAt)}
+          {formatDiagnosticTime(diagnostics.generatedAt)}
         </CardDescription>
         <CardAction>
           <Button size="sm" variant="outline" onClick={() => void copyReport()}>
@@ -535,16 +535,11 @@ function AppSection({
     <Card size="sm" className="flex-1">
       <CardHeader className="border-b">
         <CardTitle>ChatGPT / Codex 启动程序</CardTitle>
-        <CardDescription>
-          手动指定用于启动和模型解锁的应用或可执行文件。
-        </CardDescription>
       </CardHeader>
       <CardContent>
         <FieldGroup>
           <Field>
-            <FieldLabel htmlFor="codex-path">
-              ChatGPT / Codex 执行程序地址
-            </FieldLabel>
+            <FieldLabel htmlFor="codex-path">启动与模型解锁程序路径</FieldLabel>
             <InputGroup>
               <InputGroupInput
                 id="codex-path"

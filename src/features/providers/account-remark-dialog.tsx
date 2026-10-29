@@ -5,7 +5,6 @@ import {
   Dialog,
   DialogBody,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -71,9 +70,6 @@ export function AccountRemarkDialog({
       <DialogContent showCloseButton={!saving} aria-busy={saving}>
         <DialogHeader>
           <DialogTitle>编辑账号备注</DialogTitle>
-          <DialogDescription>
-            备注仅保存在本机，用于区分相近的账号。
-          </DialogDescription>
         </DialogHeader>
         <DialogBody>
           <FieldGroup>
