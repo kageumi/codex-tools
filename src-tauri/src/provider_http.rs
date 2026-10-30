@@ -1,4 +1,4 @@
-use crate::models::{AppError, ProviderProfile};
+use crate::models::{AppError, ProviderProfile, REASONING_EFFORTS};
 
 pub(crate) const MAX_UPSTREAM_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FETCHED_MODELS: usize = 10_000;
@@ -40,6 +40,10 @@ pub struct FetchedModelDetail {
     pub context_window: Option<u64>,
     /// 服务方返回的模型简介；没有返回时为空。
     pub description: Option<String>,
+    /// 服务方明确返回的模型推理档位；没有返回或格式不识别时为空。
+    pub reasoning_levels: Option<Vec<String>>,
+    /// 服务方明确返回的默认推理档位。
+    pub default_reasoning_level: Option<String>,
 }
 
 /// 根据 base_url 是否已带版本路径（/v1、/openai/v2）拼接上游接口路径。
@@ -135,6 +139,8 @@ fn parse_model_details_payload(
                 id,
                 context_window: parse_model_context_window(item),
                 description: parse_model_description(item),
+                reasoning_levels: parse_model_reasoning_levels(item),
+                default_reasoning_level: parse_default_reasoning_level(item),
             })
         })
         .collect::<Vec<_>>();
@@ -146,6 +152,62 @@ fn parse_model_details_payload(
         ));
     }
     Ok(models)
+}
+
+/// 解析服务端显式声明的支持档位。OpenAI 兼容服务没有统一的能力字段，
+/// 因此这里只接受明确列出档位的扩展字段，不从模型名或参数能力猜测。
+fn parse_model_reasoning_levels(item: &serde_json::Value) -> Option<Vec<String>> {
+    let value = [
+        item.get("supported_reasoning_levels"),
+        item.get("supportedReasoningLevels"),
+        item.get("supported_reasoning_efforts"),
+        item.get("supportedReasoningEfforts"),
+        item.pointer("/capabilities/supported_reasoning_levels"),
+        item.pointer("/capabilities/supportedReasoningLevels"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| value.is_array())?;
+    let values = value.as_array()?;
+    let mut levels = Vec::new();
+    for value in values {
+        let effort = value
+            .as_str()
+            .or_else(|| value.get("effort").and_then(serde_json::Value::as_str))
+            .or_else(|| {
+                value
+                    .get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(str::trim)
+            .map(str::to_ascii_lowercase);
+        if let Some(effort) = effort.filter(|effort| REASONING_EFFORTS.contains(&effort.as_str()))
+            && !levels.contains(&effort)
+        {
+            levels.push(effort);
+        }
+    }
+    if !values.is_empty() && levels.is_empty() {
+        return None;
+    }
+    Some(levels)
+}
+
+fn parse_default_reasoning_level(item: &serde_json::Value) -> Option<String> {
+    [
+        item.get("default_reasoning_level"),
+        item.get("defaultReasoningLevel"),
+        item.get("default_reasoning_effort"),
+        item.get("defaultReasoningEffort"),
+        item.pointer("/capabilities/default_reasoning_level"),
+        item.pointer("/capabilities/defaultReasoningLevel"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .map(str::trim)
+    .map(str::to_ascii_lowercase)
+    .find(|effort| REASONING_EFFORTS.contains(&effort.as_str()))
 }
 
 /// 从 `/models` 单项里解析模型简介；优先 `description` 字段，

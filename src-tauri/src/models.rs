@@ -16,6 +16,8 @@ const MAX_CONTEXT_WINDOW_OVERRIDE: u64 = 9_007_199_254_740_991;
 const MAX_CUSTOM_HEADERS: usize = 64;
 const MAX_HEADER_NAME_CHARS: usize = 256;
 const MAX_HEADER_VALUE_CHARS: usize = 8_192;
+pub(crate) const REASONING_EFFORTS: &[&str] =
+    &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -292,8 +294,7 @@ pub struct ProviderProfile {
     /// 与 available_models 一起构成该服务可写入 Codex 的“有效模型”。
     #[serde(default)]
     pub custom_models: Vec<String>,
-    /// 从 models.dev（catalog.json）抓取的本服务商模型元数据（slug → 元数据）；
-    /// 只在 id 与服务 `/models` 接口返回完全一致时保留，用于补充窗口/简介/名称。
+    /// 模型元数据（slug → 元数据）；包括服务 `/models` 和 models.dev 的信息。
     #[serde(default)]
     pub models_dev_meta: BTreeMap<String, ProviderModelsDevMeta>,
     /// 服务接入方式：直接 Responses API，或经本机转换代理接入 Chat Completions API。
@@ -1476,14 +1477,17 @@ pub struct ReasoningLevelInfo {
     pub description: Option<String>,
 }
 
-/// models.dev（catalog.json）中单个模型的元数据，只保存与 `/models` 接口
-/// 完全一致 id 的条目。
+/// 单个模型的补充元数据：名称/上下文等来自 models.dev，能力也可来自服务 `/models`。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelsDevMeta {
     pub name: Option<String>,
     pub context_window: Option<u64>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_levels: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
