@@ -21,6 +21,7 @@
 //! 订阅白名单限制），需要重新注入。
 
 use crate::{
+    desktop_cdp::{debug_probe_ports, evaluate, find_codex_debug_page_on, pick_debug_port},
     models::{
         ActiveKind, AppError, CodexModelInfo, ModelUnlockResult, ModelUnlockStatus,
         ProviderProfile, ReasoningLevelInfo,
@@ -29,56 +30,20 @@ use crate::{
     state::ActivationLock,
     storage::Store,
 };
-use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    sync::MutexGuard,
-};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::MutexGuard;
 
 /// 写入 Codex 配置目录的模型目录文件名（相对 `config.toml` 所在目录）。
 pub(crate) const MODEL_CATALOG_DIR: &str = "model-catalogs";
 pub(crate) const MODEL_CATALOG_FILE: &str = "codex-tools.json";
-/// 探测已有 CDP 端口的候选列表：上次随机端口（运行时拼入）以及
-/// 常见调试端口（codex++ 9229、常规 DevTools 端口等），便于复用用户
-/// 已开启的调试实例。不再包含固定端口：本应用每次都以随机端口启动，
-/// 避免端口可被本机其他进程预测。
-const PROBE_PORTS: &[u16] = &[9229, 9222, 9334, 9335];
-const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
-const MAX_CDP_PROBE_BYTES: usize = 256 * 1024;
-const EVALUATE_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 构造调试端口候选列表：上次启动用的随机端口优先，再补上常见调试端口。
-/// 端口不再固定，本机其他进程无法预测本应用的调试端口。
-fn debug_probe_ports(store: &Store) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(PROBE_PORTS.len() + 1);
-    if let Ok(Some(last)) = store.last_debug_port() {
-        ports.push(last);
-    }
-    ports.extend_from_slice(PROBE_PORTS);
-    ports
-}
-
-/// 分配一个随机的本机端口：让系统从临时端口范围挑选（借用后立即释放），
-/// 避免固定端口被本机其他进程探测/复用。
-fn pick_debug_port() -> u16 {
-    std::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-        .ok()
-        .and_then(|listener| listener.local_addr().ok())
-        .map(|address| address.port())
-        .unwrap_or(PROBE_PORTS[0])
-}
 /// 未匹配到任何元数据时使用的上下文窗口：取最保守、最兼容的 128K，
 /// 避免高估模型上下文导致溢出。
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
@@ -503,152 +468,6 @@ async fn inject(
     })
 }
 
-/// 在所有候选端口上查找 Codex 的 CDP 端点，并复用探测结果里的页面
-/// WebSocket 地址，避免调用方再次探测同一端口。
-async fn find_codex_debug_page_on(ports: &[u16]) -> Option<(u16, String)> {
-    for &port in ports {
-        if let Some(ws_url) = probe_port(port).await {
-            return Some((port, ws_url));
-        }
-    }
-    None
-}
-
-#[derive(Debug, Deserialize)]
-struct CdpTarget {
-    #[serde(rename = "type")]
-    target_type: String,
-    #[serde(default)]
-    url: String,
-    #[serde(default, rename = "webSocketDebuggerUrl")]
-    web_socket_debugger_url: Option<String>,
-}
-
-fn is_codex_page_target(target: &CdpTarget) -> bool {
-    target.target_type == "page"
-        && target.url.trim_start().starts_with("app://-")
-        && target
-            .web_socket_debugger_url
-            .as_deref()
-            .is_some_and(|url| url.starts_with("ws://"))
-}
-
-/// 从目标列表中挑选要注入的页面：优先主窗口（`app://-/index.html`，无查询
-/// 参数），避免注入到头像浮层等弹窗页面；没有主窗口时才回退到第一个页面。
-fn pick_codex_page_ws(targets: Vec<CdpTarget>) -> Option<String> {
-    let pages = targets
-        .into_iter()
-        .filter(is_codex_page_target)
-        .collect::<Vec<_>>();
-    if pages.is_empty() {
-        return None;
-    }
-    pages
-        .iter()
-        .find(|target| !target.url.contains('?'))
-        .or_else(|| pages.first())
-        .and_then(|target| target.web_socket_debugger_url.clone())
-}
-
-/// 对单个端口发起 `GET /json` 探测，返回 Codex 页面目标的 WebSocket 地址。
-async fn probe_port(port: u16) -> Option<String> {
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    let mut stream = tokio::time::timeout_at(deadline.into(), TcpStream::connect(address))
-        .await
-        .ok()?
-        .ok()?;
-    let request =
-        format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    tokio::time::timeout_at(deadline.into(), stream.write_all(request.as_bytes()))
-        .await
-        .ok()?
-        .ok()?;
-    let mut body = Vec::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(read)) => {
-                body.extend_from_slice(&chunk[..read]);
-                if body.len() > MAX_CDP_PROBE_BYTES {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-    let response = String::from_utf8_lossy(&body);
-    let header_end = response.find("\r\n\r\n")?;
-    if !response[..header_end].contains(" 200 ") {
-        return None;
-    }
-    let targets: Vec<CdpTarget> = serde_json::from_str(response[header_end + 4..].trim()).ok()?;
-    pick_codex_page_ws(targets)
-}
-
-/// 通过 CDP WebSocket 在 Codex 渲染进程执行表达式，返回求值结果
-/// （`returnByValue` + `awaitPromise`）。
-async fn evaluate(ws_url: &str, expression: &str) -> Result<Value, AppError> {
-    let (mut socket, _response) =
-        tokio::time::timeout(EVALUATE_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
-            .await
-            .map_err(|_| AppError::Internal("连接 Codex 调试端口超时。".into()))?
-            .map_err(|error| AppError::Internal(format!("无法连接 Codex 调试端口：{error}")))?;
-    let request = json!({
-        "id": 1,
-        "method": "Runtime.evaluate",
-        "params": {
-            "expression": expression,
-            "returnByValue": true,
-            "awaitPromise": true,
-        }
-    });
-    tokio::time::timeout(
-        EVALUATE_TIMEOUT,
-        socket.send(Message::Text(request.to_string())),
-    )
-    .await
-    .map_err(|_| AppError::Internal("向 Codex 发送调试指令超时。".into()))?
-    .map_err(|error| AppError::Internal(format!("无法向 Codex 发送调试指令：{error}")))?;
-    tokio::time::timeout(EVALUATE_TIMEOUT, async {
-        loop {
-            let message = socket
-                .next()
-                .await
-                .ok_or_else(|| AppError::Internal("Codex 调试端口连接中断。".into()))?
-                .map_err(|error| AppError::Internal(format!("Codex 调试端口连接错误：{error}")))?;
-            let Message::Text(text) = message else {
-                continue;
-            };
-            let value: Value = serde_json::from_str(&text)
-                .map_err(|error| AppError::Internal(format!("Codex 调试响应格式无效：{error}")))?;
-            if value.get("id").and_then(Value::as_u64) != Some(1) {
-                continue;
-            }
-            if let Some(details) = value.pointer("/result/exceptionDetails") {
-                let text = details
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("未知错误");
-                return Err(AppError::Internal(format!(
-                    "Codex 渲染进程执行脚本失败：{text}"
-                )));
-            }
-            return Ok(value
-                .pointer("/result/result/value")
-                .cloned()
-                .unwrap_or(Value::Null));
-        }
-    })
-    .await
-    .map_err(|_| AppError::Internal("等待 Codex 响应超时。".into()))?
-}
-
 /// 注入到 Codex 渲染进程的解锁脚本。
 ///
 /// - 从 `window.__CODEX_TOOLS_MODEL_CATALOG__` 读取模型目录；
@@ -918,15 +737,16 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desktop_cdp::{PROBE_PORTS, probe_port};
     use crate::models::{
         ActiveKind, ActiveState, CodexAuthCredential, CodexAuthTokens, OfficialAccountSource,
         ProviderAccountQuota, ProviderApiType, ProviderProfile, QuotaStatus, StoredOfficialAccount,
     };
+    use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
     use std::collections::BTreeMap;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::Message;
 
     fn provider(id: &str, model: &str) -> ProviderProfile {
         ProviderProfile {
@@ -1365,30 +1185,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_detects_codex_page_target() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
-            let body = r#"[{"id":"page-1","type":"page","url":"app://-/index.html","webSocketDebuggerUrl":"ws://127.0.0.1:PORT/devtools/page/abc"},{"id":"other","type":"other","url":"about:blank"}]"#;
-            let body = body.replace("PORT", &port.to_string());
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-        });
-        let ws_url = probe_port(port).await;
-        let expected = format!("ws://127.0.0.1:{port}/devtools/page/abc");
-        assert_eq!(ws_url.as_deref(), Some(expected.as_str()));
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
     async fn inject_exchanges_catalog_script_and_verification() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -1487,53 +1283,6 @@ mod tests {
             received[2],
             "window.__CODEX_TOOLS_MODEL_UNLOCKED__ === true"
         );
-    }
-
-    #[tokio::test]
-    async fn probe_prefers_main_window_over_popup_targets() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
-            // 弹窗目标排在最前，主窗口排在后面：必须选中主窗口。
-            let body = format!(
-                r#"[{{"id":"popup","type":"page","url":"app://-/index.html?initialRoute=%2Favatar-overlay","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/popup"}},{{"id":"main","type":"page","url":"app://-/index.html","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/main"}}]"#
-            );
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-        });
-        let expected = format!("ws://127.0.0.1:{port}/devtools/page/main");
-        assert_eq!(probe_port(port).await.as_deref(), Some(expected.as_str()));
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn probe_ignores_non_codex_targets_and_errors() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
-            let body = r#"[{"id":"web","type":"page","url":"https://example.test/","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/page/abc"}]"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-        });
-        assert!(probe_port(port).await.is_none());
-        server.join().unwrap();
-        assert!(probe_port(1).await.is_none());
     }
 
     #[tokio::test]

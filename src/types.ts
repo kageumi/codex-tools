@@ -361,6 +361,26 @@ export type Session = {
   hasUserEvent: boolean
 }
 
+export type SessionAction = "archive" | "unarchive" | "delete"
+
+export type SessionSyncStatus = {
+  connected: boolean
+  message: string
+  threads: Array<{
+    threadId: string
+    state: "idle" | "running" | "unknown"
+    blockedReason?: string
+  }>
+}
+
+export type SessionDeletePreview = {
+  threadId: string
+  affectedThreads: Array<{ id: string; title: string }>
+  blockedReason?: string
+}
+
+export type SessionMutationResult = { message: string }
+
 export type PageResult<T> = {
   items: T[]
   total: number

@@ -4,6 +4,7 @@ mod chat_proxy;
 mod codex;
 mod commands;
 mod credential_maintenance;
+mod desktop_cdp;
 mod json_store;
 mod local_usage;
 mod model_unlock;
@@ -18,6 +19,7 @@ mod pricing;
 mod provider_http;
 mod provider_sync;
 mod proxy_import;
+mod session_bridge;
 mod session_index;
 mod state;
 mod storage;
@@ -215,6 +217,7 @@ pub fn run() {
         .manage(ResetCreditOperations::default())
         .manage(ChatProxyRegistry::default())
         .manage(SessionIndex::default())
+        .manage(session_bridge::SessionBridge::default())
         .setup(|app| {
             #[cfg(windows)]
             if let Some(window) = app.get_webview_window("main") {
@@ -250,6 +253,7 @@ pub fn run() {
                 })
                 .build(app)?;
             let handle = app.handle().clone();
+            tauri::async_runtime::spawn(session_bridge::run(handle.clone()));
             tauri::async_runtime::spawn(run_credential_maintenance(handle));
             Ok(())
         })
@@ -294,6 +298,9 @@ pub fn run() {
             commands::sessions::sessions_scan,
             commands::sessions::sessions_repair,
             commands::sessions::sessions_list,
+            commands::sessions::sessions_sync_status,
+            commands::sessions::sessions_prepare_delete,
+            commands::sessions::sessions_mutate,
             commands::dashboard::dashboard_launch,
             commands::dashboard::settings_get_codex_app,
             commands::dashboard::settings_save_codex_app_path,

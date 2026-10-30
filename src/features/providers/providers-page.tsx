@@ -23,7 +23,6 @@ import {
 } from "@/components/ui/card"
 import {
   Empty,
-  EmptyContent,
   EmptyHeader,
   EmptyMedia,
   EmptyTitle,
@@ -45,9 +44,9 @@ import type {
 import { emptyProvider } from "./connection-utils"
 
 import {
-  AccountLoginDialog,
-  type AccountLoginMode,
-} from "./account-login-dialog"
+  AddConnectionDialog,
+  type AddConnectionMode,
+} from "./add-connection-dialog"
 import {
   refreshAccountLogin,
   refreshAccountQuota,
@@ -86,7 +85,7 @@ export function ProvidersPage({
 }) {
   const [editorOpen, setEditorOpen] = useState(false)
   const [loginOpen, setLoginOpen] = useState(false)
-  const [loginMode, setLoginMode] = useState<AccountLoginMode>("browser")
+  const [loginMode, setLoginMode] = useState<AddConnectionMode>("browser")
   const [loginError, setLoginError] = useState<string>()
   const [editor, setEditor] = useState<Provider>(emptyProvider())
   const [remarkAccount, setRemarkAccount] = useState<OfficialAccountView>()
@@ -228,9 +227,9 @@ export function ProvidersPage({
     }
   }, [authorization, begin, end, finishLoginPoll, loginMode, loginOpen])
 
-  const openAccountLogin = (mode: AccountLoginMode) => {
+  const openAddConnection = (mode: AddConnectionMode) => {
     if (busy) return
-    if (mode !== "browser") setAuthorization(undefined)
+    setAuthorization(undefined)
     setLoginMode(mode)
     setLoginError(undefined)
     setLoginOpen(true)
@@ -279,17 +278,20 @@ export function ProvidersPage({
     <>
       <ProviderEditorDialog
         open={editorOpen}
-        onOpenChange={setEditorOpen}
+        onOpenChange={(open) => {
+          setEditorOpen(open)
+          if (!open) setEditor(emptyProvider())
+        }}
         provider={editor}
         onProviderChange={setEditor}
-        onSaved={(saved) => {
-          setEditor(saved)
+        onSaved={() => {
+          setEditor(emptyProvider())
           setEditorOpen(false)
           onRefresh()
         }}
       />
       <AccountRemarkDialog
-        key={remarkAccount?.id ?? "closed"}
+        key={`remark-${remarkAccount?.id ?? "closed"}`}
         account={remarkAccount}
         open={Boolean(remarkAccount)}
         onOpenChange={(open) => {
@@ -297,41 +299,50 @@ export function ProvidersPage({
         }}
         onSaved={onRefresh}
       />
-      <AccountLoginDialog
-        key={loginOpen ? "login-open" : "login-closed"}
-        open={loginOpen}
-        mode={loginMode}
-        onModeChange={(mode) => {
-          if (mode !== "browser") setAuthorization(undefined)
-          setLoginMode(mode)
-        }}
-        onOpenChange={(open) => {
-          if (!open && busy) return
-          setLoginOpen(open)
-          if (!open && !authorization) setLoginError(undefined)
-        }}
-        authorization={authorization}
-        starting={busy === "login"}
-        polling={busy === "poll"}
-        importing={busy === "import"}
-        error={loginError}
-        onStart={() => void startLogin()}
-        onOpenPage={() =>
-          void call("connections_open_login_page").catch((reason) =>
-            toast.add({
-              title: "无法打开登录页面",
-              description: errorMessage(reason),
-              type: "error",
-            })
-          )
-        }
-        onCheck={() => void checkLogin()}
-        onImport={(name, accountId, content) =>
-          void importCookie(name, accountId, content)
-        }
-      />
+      {loginOpen && (
+        <AddConnectionDialog
+          open={loginOpen}
+          mode={loginMode}
+          onModeChange={(mode) => {
+            if (mode !== "browser") setAuthorization(undefined)
+            setLoginMode(mode)
+            setLoginError(undefined)
+          }}
+          onOpenChange={(open) => {
+            if (!open && busy) return
+            setLoginOpen(open)
+            if (!open) {
+              setAuthorization(undefined)
+              setLoginError(undefined)
+            }
+          }}
+          authorization={authorization}
+          starting={busy === "login"}
+          polling={busy === "poll"}
+          importing={busy === "import"}
+          error={loginError}
+          onStart={() => void startLogin()}
+          onOpenPage={() =>
+            void call("connections_open_login_page").catch((reason) =>
+              toast.add({
+                title: "无法打开登录页面",
+                description: errorMessage(reason),
+                type: "error",
+              })
+            )
+          }
+          onCheck={() => void checkLogin()}
+          onProviderSaved={() => {
+            setLoginOpen(false)
+            onRefresh()
+          }}
+          onImport={(name, accountId, content) =>
+            void importCookie(name, accountId, content)
+          }
+        />
+      )}
       <ResetCreditsDialog
-        key={resetCreditAccountId ?? "closed"}
+        key={`reset-credits-${resetCreditAccountId ?? "closed"}`}
         account={resetCreditAccount}
         open={Boolean(resetCreditAccountId && resetCreditAccount)}
         onOpenChange={(nextOpen) => {
@@ -348,8 +359,12 @@ export function ProvidersPage({
 
   if (!selected) {
     return (
-      <div className="flex min-h-full flex-col px-3 pt-1 pb-3">
-        <Card size="sm" className="flex-1 justify-center">
+      <div className="flex h-full min-h-0 flex-col gap-2 px-3 pt-1 pb-3">
+        <AddConnectionToolbar
+          disabled={Boolean(busy) || estimating}
+          onOpen={openAddConnection}
+        />
+        <Card size="sm" className="min-h-0 flex-1 justify-center">
           <Empty>
             <EmptyHeader>
               <EmptyMedia variant="icon">
@@ -357,41 +372,6 @@ export function ProvidersPage({
               </EmptyMedia>
               <EmptyTitle>还没有连接</EmptyTitle>
             </EmptyHeader>
-            <EmptyContent className="grid w-full max-w-none grid-cols-3 gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                className="min-w-0 px-2 text-xs"
-                disabled={Boolean(busy)}
-                onClick={() => openAccountLogin("browser")}
-              >
-                <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-                OpenAI 授权
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                className="min-w-0 px-2 text-xs"
-                disabled={Boolean(busy)}
-                onClick={() => openAccountLogin("cookie")}
-              >
-                <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
-                导入 Cookie
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                className="min-w-0 px-2 text-xs"
-                disabled={Boolean(busy)}
-                onClick={() => {
-                  setEditor(emptyProvider())
-                  setEditorOpen(true)
-                }}
-              >
-                <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
-                添加 API 服务
-              </Button>
-            </EmptyContent>
           </Empty>
         </Card>
         {connectionEditors}
@@ -435,52 +415,17 @@ export function ProvidersPage({
   }
 
   return (
-    <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
-      <Card size="sm" className="shrink-0">
-        <CardHeader className="border-b">
-          <CardTitle>添加连接</CardTitle>
-        </CardHeader>
-        <CardContent className="grid w-full grid-cols-3 gap-2">
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="min-w-0 px-2 text-xs"
-            disabled={actionBusy}
-            onClick={() => openAccountLogin("browser")}
-          >
-            <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-            OpenAI 授权
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="min-w-0 px-2 text-xs"
-            disabled={actionBusy}
-            onClick={() => openAccountLogin("cookie")}
-          >
-            <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
-            导入 Cookie
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="min-w-0 px-2 text-xs"
-            disabled={actionBusy}
-            onClick={() => {
-              setEditor(emptyProvider())
-              setEditorOpen(true)
-            }}
-          >
-            <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
-            添加 API 服务
-          </Button>
-        </CardContent>
-      </Card>
+    <div className="flex h-full min-h-0 flex-col gap-2 px-3 pt-1 pb-3">
+      <AddConnectionToolbar
+        disabled={Boolean(busy) || estimating}
+        onOpen={openAddConnection}
+      />
 
-      <Card key={item.id} size="sm" className="shrink-0">
+      <Card
+        key={item.id}
+        size="sm"
+        className="shrink-0 data-[size=sm]:[--card-spacing:--spacing(3)]"
+      >
         {isAccount ? (
           <AccountCardHeader
             account={account!}
@@ -489,8 +434,10 @@ export function ProvidersPage({
           />
         ) : (
           <CardHeader className="border-b">
-            <div className="flex items-center gap-2">
-              <CardTitle>{displayName}</CardTitle>
+            <div className="flex min-w-0 items-center gap-2">
+              <CardTitle className="min-w-0 truncate" title={displayName}>
+                {displayName}
+              </CardTitle>
               {item.active && (
                 <Badge>
                   <HugeiconsIcon icon={CheckmarkCircle02Icon} />
@@ -499,13 +446,15 @@ export function ProvidersPage({
               )}
               <Badge variant="outline">API 服务</Badge>
             </div>
-            <CardDescription>{provider?.baseUrl}</CardDescription>
+            <CardDescription className="truncate" title={provider?.baseUrl}>
+              {provider?.baseUrl}
+            </CardDescription>
           </CardHeader>
         )}
         {isAccount ? (
           <AccountDetailContent account={account!} />
         ) : (
-          <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4">
+          <CardContent className="grid grid-cols-2 gap-x-6 gap-y-2">
             <Detail
               label="接入方式"
               value={
@@ -527,7 +476,7 @@ export function ProvidersPage({
             />
           </CardContent>
         )}
-        <CardFooter className="flex-wrap gap-2">
+        <CardFooter className="shrink-0 flex-wrap gap-2 py-2">
           {isAccount ? (
             <>
               <Button
@@ -652,7 +601,7 @@ export function ProvidersPage({
 function ProvidersLoading() {
   return (
     <div
-      className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3"
+      className="flex h-full min-h-0 flex-col gap-2 px-3 pt-1 pb-3"
       aria-label="正在读取账号与服务"
       aria-busy="true"
     >
@@ -726,24 +675,34 @@ function AccountCardHeader({
   const maintenanceStatus = credentialRefreshText(account)
   const shortLoginStatus = shortLoginStatusText(account)
   const shortMaintenanceStatus = shortMaintenanceStatusText(account)
+  const planText = accountPlanText(account)
 
   return (
-    <CardHeader className="grid-cols-1 gap-4 border-b min-[480px]:grid-cols-[minmax(0,1fr)_auto]">
+    <CardHeader className="grid-cols-[minmax(0,1fr)_auto] gap-3 border-b has-data-[slot=card-description]:grid-rows-1">
       <div className="flex min-w-0 flex-col gap-1.5">
-        <div className="flex flex-wrap items-center gap-2">
-          <CardTitle className="min-w-0 break-words">{displayName}</CardTitle>
+        <div className="flex min-w-0 items-center gap-2 [&>[data-slot=badge]]:shrink-0">
+          <CardTitle className="min-w-0 truncate" title={displayName}>
+            {displayName}
+          </CardTitle>
           {account.active && (
             <Badge>
               <HugeiconsIcon icon={CheckmarkCircle02Icon} />
               当前连接
             </Badge>
           )}
-          <Badge variant="secondary">{accountPlanText(account)}</Badge>
+          <Badge variant="secondary" className="max-w-24" title={planText}>
+            <span className="truncate">{planText}</span>
+          </Badge>
         </div>
-        <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-          <span className="break-all">{account.email || "未提供邮箱"}</span>
+        <CardDescription className="flex min-w-0 items-center gap-2 text-xs">
+          <span
+            className="min-w-0 truncate"
+            title={account.email || "未提供邮箱"}
+          >
+            {account.email || "未提供邮箱"}
+          </span>
           <span aria-hidden="true">·</span>
-          <span>
+          <span className="shrink-0">
             {account.source === "proxy_import"
               ? "Cookie 登录数据"
               : "OpenAI 官方授权"}
@@ -769,7 +728,7 @@ function AccountCardHeader({
       <Button
         type="button"
         variant="outline"
-        className="h-auto justify-between gap-5 rounded-xl px-4 py-3 text-left min-[480px]:min-w-36"
+        className="h-auto min-w-32 justify-between gap-3 rounded-xl px-3 py-2 text-left"
         onClick={onOpenResetCredits}
         aria-label={`${resetCreditCountText(account)}，打开重置卡列表`}
         aria-haspopup="dialog"
@@ -801,10 +760,10 @@ function AccountCardHeader({
 
 function AccountDetailContent({ account }: { account: OfficialAccountView }) {
   const quotaWindows = displayQuotaWindows(account.quota)
+  const quotaStatus = quotaStatusText(account)
 
   return (
     <CardContent className="flex flex-col gap-1.5">
-      <Separator />
       <section className="flex flex-col gap-1">
         <div className="text-xs font-medium text-muted-foreground">额度</div>
         {quotaWindows.length ? (
@@ -859,7 +818,9 @@ function AccountDetailContent({ account }: { account: OfficialAccountView }) {
             variant={quotaBadgeVariant(account)}
             className="h-auto max-w-full justify-start py-1 text-left leading-tight break-words whitespace-normal"
           >
-            {quotaStatusText(account)}
+            <span className="line-clamp-2" title={quotaStatus}>
+              {quotaStatus}
+            </span>
           </Badge>
         )}
       </section>
@@ -887,9 +848,12 @@ function AccountDetailContent({ account }: { account: OfficialAccountView }) {
 
 function MaintenanceRecord({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex min-w-0 items-baseline gap-1">
+    <div className="flex min-w-0 flex-col gap-0.5">
       <span className="shrink-0 text-xs text-muted-foreground">{label}</span>
-      <span className="min-w-0 font-medium break-words tabular-nums">
+      <span
+        className="max-w-full truncate text-xs font-medium tabular-nums"
+        title={value}
+      >
         {value}
       </span>
     </div>
@@ -979,7 +943,47 @@ function Detail({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex flex-col gap-0.5">
       <span className="text-xs text-muted-foreground">{label}</span>
-      <span className="truncate font-medium">{value}</span>
+      <span className="truncate font-medium" title={value}>
+        {value}
+      </span>
     </div>
+  )
+}
+
+function AddConnectionToolbar({
+  disabled,
+  onOpen,
+}: {
+  disabled: boolean
+  onOpen: (mode: AddConnectionMode) => void
+}) {
+  return (
+    <Card size="sm" className="shrink-0 py-2">
+      <CardContent className="flex items-center gap-3 px-3">
+        <CardTitle className="shrink-0 text-sm">添加连接</CardTitle>
+        <div className="grid min-w-0 flex-1 grid-cols-3 gap-2">
+          {(
+            [
+              ["browser", "OpenAI 授权", Login03Icon],
+              ["cookie", "导入 Cookie", Key01Icon],
+              ["api", "添加 API 服务", Add01Icon],
+            ] as const
+          ).map(([mode, label, icon]) => (
+            <Button
+              key={mode}
+              type="button"
+              size="sm"
+              variant="outline"
+              className="min-w-0 px-2 text-xs"
+              disabled={disabled}
+              onClick={() => onOpen(mode)}
+            >
+              <HugeiconsIcon icon={icon} data-icon="inline-start" />
+              {label}
+            </Button>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
   )
 }

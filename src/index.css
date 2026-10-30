@@ -128,12 +128,8 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
-    scrollbar-width: none;
-    scrollbar-color: transparent transparent;
-  }
-
-  *::-webkit-scrollbar {
-    display: none;
+    scrollbar-width: thin;
+    scrollbar-color: var(--muted-foreground) transparent;
   }
 
   html,

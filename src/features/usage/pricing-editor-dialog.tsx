@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -15,6 +15,8 @@ import {
   FieldDescription,
   FieldGroup,
   FieldLabel,
+  FieldLegend,
+  FieldSet,
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
@@ -29,7 +31,7 @@ import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { toast } from "@/components/ui/toast"
-import { errorMessage } from "@/lib/format"
+import { errorMessage, formatRange } from "@/lib/format"
 import { call } from "@/lib/ipc"
 import type { BillingMode, PricingRule, Provider, UsageRange } from "@/types"
 
@@ -81,23 +83,29 @@ export function PricingEditor({
     editingRule ? pricingSourceValueForRule(editingRule) : ""
   )
   const [busy, setBusy] = useState(false)
+  const saving = useRef(false)
 
   const normalizedPattern = pattern.trim()
   const scope = pricingScopeForSource(pricingSourceFromValue(sourceValue))
+  const existing = scope
+    ? findEquivalentPricingRule(rules, {
+        ...scope,
+        modelPattern: normalizedPattern,
+        matchKind: "exact",
+      })
+    : undefined
+  const effectiveFromMs =
+    editingRule?.effectiveFromMs ?? existing?.effectiveFromMs ?? range.startAtMs
   const sourceOptions = useMemo(
     () => pricingSourceOptions(providers),
     [providers]
   )
 
   const save = async () => {
-    if (!scope || !normalizedPattern) return
+    if (!scope || !normalizedPattern || saving.current) return
+    saving.current = true
     setBusy(true)
     const now = Date.now()
-    const existing = findEquivalentPricingRule(rules, {
-      ...scope,
-      modelPattern: normalizedPattern,
-      matchKind: "exact",
-    })
     const rule: PricingRule = {
       id: editingRule?.id ?? existing?.id ?? "",
       version: editingRule?.version ?? existing?.version ?? 1,
@@ -111,8 +119,8 @@ export function PricingEditor({
       cacheWriteUsdPerMillion: billingMode === "token" ? cacheWrite : undefined,
       outputUsdPerMillion: billingMode === "token" ? output : undefined,
       cacheWriteIncludedInInput: cacheWriteIncluded,
-      effectiveFromMs: range.startAtMs,
-      createdAtMs: now,
+      effectiveFromMs,
+      createdAtMs: editingRule?.createdAtMs ?? existing?.createdAtMs ?? now,
       updatedAtMs: now,
     }
     try {
@@ -135,6 +143,7 @@ export function PricingEditor({
         type: "error",
       })
     } finally {
+      saving.current = false
       setBusy(false)
     }
   }
@@ -231,48 +240,57 @@ export function PricingEditor({
               </ToggleGroup>
             </Field>
             {billingMode === "token" && (
-              <FieldGroup className="grid grid-cols-2 gap-3">
-                <Field>
-                  <FieldLabel htmlFor="price-input">普通输入</FieldLabel>
-                  <Input
-                    id="price-input"
-                    inputMode="decimal"
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="price-cached-read">缓存读取</FieldLabel>
-                  <Input
-                    id="price-cached-read"
-                    inputMode="decimal"
-                    value={cachedRead}
-                    onChange={(e) => setCachedRead(e.target.value)}
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="price-cache-write">缓存写入</FieldLabel>
-                  <Input
-                    id="price-cache-write"
-                    inputMode="decimal"
-                    value={cacheWrite}
-                    onChange={(e) => setCacheWrite(e.target.value)}
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="price-output">输出</FieldLabel>
-                  <Input
-                    id="price-output"
-                    inputMode="decimal"
-                    value={output}
-                    onChange={(e) => setOutput(e.target.value)}
-                  />
-                </Field>
-              </FieldGroup>
+              <FieldSet className="gap-3" disabled={busy}>
+                <FieldLegend variant="label">
+                  价格（美元／百万 Token）
+                </FieldLegend>
+                <FieldGroup className="grid grid-cols-2 gap-3">
+                  <Field>
+                    <FieldLabel htmlFor="price-input">普通输入</FieldLabel>
+                    <Input
+                      id="price-input"
+                      inputMode="decimal"
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="price-cached-read">
+                      缓存读取
+                    </FieldLabel>
+                    <Input
+                      id="price-cached-read"
+                      inputMode="decimal"
+                      value={cachedRead}
+                      onChange={(e) => setCachedRead(e.target.value)}
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="price-cache-write">
+                      缓存写入
+                    </FieldLabel>
+                    <Input
+                      id="price-cache-write"
+                      inputMode="decimal"
+                      value={cacheWrite}
+                      onChange={(e) => setCacheWrite(e.target.value)}
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="price-output">输出</FieldLabel>
+                    <Input
+                      id="price-output"
+                      inputMode="decimal"
+                      value={output}
+                      onChange={(e) => setOutput(e.target.value)}
+                    />
+                  </Field>
+                </FieldGroup>
+              </FieldSet>
             )}
             {billingMode === "token" && (
-              <Field orientation="horizontal">
-                <FieldContent>
+              <Field orientation="horizontal" className="pr-3">
+                <FieldContent className="min-w-0">
                   <FieldLabel htmlFor="price-cache-write-included">
                     输入总量包含缓存写入
                   </FieldLabel>
@@ -282,11 +300,26 @@ export function PricingEditor({
                 </FieldContent>
                 <Switch
                   id="price-cache-write-included"
+                  disabled={busy}
                   checked={cacheWriteIncluded}
                   onCheckedChange={setCacheWriteIncluded}
                 />
               </Field>
             )}
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <Field>
+                <FieldLabel>生效时间</FieldLabel>
+                <time dateTime={new Date(effectiveFromMs).toISOString()}>
+                  {new Date(effectiveFromMs).toLocaleString("zh-CN", {
+                    hour12: false,
+                  })}
+                </time>
+              </Field>
+              <Field>
+                <FieldLabel>重算范围</FieldLabel>
+                <span>{formatRange(range)}</span>
+              </Field>
+            </div>
           </FieldGroup>
         </DialogBody>
         <DialogFooter>
@@ -301,7 +334,7 @@ export function PricingEditor({
             disabled={busy || !normalizedPattern || !scope}
             onClick={() => void save()}
           >
-            {busy && <Spinner data-icon="inline-start" />}保存
+            {busy && <Spinner data-icon="inline-start" />}保存并重算
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -637,9 +637,9 @@ export function ConnectionManagerSheet({
               删除“{deleteTargetLabel}”？
             </AlertDialogTitle>
             <AlertDialogDescription>
-              {deleteTarget?.active
-                ? "这是当前连接。程序会先切换到其他可用连接，再执行删除。"
-                : "此操作会移除本机保存的连接与凭据信息，无法撤销。"}
+              {deleteTarget?.active &&
+                "这是当前连接。程序会先切换到其他可用连接，再执行删除。"}
+              此操作会移除本机保存的连接与凭据信息，无法撤销。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

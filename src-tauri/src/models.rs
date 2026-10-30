@@ -1093,7 +1093,7 @@ pub struct UsageRow {
     pub pricing_rule_version: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWarning {
     pub path: Option<String>,
@@ -1251,6 +1251,51 @@ pub struct SessionSummary {
     pub source_rollout: Option<String>,
     pub original_provider: String,
     pub has_user_event: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntime {
+    pub thread_id: String,
+    pub state: String,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSyncStatus {
+    pub connected: bool,
+    pub message: String,
+    pub threads: Vec<SessionRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAffectedThread {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDeletePreview {
+    pub thread_id: String,
+    pub affected_threads: Vec<SessionAffectedThread>,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionAction {
+    Archive,
+    Unarchive,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMutationResult {
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
