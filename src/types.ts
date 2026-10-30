@@ -551,6 +551,8 @@ export type ProviderModelsDevMeta = {
   name?: string
   contextWindow?: number
   description?: string
+  supportedReasoningLevels?: string[] | null
+  defaultReasoningLevel?: string | null
 }
 
 export type ModelUnlockStatus = {

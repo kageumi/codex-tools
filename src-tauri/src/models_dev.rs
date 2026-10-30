@@ -191,6 +191,8 @@ fn parse_document(
                 name,
                 context_window,
                 description,
+                supported_reasoning_levels: None,
+                default_reasoning_level: None,
             },
         ));
     }
