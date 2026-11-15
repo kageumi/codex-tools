@@ -292,8 +292,7 @@ pub struct ProviderProfile {
     /// 与 available_models 一起构成该服务可写入 Codex 的“有效模型”。
     #[serde(default)]
     pub custom_models: Vec<String>,
-    /// 从 models.dev（catalog.json）抓取的本服务商模型元数据（slug → 元数据）；
-    /// 只在 id 与服务 `/models` 接口返回完全一致时保留，用于补充窗口/简介/名称。
+    /// 模型元数据（slug → 元数据），来自服务 `/models` 与 models.dev。
     #[serde(default)]
     pub models_dev_meta: BTreeMap<String, ProviderModelsDevMeta>,
     /// 服务接入方式：直接 Responses API，或经本机转换代理接入 Chat Completions API。
@@ -1383,6 +1382,12 @@ pub struct CodexModelInfo {
     pub default_reasoning_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_reasoning_levels: Option<Vec<ReasoningLevelInfo>>,
+    #[serde(default)]
+    pub service_tiers: Vec<ModelServiceTier>,
+    #[serde(default)]
+    pub additional_speed_tiers: Vec<String>,
+    #[serde(default)]
+    pub default_service_tier: Option<String>,
     /// CLI catalog 必需字段：系统提示词。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_instructions: Option<String>,
@@ -1451,6 +1456,9 @@ impl Default for CodexModelInfo {
             max_context_window: None,
             default_reasoning_level: None,
             supported_reasoning_levels: None,
+            service_tiers: Vec::new(),
+            additional_speed_tiers: Vec::new(),
+            default_service_tier: None,
             base_instructions: None,
             visibility: None,
             supported_in_api: None,
@@ -1476,14 +1484,27 @@ pub struct ReasoningLevelInfo {
     pub description: Option<String>,
 }
 
-/// models.dev（catalog.json）中单个模型的元数据，只保存与 `/models` 接口
-/// 完全一致 id 的条目。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelServiceTier {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// 单个模型的补充元数据；推理能力和速度档位只保存服务商自己的声明。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelsDevMeta {
     pub name: Option<String>,
     pub context_window: Option<u64>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_levels: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
+    /// 已归一化的服务商速度声明；缺失与显式不支持分别保存为 None / Some([])。
+    #[serde(default)]
+    pub service_tiers: Option<Vec<ModelServiceTier>>,
 }
 
 #[derive(Debug, Serialize)]

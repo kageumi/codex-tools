@@ -571,6 +571,13 @@ export type ProviderModelsDevMeta = {
   name?: string
   contextWindow?: number
   description?: string
+  supportedReasoningLevels?: string[] | null
+  defaultReasoningLevel?: string | null
+  serviceTiers?: Array<{
+    id: string
+    name: string
+    description: string
+  }> | null
 }
 
 export type ModelUnlockStatus = {

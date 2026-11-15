@@ -184,8 +184,9 @@ impl ConfigManager {
         let headers = merged_headers(provider);
         // 准备模型目录内容，但不在此写入磁盘：预览是只读操作，目录文件在
         // 真正应用时才落盘，避免未应用的预览覆盖正在使用的模型目录。
-        let catalog =
-            catalog_bytes(&model_unlock::build_model_catalog_with_windows_for_provider(provider));
+        let catalog = catalog_bytes(
+            &model_unlock::build_model_catalog_with_windows_for_provider(provider, codex_home),
+        );
         let mut document = parse_config_document(&original)?;
         // 有效模型 = 选中的模型；未指定选择时 = available_models ∪ custom_models。
         let candidate_models: Vec<String> = match provider.selected_models.as_deref() {
@@ -1043,6 +1044,103 @@ mod tests {
             base_url: base_url.into(),
             proxy_api_key: None,
         }
+    }
+
+    #[test]
+    fn fast_mode_activation_preserves_speed_and_reasoning_preferences() {
+        for speed in ["default", "priority"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let original = format!(
+                "service_tier = \"{speed}\"\nmodel_reasoning_effort = \"high\"\n\
+                 [profiles.work]\nservice_tier = \"default\"\nmodel_reasoning_effort = \"xhigh\"\n"
+            );
+            fs::write(home.join("config.toml"), &original).unwrap();
+            let mut provider = provider();
+            provider.models_dev_meta = provider
+                .available_models
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        serde_json::from_value(serde_json::json!({
+                            "serviceTiers": [{"id": "priority", "name": "Fast", "description": ""}]
+                        }))
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            let manager = ConfigManager::default();
+            let preview = manager
+                .preview_custom(home, &provider, &direct_target(&provider.base_url))
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(home.join("config.toml")).unwrap(),
+                original
+            );
+            manager.apply(&preview.operation_id).unwrap();
+            let document: DocumentMut = fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(document["service_tier"].as_str(), Some(speed));
+            assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"));
+            assert_eq!(
+                document["profiles"]["work"]["service_tier"].as_str(),
+                Some("default")
+            );
+            assert_eq!(
+                document["profiles"]["work"]["model_reasoning_effort"].as_str(),
+                Some("xhigh")
+            );
+            assert!(document.get("features").is_none());
+        }
+    }
+
+    #[test]
+    fn reasoning_preview_and_activation_use_the_configured_cache_and_preserve_effort() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        fs::write(
+            home.join("config.toml"),
+            "model_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("models_cache.json"),
+            serde_json::json!({
+                "models": [{
+                    "slug": "gpt-6-astra",
+                    "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut provider = provider();
+        provider.available_models = vec!["gpt-6-astra".into()];
+        let manager = ConfigManager::default();
+        let preview = manager
+            .preview_custom(home, &provider, &direct_target(&provider.base_url))
+            .unwrap();
+        // 对外预览只展示本应用管理的字段；原有推理强度应在实际配置中保持不变。
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            "model_reasoning_effort = \"high\"\n"
+        );
+        let path = home.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE);
+        assert!(!path.exists(), "preview must not write the catalog");
+        manager.apply(&preview.operation_id).unwrap();
+        let catalog: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            catalog["models"][0]["supported_reasoning_levels"][5]["effort"],
+            "ultra"
+        );
+        assert!(
+            fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .contains("model_reasoning_effort = \"high\"")
+        );
     }
 
     #[test]

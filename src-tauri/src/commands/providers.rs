@@ -527,26 +527,53 @@ async fn sync_provider_models(
                 .map(|window| (detail.id.clone(), window))
         })
         .collect::<BTreeMap<_, _>>();
+    let meta = merge_provider_model_metadata(&details, dev_meta_result.as_ref().ok());
+    let Some(revision) = store.update_provider_models_if_source_matches(
+        &provider.id,
+        &expected_source,
+        expected_revision,
+        models.clone(),
+        windows,
+        meta,
+    )?
+    else {
+        return Err(AppError::StaleOperation);
+    };
+    Ok(SyncedProviderModels { models, revision })
+}
+
+fn merge_provider_model_metadata(
+    details: &[provider_http::FetchedModelDetail],
+    dev_meta: Option<&BTreeMap<String, ProviderModelsDevMeta>>,
+) -> BTreeMap<String, ProviderModelsDevMeta> {
     // 先并入 /models 返回的简介（服务商自己的数据优先），再补 models.dev 元数据。
     let mut meta = details
         .iter()
-        .filter_map(|detail| {
-            detail.description.clone().map(|description| {
-                (
-                    detail.id.clone(),
-                    ProviderModelsDevMeta {
-                        name: None,
-                        context_window: None,
-                        description: Some(description),
-                    },
-                )
-            })
+        .filter(|detail| {
+            detail.description.is_some()
+                || detail.reasoning_levels.is_some()
+                || detail.default_reasoning_level.is_some()
+                || detail.service_tiers.is_some()
+        })
+        .map(|detail| {
+            (
+                detail.id.clone(),
+                ProviderModelsDevMeta {
+                    name: None,
+                    context_window: None,
+                    description: detail.description.clone(),
+                    supported_reasoning_levels: detail.reasoning_levels.clone(),
+                    default_reasoning_level: detail.default_reasoning_level.clone(),
+                    service_tiers: detail.service_tiers.clone(),
+                },
+            )
         })
         .collect::<BTreeMap<_, _>>();
-    if let Ok(dev_meta) = dev_meta_result {
+    if let Some(dev_meta) = dev_meta {
         // 按 /models 返回的原始 id 解析 models.dev 元数据（兼容纯 id / 厂商前缀 / 大小写）。
-        for id in &models {
-            let Some(info) = models_dev::lookup_model(&dev_meta, id) else {
+        for detail in details {
+            let id = &detail.id;
+            let Some(info) = models_dev::lookup_model(dev_meta, id) else {
                 continue;
             };
             let entry = meta.entry(id.clone()).or_default();
@@ -561,18 +588,7 @@ async fn sync_provider_models(
             }
         }
     }
-    let Some(revision) = store.update_provider_models_if_source_matches(
-        &provider.id,
-        &expected_source,
-        expected_revision,
-        models.clone(),
-        windows,
-        meta,
-    )?
-    else {
-        return Err(AppError::StaleOperation);
-    };
-    Ok(SyncedProviderModels { models, revision })
+    meta
 }
 
 #[tauri::command]
@@ -820,6 +836,172 @@ mod tests {
             base_url: base_url.into(),
             proxy_api_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn fast_mode_provider_declarations_survive_storage_and_catalog() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data": [{
+                    "id": "m",
+                    "service_tiers": [{
+                        "id": "priority", "name": "Fast", "description": "Provider tier"
+                    }],
+                    "default_service_tier": "priority"
+                }]}))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("data");
+        let store = Store::open(store_path.clone()).unwrap();
+        let saved = store
+            .connections_save_provider(provider("p", &format!("http://{address}/v1"), "m"))
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let details = provider_http::fetch_model_details(&client, &saved)
+            .await
+            .unwrap();
+        server.abort();
+        let meta = merge_provider_model_metadata(&details, None);
+        assert!(
+            store
+                .update_provider_models_if_source_matches(
+                    &saved.id,
+                    &ProviderSourceFingerprint::from_provider(&saved),
+                    Some(&ProviderSnapshotRevision::from_provider(&saved)),
+                    vec!["m".into()],
+                    BTreeMap::new(),
+                    meta,
+                )
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
+        let reopened = Store::open(store_path).unwrap();
+        let persisted = reopened.provider(&saved.id).unwrap();
+        let catalog = crate::model_unlock::build_model_catalog_with_windows_for_provider(
+            &persisted,
+            temp.path(),
+        );
+        let json = serde_json::to_value(catalog).unwrap();
+        assert_eq!(
+            json[0]["service_tiers"],
+            serde_json::json!([{
+                "id": "priority", "name": "Fast", "description": "Provider tier"
+            }])
+        );
+        assert_eq!(
+            json[0]["additional_speed_tiers"],
+            serde_json::json!(["fast"])
+        );
+        assert_eq!(json[0]["default_service_tier"], serde_json::Value::Null);
+
+        // A successful refresh that omits the declaration must remove old support,
+        // even when the enrichment source offers a tier for the same model.
+        let mut withdrawn = details;
+        withdrawn[0].service_tiers = None;
+        let dev_meta = BTreeMap::from([(
+            "m".into(),
+            serde_json::from_value(serde_json::json!({
+                "name": "Model M",
+                "serviceTiers": [{"id": "fast", "name": "Fast", "description": ""}]
+            }))
+            .unwrap(),
+        )]);
+        let meta = merge_provider_model_metadata(&withdrawn, Some(&dev_meta));
+        assert!(
+            reopened
+                .update_provider_models_if_source_matches(
+                    &persisted.id,
+                    &ProviderSourceFingerprint::from_provider(&persisted),
+                    Some(&ProviderSnapshotRevision::from_provider(&persisted)),
+                    vec!["m".into()],
+                    BTreeMap::new(),
+                    meta,
+                )
+                .unwrap()
+                .is_some()
+        );
+        let refreshed = reopened.provider(&persisted.id).unwrap();
+        assert_eq!(
+            refreshed.models_dev_meta["m"].name.as_deref(),
+            Some("Model M")
+        );
+        assert!(refreshed.models_dev_meta["m"].service_tiers.is_none());
+        let catalog = crate::model_unlock::build_model_catalog_with_windows_for_provider(
+            &refreshed,
+            temp.path(),
+        );
+        assert!(catalog[0].service_tiers.is_empty());
+        assert!(catalog[0].additional_speed_tiers.is_empty());
+    }
+
+    #[test]
+    fn reasoning_sync_metadata_survives_storage_and_models_dev_enrichment() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let saved = store
+            .connections_save_provider(provider("p", "https://example.test/v1", "m"))
+            .unwrap();
+        let details = vec![provider_http::FetchedModelDetail {
+            id: "m".into(),
+            context_window: None,
+            description: None,
+            reasoning_levels: Some(vec!["low".into(), "max".into()]),
+            default_reasoning_level: Some("max".into()),
+            service_tiers: None,
+        }];
+        let dev_meta = BTreeMap::from([(
+            "m".into(),
+            ProviderModelsDevMeta {
+                name: Some("Model M".into()),
+                context_window: Some(256_000),
+                supported_reasoning_levels: Some(vec!["ultra".into()]),
+                ..Default::default()
+            },
+        )]);
+        let meta = merge_provider_model_metadata(&details, Some(&dev_meta));
+        assert!(
+            store
+                .update_provider_models_if_source_matches(
+                    &saved.id,
+                    &ProviderSourceFingerprint::from_provider(&saved),
+                    Some(&ProviderSnapshotRevision::from_provider(&saved)),
+                    vec!["m".into()],
+                    BTreeMap::new(),
+                    meta,
+                )
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
+        let reopened = Store::open(temp.path().join("data")).unwrap();
+        let persisted = reopened.provider(&saved.id).unwrap();
+        let meta = &persisted.models_dev_meta["m"];
+        assert_eq!(meta.name.as_deref(), Some("Model M"));
+        assert_eq!(
+            meta.supported_reasoning_levels.as_ref().unwrap(),
+            &["low", "max"]
+        );
+        assert_eq!(meta.default_reasoning_level.as_deref(), Some("max"));
+        let catalog = crate::model_unlock::build_model_catalog_with_windows_for_provider(
+            &persisted,
+            temp.path(),
+        );
+        let json = serde_json::to_value(&catalog).unwrap();
+        assert_eq!(json[0]["supported_reasoning_levels"][1]["effort"], "max");
+        assert_eq!(
+            json[0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(json[0]["default_reasoning_level"], "max");
     }
 
     #[test]

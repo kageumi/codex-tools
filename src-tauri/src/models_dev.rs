@@ -191,6 +191,7 @@ fn parse_document(
                 name,
                 context_window,
                 description,
+                ..Default::default()
             },
         ));
     }
