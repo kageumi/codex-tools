@@ -1,9 +1,11 @@
 use crate::{
     models::{AppError, DatabaseScan, RepairResult, RepairScan, RepairTarget, SessionSummary},
     platform,
-    storage::{atomic_write, atomic_write_if_unchanged},
+    storage::{
+        ConditionalWrite, UnfinishedFilePublication, atomic_write, atomic_write_if_unchanged,
+    },
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, backup::Backup};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, backup::Backup};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,7 +17,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
-use walkdir::WalkDir;
 
 const MAX_ROLLOUT_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_REPAIR_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -156,23 +157,24 @@ fn collect_database_scope(path: &Path, facts: &mut ScopeFacts) -> anyhow::Result
     let has_catalog = catalog.contains("thread_id");
     facts.has_catalog |= has_catalog;
     if has_catalog
-        && let Some((catalog_key, host_key)) = catalog_host_join(&catalog, &hosts)
         && catalog.contains("source_kind")
         && catalog.contains("missing_candidate")
         && hosts.contains("host_kind")
     {
-        let source_kind = "source_kind";
-        let missing = "missing_candidate";
-        let host_kind = "host_kind";
-        let sql = format!(
-            "SELECT c.thread_id FROM local_thread_catalog c JOIN local_thread_catalog_hosts h ON c.{catalog_key}=h.{host_key} WHERE h.{host_kind}='local' AND COALESCE(c.{source_kind},'')<>'chatgpt' AND COALESCE(c.{missing},0)=0"
-        );
-        let mut statement = db.prepare(&sql)?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .flatten();
-        for id in ids {
-            facts.roots.entry(id).or_insert(false);
+        if let Some((catalog_key, host_key)) = catalog_host_join(&catalog, &hosts) {
+            let source_kind = "source_kind";
+            let missing = "missing_candidate";
+            let host_kind = "host_kind";
+            let sql = format!(
+                "SELECT c.thread_id FROM local_thread_catalog c JOIN local_thread_catalog_hosts h ON c.{catalog_key}=h.{host_key} WHERE h.{host_kind}='local' AND COALESCE(c.{source_kind},'')<>'chatgpt' AND COALESCE(c.{missing},0)=0"
+            );
+            let mut statement = db.prepare(&sql)?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .flatten();
+            for id in ids {
+                facts.roots.entry(id).or_insert(false);
+            }
         }
     }
 
@@ -524,16 +526,35 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
     configured_app: Option<&str>,
     may_write: impl FnMut() -> Result<bool, AppError>,
 ) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
+    repair_after_connection_switch_with_commit(
+        codex_home,
+        target,
+        manifest_path,
+        configured_app,
+        may_write,
+        || Ok(()),
+    )
+}
+
+/// Commit the caller's durable activation before discarding session snapshots.
+/// A rejected commit follows the same rollback path as a failed repair write.
+pub(crate) fn repair_after_connection_switch_with_commit(
+    codex_home: &Path,
+    target: &str,
+    manifest_path: Option<&Path>,
+    configured_app: Option<&str>,
+    may_write: impl FnMut() -> Result<bool, AppError>,
+    finish: impl FnOnce() -> Result<(), AppError>,
+) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
     repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app_impl(
         codex_home,
         target,
         manifest_path,
         configured_app,
         may_write,
+        finish,
         #[cfg(test)]
-        None,
-        #[cfg(test)]
-        None,
+        (None, None),
     )
 }
 
@@ -544,7 +565,8 @@ enum RepairTestStage {
     AfterRolloutWrite(PathBuf),
     BeforeDatabaseCommit(PathBuf),
     AfterHistoryModeCommitted,
-    AfterMigration,
+    AfterMigration(PathBuf),
+    BeforeHistoryDirectorySync(PathBuf),
 }
 
 #[cfg(test)]
@@ -573,8 +595,8 @@ fn repair_after_connection_switch_preserving_history_with_test_hooks(
         manifest_path,
         configured_app,
         may_write,
-        Some(test_hook),
-        migration_runner,
+        || Ok(()),
+        (Some(test_hook), migration_runner),
     )
 }
 
@@ -584,12 +606,17 @@ fn repair_after_connection_switch_preserving_history_with_guard_at_with_paths_fo
     manifest_path: Option<&Path>,
     configured_app: Option<&str>,
     mut may_write: impl FnMut() -> Result<bool, AppError>,
-    #[cfg(test)] mut test_hook: Option<&mut RepairTestHook<'_>>,
-    #[cfg(test)] migration_runner: Option<MigrationTestRunner>,
+    finish: impl FnOnce() -> Result<(), AppError>,
+    #[cfg(test)] (mut test_hook, migration_runner): (
+        Option<&mut RepairTestHook<'_>>,
+        Option<MigrationTestRunner>,
+    ),
 ) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
     let started = Instant::now();
     let target = SessionRoutingTarget::parse(target)?;
     let target_provider = target.provider();
+    #[cfg(target_os = "macos")]
+    crate::storage::recover_interrupted_writes(codex_home, || Ok(may_write()?))?;
     let manifest = load_manifest(manifest_path);
     let all_rollouts = rollout_files(codex_home);
     let all_databases = database_paths(codex_home);
@@ -750,29 +777,9 @@ fn repair_after_connection_switch_preserving_history_with_guard_at_with_paths_fo
         }
         let mut backup = RepairBackup::create()
             .map_err(|error| AppError::Internal(format!("无法创建回滚备份：{error}")))?;
-        let expected_rollouts = repair_plans
-            .iter()
-            .filter_map(|plan| match plan {
-                RolloutPlan::Repair {
-                    path,
-                    repaired_sha256,
-                    ..
-                } => Some((path.clone(), repaired_sha256.clone())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let stable_expected_rollouts = expected_rollouts
-            .iter()
-            .filter(|(path, _)| {
-                !recovery_plans
-                    .iter()
-                    .any(|plan| plan.rollouts.iter().any(|rollout| rollout.path == *path))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
         let mut backed_paths = HashSet::new();
-        let mut write_started = false;
-        let mut written_paths = HashSet::new();
+        let mut written_paths = HashMap::new();
+        let mut retained_rollouts = Vec::new();
         let commit = (|| -> anyhow::Result<()> {
             // 所有目标在首次写入前完成哈希守卫和备份；后续阶段不得再把“刚写过的
             // 文件”当作备份源。
@@ -807,9 +814,11 @@ fn repair_after_connection_switch_preserving_history_with_guard_at_with_paths_fo
                 run_repair_test_hook(&mut test_hook, RepairTestStage::AfterBackup(path.clone()))?;
             }
             if !recovery_plans.is_empty() {
-                if let Some(expected_hash) = history_database_hash.as_ref()
-                    && file_sha256(&history_database)? != *expected_hash
-                {
+                let current_hash = history_database
+                    .is_file()
+                    .then(|| file_sha256(&history_database))
+                    .transpose()?;
+                if current_hash != history_database_hash {
                     anyhow::bail!("Codex 正在更新历史投影，切换已终止并回滚。");
                 }
                 if backed_paths.insert(history_database.clone()) {
@@ -875,22 +884,16 @@ fn repair_after_connection_switch_preserving_history_with_guard_at_with_paths_fo
                 {
                     anyhow::bail!("Codex 正在更新会话 {}，切换已终止并回滚。", path.display());
                 }
-                let changed = match atomic_write_if_unchanged_and_track(
+                let changed = atomic_write_if_unchanged_and_track(
                     &path,
                     &write.original,
                     &write.repaired,
                     &mut written_paths,
-                ) {
-                    Ok(changed) => changed,
-                    Err(error) => {
-                        write_started |= written_paths.contains(&path);
-                        return Err(error);
-                    }
-                };
+                    &mut retained_rollouts,
+                )?;
                 if !changed {
                     anyhow::bail!("Codex 正在更新会话 {}，切换已终止并回滚。", path.display());
                 }
-                write_started = true;
                 #[cfg(test)]
                 run_repair_test_hook(
                     &mut test_hook,
@@ -916,115 +919,202 @@ fn repair_after_connection_switch_preserving_history_with_guard_at_with_paths_fo
                     RepairTestStage::BeforeDatabaseCommit(path.clone()),
                 )?;
                 let rows = repair_database_commit(
+                    backup.database_mut(path)?,
                     path,
                     target_provider,
                     &scope,
                     *expected_rows,
                     &mut may_write,
                 )?;
-                write_started = true;
-                written_paths.insert(path.clone());
+                written_paths.insert(path.clone(), RepairWrite::Database);
                 result.rows_updated += rows;
                 result.databases_updated += 1;
                 affected_paths.push(path.clone());
             }
             if !recovery_plans.is_empty() {
                 let state_database = codex_home.join("state_5.sqlite");
-                for logical_plan in &recovery_plans {
-                    for plan in &logical_plan.rollouts {
+                let stage = backup.dir.join("migration");
+                fs::create_dir(&stage)?;
+                let staged_state = stage.join("state_5.sqlite");
+                let staged_history = stage.join(THREAD_HISTORY_FILE);
+                backup
+                    .database_mut(&state_database)?
+                    .snapshot_to(&staged_state)?;
+                if history_database_hash.is_some() {
+                    backup
+                        .database_mut(&history_database)?
+                        .snapshot_to(&staged_history)?;
+                }
+                let mut staged_plans = recovery_plans.clone();
+                for logical_plan in &mut staged_plans {
+                    for plan in &mut logical_plan.rollouts {
                         if !may_write()? {
                             anyhow::bail!(
                                 "Codex 已重新运行或修复目标已变化，历史恢复已终止并回滚。"
                             );
                         }
                         let current = fs::read(&plan.path)?;
-                        let current_sha256 = file_sha256_bytes(&current);
-                        if current_sha256 != plan.original_sha256
-                            && !expected_rollouts.iter().any(|(path, expected)| {
-                                path == &plan.path && expected == &current_sha256
-                            })
-                        {
-                            anyhow::bail!(
-                                "Codex 正在更新会话 {}，历史恢复已终止并回滚。",
-                                plan.path.display()
-                            );
-                        }
+                        let expected = expected_rollout(&written_paths, plan);
+                        verify_current_bytes(&current, expected, &plan.path)?;
                         let legacy =
                             mark_rollout_history_legacy(&current, &plan.logical_thread_id)?;
-                        let changed = match atomic_write_if_unchanged_and_track(
-                            &plan.path,
-                            &current,
-                            &legacy,
-                            &mut written_paths,
-                        ) {
-                            Ok(changed) => changed,
-                            Err(error) => {
-                                write_started |= written_paths.contains(&plan.path);
-                                return Err(error);
-                            }
-                        };
-                        if !changed {
-                            anyhow::bail!(
-                                "Codex 正在更新会话 {}，历史恢复已终止并回滚。",
-                                plan.path.display()
-                            );
-                        }
-                        write_started = true;
-                        affected_paths.push(plan.path.clone());
+                        plan.path = stage.join(plan.path.strip_prefix(codex_home)?);
+                        atomic_write(&plan.path, &legacy)?;
                     }
                 }
-                mark_database_history_legacy(&state_database, &recovery_plans, &mut may_write)?;
-                write_started = true;
-                written_paths.insert(state_database.clone());
-                written_paths.insert(history_database.clone());
+                let original_paths =
+                    relocate_thread_paths(&staged_state, &recovery_plans, &staged_plans)?;
+                mark_database_history_legacy(&staged_state, &staged_plans, &mut may_write)?;
                 #[cfg(test)]
                 run_repair_test_hook(&mut test_hook, RepairTestStage::AfterHistoryModeCommitted)?;
                 #[cfg(test)]
                 let migration_report = if let Some(runner) = migration_runner {
-                    runner(codex_home, configured_app, &recovery_plans)?
+                    runner(&stage, configured_app, &staged_plans)?
                 } else {
-                    run_codex_history_migration(codex_home, configured_app, &recovery_plans)?
+                    run_codex_history_migration(&stage, configured_app, &staged_plans)?
                 };
                 #[cfg(not(test))]
                 let migration_report =
-                    run_codex_history_migration(codex_home, configured_app, &recovery_plans)?;
+                    run_codex_history_migration(&stage, configured_app, &staged_plans)?;
                 #[cfg(test)]
-                run_repair_test_hook(&mut test_hook, RepairTestStage::AfterMigration)?;
+                run_repair_test_hook(
+                    &mut test_hook,
+                    RepairTestStage::AfterMigration(stage.clone()),
+                )?;
                 verify_paginated_history_recovery(
-                    &state_database,
-                    &history_database,
-                    &recovery_plans,
+                    &staged_state,
+                    &staged_history,
+                    &staged_plans,
                     &migration_report,
                     target_provider,
                 )?;
+                if !original_paths.is_empty() {
+                    let mut db = Connection::open(&staged_state)?;
+                    let tx = db.transaction()?;
+                    for (id, path) in original_paths {
+                        tx.execute(
+                            "UPDATE threads SET rollout_path=?2 WHERE id=?1",
+                            (&id, &path),
+                        )?;
+                    }
+                    tx.commit()?;
+                }
+                for (live, staged) in recovery_plans
+                    .iter()
+                    .flat_map(|p| &p.rollouts)
+                    .zip(staged_plans.iter().flat_map(|p| &p.rollouts))
+                {
+                    if !may_write()? {
+                        anyhow::bail!("修复目标已变化，历史恢复已终止。");
+                    }
+                    let current = fs::read(&live.path)?;
+                    verify_current_bytes(
+                        &current,
+                        expected_rollout(&written_paths, live),
+                        &live.path,
+                    )?;
+                    if !atomic_write_if_unchanged_and_track(
+                        &live.path,
+                        &current,
+                        &fs::read(&staged.path)?,
+                        &mut written_paths,
+                        &mut retained_rollouts,
+                    )? {
+                        anyhow::bail!("会话 {} 在迁移期间发生变化。", live.path.display());
+                    }
+                    affected_paths.push(live.path.clone());
+                }
+                for (live, staged) in [
+                    (&state_database, &staged_state),
+                    (&history_database, &staged_history),
+                ] {
+                    if !may_write()? {
+                        anyhow::bail!("修复目标已变化，历史恢复已终止。");
+                    }
+                    if live == &history_database && history_database_hash.is_none() {
+                        continue;
+                    }
+                    backup.database_mut(live)?.replace_from(staged)?;
+                    written_paths.insert(live.clone(), RepairWrite::Database);
+                }
                 affected_paths.push(state_database);
                 affected_paths.push(history_database.clone());
             }
             verify_repair_commit(
-                &stable_expected_rollouts,
+                &written_paths,
                 &database_plans,
                 target_provider,
                 &scope,
+                &backup,
             )?;
+            // An independently created history database wins. When we publish it,
+            // record that write before any fallible activation work.
+            if !recovery_plans.is_empty() && history_database_hash.is_none() {
+                if !may_write()? {
+                    anyhow::bail!("修复目标已变化，历史恢复已终止。");
+                }
+                let standalone = backup.dir.join("new-history.sqlite");
+                let source =
+                    Connection::open(backup.dir.join("migration").join(THREAD_HISTORY_FILE))?;
+                snapshot_sqlite_to(&source, &standalone)?;
+                let published_hash = file_sha256(&standalone)?;
+                ensure_history_has_no_sidecars(&history_database)?;
+                #[cfg(not(test))]
+                let publication =
+                    crate::storage::atomic_create_if_absent(&history_database, &standalone)?;
+                #[cfg(test)]
+                let publication = crate::storage::atomic_create_if_absent_with_sync(
+                    &history_database,
+                    &standalone,
+                    |path| {
+                        run_repair_test_hook(
+                            &mut test_hook,
+                            RepairTestStage::BeforeHistoryDirectorySync(path.to_owned()),
+                        )
+                        .map_err(std::io::Error::other)?;
+                        crate::json_store::sync_parent_directory(path)
+                    },
+                )?;
+                written_paths.insert(
+                    history_database.clone(),
+                    RepairWrite::CreatedSqlite(published_hash.clone()),
+                );
+                ensure_history_has_no_sidecars(&history_database)?;
+                anyhow::ensure!(
+                    file_sha256(&history_database)? == published_hash,
+                    "新建历史库在发布期间发生变化：{}",
+                    history_database.display()
+                );
+                if let crate::storage::FilePublication::DirectorySyncFailed(error) = publication {
+                    tracing::warn!(%error, backup = %backup.dir.display(), "历史库已写入，但目录同步失败");
+                    result.warnings.push(format!(
+                        "历史库已写入，但目录同步失败（{error}）。修复备份保留在 {}。",
+                        backup.dir.display()
+                    ));
+                }
+            }
+            for (retained, expected) in &retained_rollouts {
+                anyhow::ensure!(
+                    file_sha256(retained)? == *expected,
+                    "修复期间原会话仍在写入，内容保留在 {}。",
+                    retained.display()
+                );
+            }
+            anyhow::ensure!(may_write()?, "修复目标已变化，连接未切换。");
+            finish()?;
             Ok(())
         })();
         if let Err(error) = commit {
-            if !write_started {
+            let incomplete_publication = error.is::<UnfinishedFilePublication>();
+            if written_paths.is_empty() && !incomplete_publication {
                 let _ = backup.cleanup();
                 return Err(AppError::Internal(format!(
                     "会话归属修复未完成，写入前预检或备份失败：{error}"
                 )));
             }
             let restore_error = backup.restore_selected(&written_paths);
-            let residue_error = cleanup_known_migration_residue(codex_home, &recovery_plans);
-            return match restore_error {
-                Ok(()) => {
-                    if let Err(residue) = residue_error {
-                        return Err(AppError::Internal(format!(
-                            "会话归属修复未完成且迁移副产物清理失败：{error}（清理错误：{residue}；备份保留在 {}）",
-                            backup.dir.display()
-                        )));
-                    }
+            return match (restore_error, incomplete_publication) {
+                (Ok(()), false) => {
                     backup.cleanup().map_err(|cleanup| {
                         AppError::Internal(format!(
                             "会话归属修复未完成，已回滚全部修改，但无法清理备份 {}：{cleanup}",
@@ -1035,19 +1125,31 @@ fn repair_after_connection_switch_preserving_history_with_guard_at_with_paths_fo
                         "会话归属修复未完成，已回滚全部修改：{error}"
                     )))
                 }
-                Err(restore) => {
-                    let residue = residue_error
-                        .err()
-                        .map(|residue| format!("；迁移副产物清理错误：{residue}"))
-                        .unwrap_or_default();
-                    Err(AppError::Internal(format!(
-                        "会话归属修复未完成且回滚失败：{error}（恢复错误：{restore}{residue}；备份保留在 {}）",
-                        backup.dir.display()
-                    )))
-                }
+                (Ok(()), true) => Err(AppError::Internal(format!(
+                    "会话归属修复未完成，请检查未写完的文件。{error}（修复备份保留在 {}）",
+                    backup.dir.display()
+                ))),
+                (Err(restore), _) => Err(AppError::Internal(format!(
+                    "会话归属修复未完成且回滚失败：{error}（恢复错误：{restore}；备份保留在 {}）",
+                    backup.dir.display()
+                ))),
             };
         }
-        let _ = backup.cleanup();
+        if result.warnings.is_empty() {
+            let _ = backup.cleanup();
+        }
+        if let Some((example, _)) = retained_rollouts.first() {
+            result.warnings.push(format!(
+                "文件系统无法核实旧文件已关闭，已在会话所在目录保留 {} 份原文件。例如 {}。",
+                retained_rollouts.len(),
+                example.display()
+            ));
+        }
+    } else {
+        if !may_write()? {
+            return Err(AppError::StaleOperation);
+        }
+        finish()?;
     }
 
     // ---- 成功后按修复结果重建清单，淘汰过期条目 ----
@@ -1063,7 +1165,9 @@ fn repair_after_connection_switch_preserving_history_with_guard_at_with_paths_fo
     );
     save_manifest(manifest_path, &next_manifest);
 
-    result.verification_passed = result.files_failed == 0 && result.warnings.is_empty();
+    // Publication can carry a durability warning after its name is live.
+    // Verification and activation still completed against that live history.
+    result.verification_passed = result.files_failed == 0;
     result.repair_complete = result.verification_passed;
     result.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     Ok((result, affected_paths))
@@ -1080,79 +1184,80 @@ fn run_repair_test_hook(
     Ok(())
 }
 
+enum RepairWrite {
+    Rollout(String),
+    Database,
+    CreatedSqlite(String),
+}
+
+fn ensure_history_has_no_sidecars(path: &Path) -> anyhow::Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        anyhow::ensure!(
+            !Path::new(&sidecar).try_exists()?,
+            "历史库出现外部 SQLite sidecar，已保留当前文件。"
+        );
+    }
+    Ok(())
+}
+
+fn expected_rollout<'a>(
+    writes: &'a HashMap<PathBuf, RepairWrite>,
+    plan: &'a PhysicalRolloutRecoveryPlan,
+) -> &'a str {
+    match writes.get(&plan.path) {
+        Some(RepairWrite::Rollout(hash)) => hash,
+        _ => &plan.original_sha256,
+    }
+}
+
+fn verify_current_bytes(bytes: &[u8], expected: &str, path: &Path) -> anyhow::Result<()> {
+    if file_sha256_bytes(bytes) != expected {
+        anyhow::bail!("会话 {} 已被其他写入修改，已保留当前内容。", path.display());
+    }
+    Ok(())
+}
+
 fn atomic_write_if_unchanged_and_track(
     path: &Path,
     expected: &[u8],
     replacement: &[u8],
-    written_paths: &mut HashSet<PathBuf>,
+    written_paths: &mut HashMap<PathBuf, RepairWrite>,
+    retained_rollouts: &mut Vec<(PathBuf, String)>,
 ) -> anyhow::Result<bool> {
-    track_atomic_write_result(path, replacement, written_paths, || {
+    let written = track_atomic_write_result(path, expected, replacement, written_paths, || {
         atomic_write_if_unchanged(path, expected, replacement)
-    })
+    })?;
+    if let ConditionalWrite::Written {
+        retained: Some(retained),
+        ..
+    } = &written
+    {
+        retained_rollouts.push((retained.clone(), file_sha256_bytes(expected)));
+    }
+    Ok(written.confirm_publication(path))
 }
 
 fn track_atomic_write_result(
     path: &Path,
+    expected: &[u8],
     replacement: &[u8],
-    written_paths: &mut HashSet<PathBuf>,
-    write: impl FnOnce() -> anyhow::Result<bool>,
-) -> anyhow::Result<bool> {
-    match write() {
-        Ok(true) => {
-            written_paths.insert(path.to_path_buf());
-            Ok(true)
-        }
-        Ok(false) => Ok(false),
-        Err(error) => {
-            // `replace_temporary` may report a post-rename durability error.  Only
-            // register a target when it now contains this engine's exact bytes;
-            // an Ok(false) CAS conflict and unrelated external bytes remain untouched.
-            if fs::read(path).is_ok_and(|current| current == replacement) {
-                written_paths.insert(path.to_path_buf());
-            }
-            Err(error)
-        }
+    written_paths: &mut HashMap<PathBuf, RepairWrite>,
+    write: impl FnOnce() -> anyhow::Result<ConditionalWrite>,
+) -> anyhow::Result<ConditionalWrite> {
+    let result = write();
+    // An error can follow a successful rename. Keep the backup if the original is
+    // gone, even if a later append already changed the replacement again.
+    if result.as_ref().is_ok_and(ConditionalWrite::written)
+        || (result.is_err() && !fs::read(path).is_ok_and(|current| current == expected))
+    {
+        written_paths.insert(
+            path.to_owned(),
+            RepairWrite::Rollout(file_sha256_bytes(replacement)),
+        );
     }
-}
-
-fn cleanup_known_migration_residue(
-    codex_home: &Path,
-    plans: &[LogicalThreadHistoryRecoveryPlan],
-) -> anyhow::Result<()> {
-    if plans.is_empty() {
-        return Ok(());
-    }
-    let journals = codex_home.join("rollout-migrations");
-    for plan in plans {
-        let pending = journals.join(format!("{}.pending", plan.logical_thread_id));
-        remove_known_migration_file(&pending)?;
-        for rollout in &plan.rollouts {
-            let name = rollout
-                .path
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("rollout 路径缺少文件名"))?
-                .to_string_lossy();
-            let temporary = rollout
-                .path
-                .with_file_name(format!(".{name}.paginated.tmp"));
-            remove_known_migration_file(&temporary)?;
-        }
-    }
-    if journals.is_dir() && fs::read_dir(&journals)?.next().is_none() {
-        fs::remove_dir(&journals)?;
-    }
-    Ok(())
-}
-
-fn remove_known_migration_file(path: &Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if !path.is_file() {
-        anyhow::bail!("已知迁移副产物路径不是普通文件：{}", path.display());
-    }
-    fs::remove_file(path)?;
-    Ok(())
+    result
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1498,8 +1603,9 @@ fn preflight_paginated_history_recovery(
         let projection_was_healthy = paginated_projection_is_valid(history.as_ref(), &info)?;
         // 旧版跳号历史只能沿用已验证的投影。当前官方迁移器不能保证重放缺号
         // 记录时保持原边界；变长改写和损坏投影都必须在任何写入前拒绝。
-        if (force_recovery_rollouts.contains(path) || !projection_was_healthy)
-            && let Some((previous, ordinal, offset)) = info.first_ordinal_gap
+        if let Some((previous, ordinal, offset)) = info
+            .first_ordinal_gap
+            .filter(|_| force_recovery_rollouts.contains(path) || !projection_was_healthy)
         {
             anyhow::bail!(
                 "rollout {} 在字节 {offset} 的 ordinal {previous}→{ordinal} 存在缺号；{}，无法安全重投影，已在写入前拒绝恢复",
@@ -2214,9 +2320,7 @@ fn ensure_migration_uses_backed_up_databases(codex_home: &Path) -> anyhow::Resul
     let config_path = codex_home.join("config.toml");
     if config_path.is_file() {
         let config = fs::read_to_string(&config_path)?;
-        let document = config
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|error| anyhow::anyhow!("无法解析 Codex 配置中的 sqlite_home：{error}"))?;
+        let document = crate::codex::parse_config_document(&config)?;
         if toml_contains_sqlite_home(document.as_item()) {
             anyhow::bail!(
                 "检测到配置 sqlite_home；当前恢复仅备份 CODEX_HOME 内 SQLite，拒绝向未计划数据库迁移"
@@ -2306,7 +2410,46 @@ fn validate_migration_report(
 }
 
 fn rollout_paths_match(left: &Path, right: &Path) -> bool {
-    fs::canonicalize(left).ok() == fs::canonicalize(right).ok()
+    left == right
+        || matches!((fs::canonicalize(left), fs::canonicalize(right)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The CLI may resolve a thread through the absolute rollout_path in the state database.
+/// Point those rows at the isolated files, retaining their exact values for publication.
+fn relocate_thread_paths(
+    state: &Path,
+    live: &[LogicalThreadHistoryRecoveryPlan],
+    staged: &[LogicalThreadHistoryRecoveryPlan],
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut db = Connection::open(state)?;
+    if !table_columns(&db, "threads")?.contains("rollout_path") {
+        return Ok(Vec::new());
+    }
+    let tx = db.transaction()?;
+    let mut originals = Vec::new();
+    for (live, staged) in live.iter().zip(staged) {
+        let id = &live.logical_thread_id;
+        let saved: Option<String> = tx.query_row(
+            "SELECT rollout_path FROM threads WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if let Some(saved) = saved.filter(|s| !s.is_empty()) {
+            let (_, destination) = live
+                .rollouts
+                .iter()
+                .zip(&staged.rollouts)
+                .find(|(rollout, _)| rollout_paths_match(&rollout.path, Path::new(&saved)))
+                .ok_or_else(|| anyhow::anyhow!("会话 {id} 的数据库路径与恢复计划不一致"))?;
+            tx.execute(
+                "UPDATE threads SET rollout_path=?2 WHERE id=?1",
+                (id, destination.path.to_string_lossy().as_ref()),
+            )?;
+            originals.push((id.clone(), saved));
+        }
+    }
+    tx.commit()?;
+    Ok(originals)
 }
 
 fn codex_history_migration_command(
@@ -2318,6 +2461,7 @@ fn codex_history_migration_command(
         .map_err(|error| anyhow::anyhow!("无法启动 Codex 历史迁移器：{error}"))?;
     command
         .env("CODEX_HOME", codex_home)
+        .current_dir(codex_home)
         .arg("migrate-rollouts")
         .arg("--apply")
         .arg("--json");
@@ -2380,7 +2524,7 @@ fn verify_paginated_history_recovery(
                 );
             }
             verify_rollout_semantic_sha256(&bytes, &plan.semantic_sha256)?;
-            verify_rollout_route(&plan.path, target)?;
+            verify_rollout_route(&plan.path, &bytes, target)?;
             if !paginated_projection_is_valid(Some(&history), &info)? {
                 anyhow::bail!(
                     "会话 {} 的物理 rollout {} 分页历史投影仍不可用",
@@ -2529,6 +2673,72 @@ enum BackupEntryKind {
 struct RepairBackup {
     dir: PathBuf,
     entries: Vec<BackupEntry>,
+    databases: HashMap<PathBuf, RepairDatabase>,
+}
+
+struct RepairDatabase {
+    connection: Connection,
+    /// SQLite changes this connection-local counter for commits made by other connections,
+    /// including commits that still exist only in the WAL.
+    version: i64,
+}
+
+fn snapshot_sqlite_to(source: &Connection, path: &Path) -> anyhow::Result<()> {
+    let mut destination = Connection::open(path)?;
+    Backup::new(source, &mut destination)?.run_to_completion(
+        128,
+        Duration::from_millis(5),
+        None,
+    )?;
+    Ok(())
+}
+
+impl RepairDatabase {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let version = connection.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok(Self {
+            connection,
+            version,
+        })
+    }
+
+    fn check_version(connection: &Connection, expected: i64) -> anyhow::Result<()> {
+        let version: i64 = connection.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        if version != expected {
+            anyhow::bail!("数据库已被其他连接修改，已保留当前内容。");
+        }
+        Ok(())
+    }
+
+    fn snapshot_to(&self, path: &Path) -> anyhow::Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        Self::check_version(&tx, self.version)?;
+        snapshot_sqlite_to(&tx, path)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn replace_from(&mut self, path: &Path) -> anyhow::Result<()> {
+        let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let integrity: String = source.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(integrity == "ok", "SQLite integrity_check={integrity}");
+        Self::check_version(&self.connection, self.version)?;
+        // Backup requires an autocommit destination. Exclusive locking mode keeps the
+        // writer lock across COMMIT, the version check and SQLite's atomic page copy.
+        self.connection
+            .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")?;
+        Self::check_version(&self.connection, self.version)?;
+        let copy = Backup::new(&source, &mut self.connection)?;
+        anyhow::ensure!(
+            copy.step(-1)? == rusqlite::backup::StepResult::Done,
+            "SQLite 快照未能完整写入。"
+        );
+        Ok(())
+    }
 }
 
 impl RepairBackup {
@@ -2538,9 +2748,11 @@ impl RepairBackup {
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&dir)?;
+        crate::storage::secure_directory(&dir)?;
         Ok(Self {
             dir,
             entries: Vec::new(),
+            databases: HashMap::new(),
         })
     }
 
@@ -2560,9 +2772,12 @@ impl RepairBackup {
         Ok(())
     }
 
-    /// 使用 SQLite backup API 生成逻辑一致快照。恢复时只从该快照恢复主库并移除
-    /// WAL/SHM；因此验证的是快照哈希与 SQLite 完整性，不把运行时 sidecar 的
-    /// 物理字节等同于一致性快照。
+    fn database_mut(&mut self, path: &Path) -> anyhow::Result<&mut RepairDatabase> {
+        self.databases
+            .get_mut(path)
+            .ok_or_else(|| anyhow::anyhow!("数据库缺少修复快照：{}", path.display()))
+    }
+
     fn add_sqlite_database(&mut self, original: &Path) -> anyhow::Result<()> {
         if !original.is_file() {
             let backup = self.dir.join(format!("{:04}.absent", self.entries.len()));
@@ -2575,17 +2790,9 @@ impl RepairBackup {
             return Ok(());
         }
         let backup = self.dir.join(format!("{:04}.sqlite", self.entries.len()));
-        let source = Connection::open_with_flags(
-            original,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        let mut snapshot = Connection::open(&backup)?;
-        {
-            let backup_api = Backup::new(&source, &mut snapshot)?;
-            backup_api.run_to_completion(128, Duration::from_millis(5), None)?;
-        }
-        drop(snapshot);
-        drop(source);
+        let database = RepairDatabase::open(original)?;
+        database.snapshot_to(&backup)?;
+        self.databases.insert(original.to_owned(), database);
         let snapshot_sha256 = file_sha256(&backup)?;
         self.entries.push(BackupEntry {
             original: original.to_path_buf(),
@@ -2599,99 +2806,73 @@ impl RepairBackup {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn restore(&self) -> anyhow::Result<()> {
-        self.restore_selected(
-            &self
-                .entries
-                .iter()
-                .map(|entry| entry.original.clone())
-                .collect(),
-        )
-    }
-
-    fn restore_selected(&self, originals: &HashSet<PathBuf>) -> anyhow::Result<()> {
+    fn restore_selected(&mut self, writes: &HashMap<PathBuf, RepairWrite>) -> anyhow::Result<()> {
         let mut failures = Vec::new();
-        for entry in self
-            .entries
-            .iter()
-            .rev()
-            .filter(|entry| originals.contains(&entry.original))
-        {
-            if let Err(error) = self.restore_entry(entry) {
+        for entry in self.entries.iter().rev() {
+            let Some(written) = writes.get(&entry.original) else {
+                continue;
+            };
+            if let Err(error) =
+                Self::restore_entry(entry, written, self.databases.get_mut(&entry.original))
+            {
                 failures.push(format!("{}：{error}", entry.original.display()));
             }
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!("恢复失败目标：{}", failures.join("；"))
+        if !failures.is_empty() {
+            anyhow::bail!("恢复失败目标：{}", failures.join("；"));
         }
+        Ok(())
     }
 
-    fn restore_entry(&self, entry: &BackupEntry) -> anyhow::Result<()> {
-        match &entry.kind {
-            BackupEntryKind::Bytes {
-                snapshot_sha256, ..
-            } => {
-                if file_sha256(&entry.backup)? != *snapshot_sha256 {
-                    anyhow::bail!("备份字节哈希核验失败");
+    fn restore_entry(
+        entry: &BackupEntry,
+        written: &RepairWrite,
+        database: Option<&mut RepairDatabase>,
+    ) -> anyhow::Result<()> {
+        match (&entry.kind, written) {
+            (
+                BackupEntryKind::Bytes {
+                    snapshot_sha256, ..
+                },
+                RepairWrite::Rollout(expected),
+            ) => {
+                let original = fs::read(&entry.backup)?;
+                anyhow::ensure!(
+                    file_sha256_bytes(&original) == *snapshot_sha256,
+                    "备份字节哈希核验失败"
+                );
+                let current = fs::read(&entry.original)?;
+                if current == original {
+                    return Ok(());
                 }
-                atomic_write(&entry.original, &fs::read(&entry.backup)?)?;
-                if file_sha256(&entry.original)? != *snapshot_sha256 {
-                    anyhow::bail!("恢复字节哈希核验失败");
-                }
+                verify_current_bytes(&current, expected, &entry.original)?;
+                anyhow::ensure!(
+                    atomic_write_if_unchanged(&entry.original, &current, &original)?
+                        .confirm_publication(&entry.original),
+                    "会话在回滚期间发生变化，已保留当前内容。"
+                );
             }
-            BackupEntryKind::SqliteSnapshot {
-                snapshot_sha256, ..
-            } => {
-                if file_sha256(&entry.backup)? != *snapshot_sha256 {
-                    anyhow::bail!("SQLite 备份快照哈希核验失败");
-                }
-                let snapshot_connection = Connection::open_with_flags(
-                    &entry.backup,
-                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )?;
-                let snapshot_integrity: String =
-                    snapshot_connection
-                        .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-                if snapshot_integrity != "ok" {
-                    anyhow::bail!("SQLite 备份 integrity_check={snapshot_integrity}");
-                }
-                drop(snapshot_connection);
-                for suffix in ["-wal", "-shm"] {
-                    let mut target = entry.original.as_os_str().to_os_string();
-                    target.push(suffix);
-                    let target = PathBuf::from(target);
-                    if target.exists() {
-                        fs::remove_file(target)?;
-                    }
-                }
-                let snapshot = fs::read(&entry.backup)?;
-                atomic_write(&entry.original, &snapshot)?;
-                if file_sha256(&entry.original)? != *snapshot_sha256 {
-                    anyhow::bail!("SQLite 快照哈希核验失败");
-                }
-                let connection = Connection::open_with_flags(
-                    &entry.original,
-                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )?;
-                let integrity: String =
-                    connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-                if integrity != "ok" {
-                    anyhow::bail!("SQLite integrity_check={integrity}");
-                }
+            (
+                BackupEntryKind::SqliteSnapshot {
+                    snapshot_sha256, ..
+                },
+                RepairWrite::Database,
+            ) => {
+                anyhow::ensure!(
+                    file_sha256(&entry.backup)? == *snapshot_sha256,
+                    "SQLite 备份快照哈希核验失败"
+                );
+                database
+                    .ok_or_else(|| anyhow::anyhow!("数据库连接已失效"))?
+                    .replace_from(&entry.backup)?;
             }
-            BackupEntryKind::AbsentSqlite => {
-                for suffix in ["", "-wal", "-shm"] {
-                    let mut target = entry.original.as_os_str().to_os_string();
-                    target.push(suffix);
-                    let target = PathBuf::from(target);
-                    if target.exists() {
-                        fs::remove_file(target)?;
-                    }
-                }
+            (BackupEntryKind::AbsentSqlite, RepairWrite::CreatedSqlite(expected)) => {
+                crate::storage::remove_created_file_if_unchanged(&entry.original, |path| {
+                    ensure_history_has_no_sidecars(&entry.original)?;
+                    Ok(file_sha256(path)? == *expected)
+                })?;
             }
+            _ => anyhow::bail!("修复写入与备份类型不匹配"),
         }
         Ok(())
     }
@@ -2739,28 +2920,34 @@ impl RepairBackup {
 }
 
 fn verify_repair_commit(
-    expected_rollouts: &[(PathBuf, String)],
+    writes: &HashMap<PathBuf, RepairWrite>,
     database_plans: &[(PathBuf, usize, String)],
     target: &str,
     scope: &SessionScope,
+    backup: &RepairBackup,
 ) -> anyhow::Result<()> {
-    for (path, expected_sha256) in expected_rollouts {
-        if file_sha256(path)? != *expected_sha256 {
-            anyhow::bail!("会话文件 {} 在写入后发生变化", path.display());
+    for (path, write) in writes {
+        if let RepairWrite::Rollout(expected) = write {
+            let current = fs::read(path)?;
+            verify_current_bytes(&current, expected, path)?;
+            verify_rollout_route(path, &current, target)?;
         }
-        verify_rollout_route(path, target)?;
     }
     for (path, _, _) in database_plans {
-        verify_database_route(path, target, scope)?;
+        let db = backup
+            .databases
+            .get(path)
+            .ok_or_else(|| anyhow::anyhow!("数据库修复连接已失效"))?;
+        RepairDatabase::check_version(&db.connection, db.version)?;
+        verify_database_route(&db.connection, path, target, scope)?;
     }
     Ok(())
 }
 
-fn verify_rollout_route(path: &Path, target: &str) -> anyhow::Result<()> {
-    let bytes = fs::read(path)?;
+fn verify_rollout_route(path: &Path, bytes: &[u8], target: &str) -> anyhow::Result<()> {
     let mut session_meta_count = 0;
     let mut session_meta_target_count = 0;
-    for line in std::str::from_utf8(&bytes)?.lines() {
+    for line in std::str::from_utf8(bytes)?.lines() {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -2822,14 +3009,15 @@ fn rollout_semantic_sha256(bytes: &[u8]) -> anyhow::Result<String> {
                     .and_then(|payload| payload.get("type"))
                     .and_then(Value::as_str)
                     == Some("thread_settings_applied")
-                && let Some(settings) = object
+            {
+                if let Some(settings) = object
                     .get_mut("payload")
-                    .and_then(Value::as_object_mut)
                     .and_then(|payload| payload.get_mut("thread_settings"))
                     .and_then(Value::as_object_mut)
-            {
-                settings.remove("model_provider");
-                settings.remove("model_provider_id");
+                {
+                    settings.remove("model_provider");
+                    settings.remove("model_provider_id");
+                }
             }
         }
         normalized.push(record);
@@ -2848,12 +3036,13 @@ fn verify_rollout_semantic_sha256(bytes: &[u8], expected: &str) -> anyhow::Resul
     Ok(())
 }
 
-fn verify_database_route(path: &Path, target: &str, scope: &SessionScope) -> anyhow::Result<()> {
-    let db = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let Some((table, id, columns)) = session_table(&db)? else {
+fn verify_database_route(
+    db: &Connection,
+    path: &Path,
+    target: &str,
+    scope: &SessionScope,
+) -> anyhow::Result<()> {
+    let Some((table, id, columns)) = session_table(db)? else {
         anyhow::bail!("会话数据库格式在写入后发生变化");
     };
     for ids in scope.eligible_ids().chunks(900) {
@@ -2954,22 +3143,25 @@ fn preflight_database(path: &Path, target: &str, scope: &SessionScope) -> anyhow
 }
 
 fn repair_database_commit(
+    database: &mut RepairDatabase,
     path: &Path,
     target: &str,
     scope: &SessionScope,
     expected_rows: usize,
     may_write: &mut impl FnMut() -> Result<bool, AppError>,
 ) -> anyhow::Result<usize> {
-    let mut db = Connection::open(path)?;
-    let Some((table, id, columns)) = session_table(&db)? else {
+    let transaction = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    RepairDatabase::check_version(&transaction, database.version)?;
+    let Some((table, id, columns)) = session_table(&transaction)? else {
         anyhow::bail!("未知的 Codex 会话数据库结构（未找到 threads/local_thread_catalog 表）");
     };
     if !columns.contains("model_provider") {
         anyhow::bail!("会话数据库格式不受支持，缺少 model_provider 列");
     }
-    let ids = eligible_database_changes(&db, table, id, target, scope)?;
+    let ids = eligible_database_changes(&transaction, table, id, target, scope)?;
     let clears_model = columns.contains("model");
-    let transaction = db.transaction()?;
     let mut rows = 0;
     for ids in ids.chunks(900) {
         if !may_write()? {
@@ -2995,13 +3187,13 @@ fn repair_database_commit(
     if !may_write()? {
         anyhow::bail!("Codex 已重新运行或修复目标已变化，切换已终止并回滚。");
     }
-    transaction.commit()?;
     if rows != expected_rows {
         anyhow::bail!(
             "会话数据库 {} 在提交期间发生并发变化（预期更新 {expected_rows} 行，实际 {rows} 行）",
             path.display()
         );
     }
+    transaction.commit()?;
     Ok(rows)
 }
 
@@ -3313,24 +3505,18 @@ pub fn list_database_sessions_from_paths(
 }
 
 pub fn rollout_files(codex_home: &Path) -> Vec<PathBuf> {
-    let mut output = [
-        codex_home.join("sessions"),
-        codex_home.join("archived_sessions"),
-    ]
-    .into_iter()
-    .flat_map(|directory| {
-        WalkDir::new(directory)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-            .map(|entry| entry.into_path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "jsonl")
-            })
-    })
-    .collect::<Vec<_>>();
+    let mut output = crate::storage::codex_rollout_walks(codex_home)
+        .flat_map(|walk| {
+            walk.into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| entry.into_path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                })
+        })
+        .collect::<Vec<_>>();
     // 确定性处理顺序：修复/回滚按路径排序写入，避免不同平台文件系统迭代
     // 顺序不一致导致写序与回滚行为差异（例如外部写入目标被意外覆盖）。
     output.sort();
@@ -3348,11 +3534,13 @@ pub fn database_paths(codex_home: &Path) -> Vec<PathBuf> {
     if let Some(path) = std::env::var_os("CODEX_SQLITE_HOME") {
         collect_databases(&PathBuf::from(path), &mut output);
     }
-    if let Ok(text) = fs::read_to_string(codex_home.join("config.toml"))
-        && let Ok(document) = text.parse::<toml_edit::DocumentMut>()
-        && let Some(path) = document
-            .get("sqlite_home")
-            .and_then(toml_edit::Item::as_str)
+    let config = fs::read_to_string(codex_home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok());
+    if let Some(path) = config
+        .as_ref()
+        .and_then(|doc| doc.get("sqlite_home"))
+        .and_then(toml_edit::Item::as_str)
     {
         collect_databases(&PathBuf::from(path), &mut output);
     }
@@ -3528,6 +3716,7 @@ fn finish_warnings(warnings: &mut Vec<String>, omitted: usize) {
 mod tests {
     use super::*;
     use std::io::{BufWriter, Seek, Write};
+    use walkdir::WalkDir;
 
     fn single_recovery_plan(
         logical_thread_id: &str,
@@ -5051,6 +5240,246 @@ mod tests {
     }
 
     #[test]
+    fn rollback_preserves_appends_and_committed_wal_rows_during_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, rollout, state, _, _) = paginated_recovery_fixture(&temp);
+        let writer = Connection::open(&state).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE notes(note TEXT);")
+            .unwrap();
+        let mut recovery_directory = None;
+        let appended =
+            b"{\"type\":\"event_msg\",\"payload\":{\"message\":\"new conversation record\"}}\n";
+        let mut hook = |stage| {
+            if let RepairTestStage::AfterMigration(stage) = stage {
+                recovery_directory = stage.parent().map(Path::to_owned);
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&rollout)?
+                    .write_all(appended)?;
+                writer.execute("INSERT INTO notes VALUES('new note')", [])?;
+            }
+            Ok(())
+        };
+        let error = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            None,
+            None,
+            || Ok(true),
+            &mut hook,
+            Some(finish_synthetic_migration),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("备份保留在"), "{error}");
+        assert!(fs::read(&rollout).unwrap().ends_with(appended));
+        assert_eq!(
+            writer
+                .query_row("SELECT note FROM notes", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "new note"
+        );
+        let backup = recovery_directory.unwrap();
+        assert!(backup.join("backup-manifest.json").is_file());
+        fs::remove_dir_all(backup).unwrap();
+    }
+
+    fn migrate_with_history_seed(
+        stage: &Path,
+        seed: Option<&str>,
+        plans: &[LogicalThreadHistoryRecoveryPlan],
+    ) -> anyhow::Result<MigrationReport> {
+        fs::copy(seed.unwrap(), stage.join(THREAD_HISTORY_FILE))?;
+        finish_synthetic_migration(stage, None, plans)
+    }
+
+    #[test]
+    fn publishes_missing_history_only_if_the_destination_is_still_absent() {
+        for external_creation in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (home, rollout, _, history, _) = paginated_recovery_fixture(&temp);
+            let before = fs::read(&rollout).unwrap();
+            let seed = temp.path().join("empty-projection.sqlite");
+            fs::rename(&history, &seed).unwrap();
+            let mut hook = |stage| {
+                if external_creation && matches!(stage, RepairTestStage::AfterMigration(_)) {
+                    Connection::open(&history)?.execute_batch(
+                        "CREATE TABLE notes(note TEXT); INSERT INTO notes VALUES('keep');",
+                    )?;
+                }
+                Ok(())
+            };
+            let result = repair_after_connection_switch_preserving_history_with_test_hooks(
+                &home,
+                "custom",
+                None,
+                seed.to_str(),
+                || Ok(true),
+                &mut hook,
+                Some(migrate_with_history_seed),
+            );
+            let db = Connection::open(&history).unwrap();
+            if external_creation {
+                assert!(result.is_err());
+                assert_eq!(fs::read(&rollout).unwrap(), before);
+                assert_eq!(
+                    db.query_row("SELECT note FROM notes", [], |r| r.get::<_, String>(0))
+                        .unwrap(),
+                    "keep"
+                );
+            } else {
+                assert!(result.unwrap().0.repair_complete);
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM thread_items", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_sync_error_keeps_published_history_and_its_rollout_consistent() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
+        let seed = temp.path().join("empty-projection.sqlite");
+        fs::rename(&history, &seed).unwrap();
+        let mut backup = None;
+        let mut hook = |stage| match stage {
+            RepairTestStage::AfterMigration(path) => {
+                backup = path.parent().map(Path::to_owned);
+                Ok(())
+            }
+            RepairTestStage::BeforeHistoryDirectorySync(path) => {
+                assert_eq!(path, history);
+                assert!(path.is_file());
+                anyhow::bail!("injected directory sync failure")
+            }
+            _ => Ok(()),
+        };
+        let (result, affected) = repair_after_connection_switch_preserving_history_with_test_hooks(
+            &home,
+            "custom",
+            None,
+            seed.to_str(),
+            || Ok(true),
+            &mut hook,
+            Some(migrate_with_history_seed),
+        )
+        .unwrap();
+        let backup = backup.unwrap();
+        assert!(result.repair_complete);
+        assert!(result.verification_passed);
+        assert!(result.warnings[0].contains(&backup.display().to_string()));
+        assert!(backup.join("backup-manifest.json").is_file());
+        assert!(affected.contains(&history));
+        assert!(
+            fs::read_to_string(&rollout)
+                .unwrap()
+                .contains(r#""model_provider":"custom""#)
+        );
+        let provider: String = Connection::open(&state)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id=?1",
+                [&logical],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "custom");
+        let rows: i64 = Connection::open(&history)
+            .unwrap()
+            .query_row("SELECT count(*) FROM thread_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        let backup = backup.canonicalize().unwrap();
+        assert_eq!(
+            backup.parent(),
+            Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+        );
+        assert!(
+            backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("codex-tools-session-repair-")
+        );
+        fs::remove_dir_all(backup).unwrap();
+    }
+
+    #[test]
+    fn failed_chat_confirmation_restores_rollouts_and_existing_or_new_history() {
+        use crate::models::{ChatRouteBinding, ProviderProfile};
+        use crate::storage::Store;
+
+        for history_exists in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
+            let seed = temp.path().join("empty-projection.sqlite");
+            let (runner, seed_path): (MigrationTestRunner, _) = if history_exists {
+                (finish_synthetic_migration, None)
+            } else {
+                fs::rename(&history, &seed).unwrap();
+                (migrate_with_history_seed, seed.to_str())
+            };
+            let before = fs::read(&rollout).unwrap();
+            let store = Store::open(temp.path().join("app-data")).unwrap();
+            let provider: ProviderProfile = serde_json::from_value(serde_json::json!({
+                "name": "Fixture", "baseUrl": "https://example.test/v1", "enabled": true,
+                "apiType": "chat", "apiKey": "fixture-key",
+            }))
+            .unwrap();
+            let stored = store.connections_save_provider(provider).unwrap();
+            store.activate(&stored.id).unwrap();
+            let manifest = temp.path().join("repair-manifest.json");
+            let error = repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app_impl(
+                &home, "custom", Some(&manifest), seed_path, || Ok(true),
+                || {
+                    assert_ne!(fs::read(&rollout).unwrap(), before);
+                    assert!(history.is_file());
+                    let persisted = store.path().with_extension("fixture");
+                    fs::rename(store.path(), &persisted)?;
+                    fs::create_dir(store.path())?;
+                    let result = store.confirm_chat_route(&stored.id, Some("fixture-binding".into()));
+                    fs::remove_dir(store.path())?;
+                    fs::rename(persisted, store.path())?;
+                    assert!(result.is_err());
+                    result
+                },
+                (None, Some(runner)),
+            ).unwrap_err();
+            assert!(error.to_string().contains("已回滚全部修改"), "{error}");
+            assert_eq!(fs::read(&rollout).unwrap(), before);
+            assert_eq!(history.is_file(), history_exists);
+            assert!(!manifest.exists());
+            let provider: String = Connection::open(&state)
+                .unwrap()
+                .query_row(
+                    "SELECT model_provider FROM threads WHERE id=?1",
+                    [&logical],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(provider, "openai");
+            if history_exists {
+                let count: i64 = Connection::open(&history)
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM thread_items", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+            let reopened = Store::open(temp.path().join("app-data")).unwrap();
+            assert_eq!(
+                reopened
+                    .read(|state| state.active.chat_route_binding.clone())
+                    .unwrap(),
+                ChatRouteBinding::Pending
+            );
+        }
+    }
+
+    #[test]
     fn rollback_after_history_mode_commit_restores_rollout_and_sqlite() {
         let temp = tempfile::tempdir().unwrap();
         let (home, rollout, state, history, logical) = paginated_recovery_fixture(&temp);
@@ -5173,7 +5602,11 @@ mod tests {
                 rollout.file_name().unwrap().to_string_lossy()
             ));
             let mut hook = |stage| {
-                if stage == RepairTestStage::AfterMigration {
+                if let RepairTestStage::AfterMigration(staged_home) = stage {
+                    let pending = staged_home.join(pending.strip_prefix(&home)?);
+                    let temporary = staged_home.join(temporary.strip_prefix(&home)?);
+                    let rollout = staged_home.join(rollout.strip_prefix(&home)?);
+                    let history = staged_home.join(THREAD_HISTORY_FILE);
                     fs::create_dir_all(pending.parent().unwrap())?;
                     fs::write(&pending, b"current migration pending")?;
                     fs::write(&temporary, b"current migration temporary")?;
@@ -6197,6 +6630,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mode, "paginated");
+        let live_path: String = state
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id=?1",
+                [logical],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rollout_paths_match(&rollout, Path::new(&live_path)));
     }
 
     #[test]
@@ -6249,11 +6690,17 @@ mod tests {
             .unwrap();
         let mut backup = RepairBackup::create().unwrap();
         backup.add_sqlite_database(&database).unwrap();
-        connection
+        backup
+            .database_mut(&database)
+            .unwrap()
+            .connection
             .execute("INSERT INTO entries VALUES('after')", [])
             .unwrap();
         drop(connection);
-        backup.restore().unwrap();
+        backup
+            .restore_selected(&HashMap::from([(database.clone(), RepairWrite::Database)]))
+            .unwrap();
+        backup.databases.clear();
         let restored = Connection::open_with_flags(
             &database,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -6288,7 +6735,18 @@ mod tests {
             serde_json::from_slice(&fs::read(backup.dir.join("backup-manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest.as_array().unwrap().len(), 2);
-        let error = backup.restore().unwrap_err();
+        let error = backup
+            .restore_selected(&HashMap::from([
+                (
+                    good.clone(),
+                    RepairWrite::Rollout(file_sha256_bytes(b"good-after")),
+                ),
+                (
+                    bad.clone(),
+                    RepairWrite::Rollout(file_sha256_bytes(b"bad-after")),
+                ),
+            ]))
+            .unwrap_err();
         assert!(error.to_string().contains("bad.jsonl"));
         assert_eq!(fs::read(&good).unwrap(), b"good-before");
         assert_eq!(fs::read(&bad).unwrap(), b"bad-after");
@@ -6306,7 +6764,12 @@ mod tests {
         fs::write(&target, b"external-after").unwrap();
         fs::write(&backup.entries[0].backup, b"corrupt").unwrap();
 
-        let error = backup.restore_entry(&backup.entries[0]).unwrap_err();
+        let error = backup
+            .restore_selected(&HashMap::from([(
+                target.clone(),
+                RepairWrite::Rollout(file_sha256_bytes(b"external-after")),
+            )]))
+            .unwrap_err();
 
         assert!(error.to_string().contains("哈希核验失败"));
         assert_eq!(fs::read(&target).unwrap(), b"external-after");
@@ -6339,7 +6802,9 @@ mod tests {
         let wal_before = wal_path.is_file().then(|| fs::read(&wal_path).unwrap());
         fs::write(&backup.entries[0].backup, b"corrupt").unwrap();
 
-        let error = backup.restore_entry(&backup.entries[0]).unwrap_err();
+        let error = backup
+            .restore_selected(&HashMap::from([(target.clone(), RepairWrite::Database)]))
+            .unwrap_err();
 
         assert!(error.to_string().contains("SQLite 备份快照哈希核验失败"));
         assert_eq!(fs::read(&target).unwrap(), target_before);
@@ -6357,36 +6822,36 @@ mod tests {
         fs::write(&target, b"before").unwrap();
         let mut backup = RepairBackup::create().unwrap();
         backup.add_bytes(&target, b"before").unwrap();
-        let mut written = HashSet::new();
+        let mut written = HashMap::new();
 
-        let error = track_atomic_write_result(&target, b"after", &mut written, || {
+        let error = track_atomic_write_result(&target, b"before", b"after", &mut written, || {
             atomic_write(&target, b"after")?;
             anyhow::bail!("模拟 rename 后目录 fsync 失败")
         })
         .unwrap_err();
 
         assert!(error.to_string().contains("rename 后目录 fsync"));
-        assert!(written.contains(&target));
+        assert!(written.contains_key(&target));
         backup.restore_selected(&written).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"before");
         backup.cleanup().unwrap();
     }
 
     #[test]
-    fn database_rows_zero_after_preflight_is_a_concurrent_conflict() {
+    fn database_row_count_conflict_rolls_back_every_pending_update() {
         let temp = tempfile::tempdir().unwrap();
         let database_path = temp.path().join("state_5.sqlite");
         let database = Connection::open(&database_path).unwrap();
         database
             .execute_batch(
                 "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT);
-                 INSERT INTO threads VALUES('one','openai');",
+                 INSERT INTO threads VALUES('one','openai'), ('two','openai');",
             )
             .unwrap();
         let scope = session_scope(std::slice::from_ref(&database_path), &[]).unwrap();
         assert_eq!(
             preflight_database(&database_path, "custom", &scope).unwrap(),
-            1
+            2
         );
         database
             .execute(
@@ -6396,10 +6861,42 @@ mod tests {
             .unwrap();
         drop(database);
 
-        let error = repair_database_commit(&database_path, "custom", &scope, 1, &mut || Ok(true))
-            .unwrap_err();
+        let error = repair_database_commit(
+            &mut RepairDatabase::open(&database_path).unwrap(),
+            &database_path,
+            "custom",
+            &scope,
+            2,
+            &mut || Ok(true),
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("并发变化"));
+        let remaining: String = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id='two'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, "openai");
+        let db = Connection::open(&database_path).unwrap();
+        db.execute(
+            "UPDATE threads SET model_provider='custom' WHERE id='two'",
+            [],
+        )
+        .unwrap();
+        let zero = repair_database_commit(
+            &mut RepairDatabase::open(&database_path).unwrap(),
+            &database_path,
+            "custom",
+            &scope,
+            2,
+            &mut || Ok(true),
+        )
+        .unwrap_err();
+        assert!(zero.to_string().contains("实际 0 行"));
         assert_sqlite_integrity(&database_path);
     }
 

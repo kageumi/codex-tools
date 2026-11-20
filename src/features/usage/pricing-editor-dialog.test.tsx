@@ -94,6 +94,30 @@ describe("价格规则的费用范围", () => {
     expect(saved.id).toBe(rule.id)
   })
 
+  it("只改模型时保留未填写的价格和显式零价", async () => {
+    mount({ ...rule, outputUsdPerMillion: "0" })
+    expect((screen.getByLabelText("缓存读取") as HTMLInputElement).value).toBe(
+      ""
+    )
+    expect((screen.getByLabelText("缓存写入") as HTMLInputElement).value).toBe(
+      ""
+    )
+    fireEvent.change(screen.getByLabelText("模型", { exact: true }), {
+      target: { value: "another" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "保存并重算" }))
+    await waitFor(() =>
+      expect(callMock).toHaveBeenCalledWith("usage_save_pricing_rule", {
+        input: expect.objectContaining({
+          modelPattern: "another",
+          cachedReadUsdPerMillion: undefined,
+          cacheWriteUsdPerMillion: undefined,
+          outputUsdPerMillion: "0",
+        }),
+      })
+    )
+  })
+
   it.each([true, false])(
     "添加规则时复用已有生效时间，已有等价规则：%s",
     async (equivalent) => {

@@ -1,4 +1,4 @@
-use crate::models::{AppError, ProviderProfile, REASONING_EFFORTS};
+use crate::models::{AppError, ModelServiceTier, ProviderProfile};
 
 pub(crate) const MAX_UPSTREAM_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FETCHED_MODELS: usize = 10_000;
@@ -40,10 +40,9 @@ pub struct FetchedModelDetail {
     pub context_window: Option<u64>,
     /// 服务方返回的模型简介；没有返回时为空。
     pub description: Option<String>,
-    /// 服务方明确返回的模型推理档位；没有返回或格式不识别时为空。
     pub reasoning_levels: Option<Vec<String>>,
-    /// 服务方明确返回的默认推理档位。
     pub default_reasoning_level: Option<String>,
+    pub service_tiers: Option<Vec<ModelServiceTier>>,
 }
 
 /// 根据 base_url 是否已带版本路径（/v1、/openai/v2）拼接上游接口路径。
@@ -141,6 +140,7 @@ fn parse_model_details_payload(
                 description: parse_model_description(item),
                 reasoning_levels: parse_model_reasoning_levels(item),
                 default_reasoning_level: parse_default_reasoning_level(item),
+                service_tiers: parse_model_service_tiers(item),
             })
         })
         .collect::<Vec<_>>();
@@ -154,21 +154,90 @@ fn parse_model_details_payload(
     Ok(models)
 }
 
-/// 解析服务端显式声明的支持档位。OpenAI 兼容服务没有统一的能力字段，
-/// 因此这里只接受明确列出档位的扩展字段，不从模型名或参数能力猜测。
-fn parse_model_reasoning_levels(item: &serde_json::Value) -> Option<Vec<String>> {
-    let value = [
+/// 只接受服务商声明的 Fast 档位。显式字段（包括空值或非法值）阻止回退，
+/// 避免用 additional_speed_tiers 覆盖服务商明确撤回的 service_tiers。
+fn parse_model_service_tiers(item: &serde_json::Value) -> Option<Vec<ModelServiceTier>> {
+    let declared = item
+        .get("service_tiers")
+        .or_else(|| item.get("serviceTiers"))
+        .or_else(|| item.pointer("/capabilities/service_tiers"))
+        .or_else(|| item.pointer("/capabilities/serviceTiers"));
+    if let Some(declared) = declared {
+        let mut tiers: Vec<ModelServiceTier> = Vec::new();
+        for value in declared.as_array().into_iter().flatten() {
+            let Some(id @ ("fast" | "priority")) =
+                value.get("id").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if tiers.iter().any(|tier| tier.id == id) {
+                continue;
+            }
+            let name = value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && name.len() <= MAX_MODEL_ID_BYTES)
+                .unwrap_or("Fast");
+            let description = value
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| text.len() <= MAX_MODEL_DESCRIPTION_BYTES)
+                .unwrap_or_default();
+            tiers.push(ModelServiceTier {
+                id: id.into(),
+                name: name.into(),
+                description: description.into(),
+            });
+        }
+        return Some(tiers);
+    }
+    let additional = item
+        .get("additional_speed_tiers")
+        .or_else(|| item.get("additionalSpeedTiers"))
+        .or_else(|| item.pointer("/capabilities/additional_speed_tiers"))
+        .or_else(|| item.pointer("/capabilities/additionalSpeedTiers"))?;
+    Some(
+        if additional
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("fast")))
+        {
+            vec![ModelServiceTier {
+                id: "fast".into(),
+                name: "Fast".into(),
+                description: String::new(),
+            }]
+        } else {
+            Vec::new()
+        },
+    )
+}
+
+fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let effort = value.trim().to_ascii_lowercase();
+    matches!(
+        effort.as_str(),
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    )
+    .then_some(effort)
+}
+
+/// 服务商扩展字段和 Codex 本机缓存共用解析，显式空数组与未声明能力分开处理。
+pub(crate) fn parse_model_reasoning_levels(item: &serde_json::Value) -> Option<Vec<String>> {
+    let values = [
         item.get("supported_reasoning_levels"),
         item.get("supportedReasoningLevels"),
         item.get("supported_reasoning_efforts"),
         item.get("supportedReasoningEfforts"),
         item.pointer("/capabilities/supported_reasoning_levels"),
         item.pointer("/capabilities/supportedReasoningLevels"),
+        item.pointer("/capabilities/supported_reasoning_efforts"),
+        item.pointer("/capabilities/supportedReasoningEfforts"),
     ]
     .into_iter()
     .flatten()
-    .find(|value| value.is_array())?;
-    let values = value.as_array()?;
+    .find_map(serde_json::Value::as_array)?;
     let mut levels = Vec::new();
     for value in values {
         let effort = value
@@ -179,11 +248,13 @@ fn parse_model_reasoning_levels(item: &serde_json::Value) -> Option<Vec<String>>
                     .get("reasoning_effort")
                     .and_then(serde_json::Value::as_str)
             })
-            .map(str::trim)
-            .map(str::to_ascii_lowercase);
-        if let Some(effort) = effort.filter(|effort| REASONING_EFFORTS.contains(&effort.as_str()))
-            && !levels.contains(&effort)
-        {
+            .or_else(|| {
+                value
+                    .get("reasoningEffort")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .and_then(normalize_reasoning_effort);
+        if let Some(effort) = effort.filter(|effort| !levels.contains(effort)) {
             levels.push(effort);
         }
     }
@@ -201,13 +272,13 @@ fn parse_default_reasoning_level(item: &serde_json::Value) -> Option<String> {
         item.get("defaultReasoningEffort"),
         item.pointer("/capabilities/default_reasoning_level"),
         item.pointer("/capabilities/defaultReasoningLevel"),
+        item.pointer("/capabilities/default_reasoning_effort"),
+        item.pointer("/capabilities/defaultReasoningEffort"),
     ]
     .into_iter()
     .flatten()
     .filter_map(serde_json::Value::as_str)
-    .map(str::trim)
-    .map(str::to_ascii_lowercase)
-    .find(|effort| REASONING_EFFORTS.contains(&effort.as_str()))
+    .find_map(normalize_reasoning_effort)
 }
 
 /// 从 `/models` 单项里解析模型简介；优先 `description` 字段，
@@ -317,7 +388,179 @@ pub fn custom_headers(provider: &ProviderProfile) -> Result<reqwest::header::Hea
 mod tests {
     use super::*;
     use crate::models::ProviderApiType;
+
+    #[test]
+    fn fast_mode_payload_accepts_provider_aliases_and_additional_tier_fallback() {
+        for key in ["service_tiers", "serviceTiers"] {
+            for nested in [false, true] {
+                let capability = json!({key: [
+                    {"id": "priority", "name": "Provider Fast", "description": "Provider terms"},
+                    {"id": "priority", "name": "Duplicate"},
+                    {"id": "fast"},
+                    {"id": "ultrafast"},
+                    {"id": "default"}
+                ]});
+                let mut model = if nested {
+                    json!({"capabilities": capability})
+                } else {
+                    capability
+                };
+                model["id"] = json!("relay-model");
+                let details = parse_model_details_payload(&json!({"data": [model]})).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&details[0].service_tiers).unwrap(),
+                    json!([
+                        {"id": "priority", "name": "Provider Fast", "description": "Provider terms"},
+                        {"id": "fast", "name": "Fast", "description": ""}
+                    ])
+                );
+            }
+        }
+        for key in ["additional_speed_tiers", "additionalSpeedTiers"] {
+            for nested in [false, true] {
+                let capability = json!({key: ["fast", "fast", "ultrafast"]});
+                let mut model = if nested {
+                    json!({"capabilities": capability})
+                } else {
+                    capability
+                };
+                model["id"] = json!("relay-model");
+                let details = parse_model_details_payload(&json!({"data": [model]})).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&details[0].service_tiers).unwrap(),
+                    json!([{"id": "fast", "name": "Fast", "description": ""}])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_mode_explicit_empty_or_invalid_declarations_never_fall_back() {
+        for value in [
+            json!([]),
+            json!(null),
+            json!(true),
+            json!("fast"),
+            json!([null, "fast", {"id": "unknown"}, {"id": "FAST"}]),
+        ] {
+            let details = parse_model_details_payload(&json!({"data": [{
+                "id": "gpt-6-astra",
+                "service_tiers": value,
+                "serviceTiers": [{"id": "priority"}],
+                "additional_speed_tiers": ["fast"]
+            }]}))
+            .unwrap();
+            assert_eq!(details[0].service_tiers, Some(Vec::new()));
+        }
+        for value in [json!(null), json!("fast"), json!([]), json!(["priority"])] {
+            let details = parse_model_details_payload(&json!({"data": [{
+                "id": "gpt-6-astra", "additional_speed_tiers": value
+            }]}))
+            .unwrap();
+            assert_eq!(details[0].service_tiers, Some(Vec::new()));
+        }
+        let undeclared = parse_model_details_payload(&json!({"data": [{
+            "id": "gpt-6-astra", "default_service_tier": "priority"
+        }]}))
+        .unwrap();
+        assert_eq!(undeclared[0].service_tiers, None);
+    }
+
+    #[test]
+    fn fast_mode_metadata_remains_backward_compatible() {
+        let legacy: crate::models::ProviderModelsDevMeta =
+            serde_json::from_value(json!({"name": "Legacy"})).unwrap();
+        assert!(legacy.service_tiers.is_none());
+        let declared = json!({
+            "name": null, "contextWindow": null, "description": null,
+            "supportedReasoningLevels": null, "defaultReasoningLevel": null,
+            "serviceTiers": [{"id": "priority", "name": "Fast", "description": ""}]
+        });
+        let decoded: crate::models::ProviderModelsDevMeta =
+            serde_json::from_value(declared.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), declared);
+        let catalog: crate::models::CodexModelInfo =
+            serde_json::from_value(json!({"slug": "legacy", "display_name": "Legacy"})).unwrap();
+        assert!(catalog.service_tiers.is_empty());
+        assert!(catalog.additional_speed_tiers.is_empty());
+        assert!(catalog.default_service_tier.is_none());
+    }
     use serde_json::json;
+
+    #[test]
+    fn reasoning_metadata_accepts_declared_shapes_and_normalizes_known_levels() {
+        for key in [
+            "supported_reasoning_levels",
+            "supportedReasoningLevels",
+            "supported_reasoning_efforts",
+            "supportedReasoningEfforts",
+        ] {
+            for nested in [false, true] {
+                let mut item = json!({key: [
+                    " low ", {"effort": "HIGH"}, {"reasoning_effort": "max"},
+                    {"reasoningEffort": "ultra"}, "max", "unknown", null,
+                ], "defaultReasoningEffort": " MAX "});
+                if nested {
+                    item = json!({"capabilities": item});
+                }
+                assert_eq!(
+                    parse_model_reasoning_levels(&item).unwrap(),
+                    ["low", "high", "max", "ultra"]
+                );
+                assert_eq!(parse_default_reasoning_level(&item).as_deref(), Some("max"));
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_metadata_distinguishes_empty_missing_and_invalid() {
+        assert_eq!(
+            parse_model_reasoning_levels(&json!({"supported_reasoning_levels": []})),
+            Some(vec![])
+        );
+        for item in [
+            json!({}),
+            json!({"supported_reasoning_levels": null}),
+            json!({"supported_reasoning_levels": "max"}),
+            json!({"supported_reasoning_levels": ["unknown", 1]}),
+        ] {
+            assert_eq!(parse_model_reasoning_levels(&item), None);
+        }
+        assert_eq!(
+            parse_default_reasoning_level(&json!({"default_reasoning_level": "future"})),
+            None
+        );
+        let details = parse_model_details_payload(&json!({"data":[{
+            "id":"declared", "supportedReasoningEfforts":["low", "max"],
+            "default_reasoning_level":"max"
+        }]}))
+        .unwrap();
+        assert_eq!(
+            details[0].reasoning_levels.as_ref().unwrap(),
+            &["low", "max"]
+        );
+        assert_eq!(details[0].default_reasoning_level.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn reasoning_metadata_round_trips_and_accepts_legacy_stored_models() {
+        let legacy: crate::models::ProviderModelsDevMeta =
+            serde_json::from_value(json!({"name":"legacy"})).unwrap();
+        assert!(legacy.supported_reasoning_levels.is_none());
+        assert!(legacy.default_reasoning_level.is_none());
+        let declared: crate::models::ProviderModelsDevMeta = serde_json::from_value(json!({
+            "supportedReasoningLevels":["low", "max"],
+            "defaultReasoningLevel":"max"
+        }))
+        .unwrap();
+        let json = serde_json::to_value(&declared).unwrap();
+        assert_eq!(json["supportedReasoningLevels"], json!(["low", "max"]));
+        assert_eq!(json["defaultReasoningLevel"], "max");
+        assert_eq!(
+            serde_json::from_value::<crate::models::ProviderModelsDevMeta>(json).unwrap(),
+            declared
+        );
+    }
 
     #[test]
     fn parses_context_window_from_common_field_names() {

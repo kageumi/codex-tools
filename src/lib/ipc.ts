@@ -55,7 +55,7 @@ type CommandMap = {
   >
   connections_delete_provider: CommandSpec<{ id: string }, void>
   connections_import_cookie: CommandSpec<
-    { name?: string; accountId?: string; content: string },
+    { name?: string; nameOffset?: number; accountId?: string; content: string },
     ProxyImportResult
   >
   connections_login_start: CommandSpec<undefined, DeviceAuthorization>

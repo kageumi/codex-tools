@@ -25,6 +25,7 @@ pub(crate) const LEGACY_OPENAI_RELAY_PROVIDER_ID: &str = "codex_tools_openai_rel
 const MAX_CODEX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CODEX_AUTH_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MODEL_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
+const CHAT_ROUTE_COMMENT: &str = "# codex-tools-chat ";
 
 /// 序列化模型目录内容；没有可用模型时返回 `None`（应用时跳过写目录，
 /// 避免用空目录覆盖正在使用的模型目录）。
@@ -41,6 +42,7 @@ fn catalog_bytes(catalog: &[crate::models::CodexModelInfo]) -> Option<Vec<u8>> {
 #[derive(Clone)]
 struct PendingPatch {
     target: PathBuf,
+    provider_revision: crate::storage::ProviderSnapshotRevision,
     rendered: String,
     auth_rendered: Vec<u8>,
     /// 模型目录文件内容（`{"models": [...]}`）；为空表示没有可用模型，
@@ -77,6 +79,7 @@ struct OfficialAccountPatch {
 
 struct PatchDraft<'a> {
     target: PathBuf,
+    provider_revision: crate::storage::ProviderSnapshotRevision,
     original: &'a str,
     rendered: String,
     auth_rendered: Vec<u8>,
@@ -184,23 +187,11 @@ impl ConfigManager {
         let headers = merged_headers(provider);
         // 准备模型目录内容，但不在此写入磁盘：预览是只读操作，目录文件在
         // 真正应用时才落盘，避免未应用的预览覆盖正在使用的模型目录。
-        let catalog =
-            catalog_bytes(&model_unlock::build_model_catalog_with_windows_for_provider(provider));
+        let catalog = catalog_bytes(
+            &model_unlock::build_model_catalog_with_windows_for_provider(provider, codex_home),
+        );
         let mut document = parse_config_document(&original)?;
-        // 有效模型 = 选中的模型；未指定选择时 = available_models ∪ custom_models。
-        let candidate_models: Vec<String> = match provider.selected_models.as_deref() {
-            Some(selected) => selected.to_vec(),
-            None => {
-                let mut effective: Vec<String> = provider.available_models.clone();
-                for model in &provider.custom_models {
-                    if !effective.contains(model) {
-                        effective.push(model.clone());
-                    }
-                }
-                effective
-            }
-        };
-        let effective_model = effective_provider_model(&document, &candidate_models)?;
+        let effective_model = effective_provider_model(&document, &candidate_models(provider))?;
         apply_custom_fields(
             &mut document,
             &provider.name,
@@ -208,6 +199,15 @@ impl ConfigManager {
             &headers,
             &effective_model,
         )?;
+        if let Some(key) = &target.proxy_api_key {
+            let table = document["model_providers"][MANAGED_PROVIDER_ID]
+                .as_table_mut()
+                .expect("apply_custom_fields created the managed provider table");
+            table.decor_mut().set_suffix(format!(
+                " {CHAT_ROUTE_COMMENT}{}",
+                chat_route_digest(provider, key)?
+            ));
+        }
         let rendered = document.to_string();
         let auth_rendered = render_api_key_auth(auth_key)?;
         let public_preview = managed_custom_preview(&document, auth_key, &headers);
@@ -217,6 +217,7 @@ impl ConfigManager {
         );
         self.remember(PatchDraft {
             target: path,
+            provider_revision: crate::storage::ProviderSnapshotRevision::from_provider(provider),
             original: &original,
             rendered,
             auth_rendered,
@@ -226,6 +227,24 @@ impl ConfigManager {
             changes,
             api_key: auth_key,
         })
+    }
+
+    pub(crate) fn check_preview_provider(
+        &self,
+        operation_id: &str,
+        home: &Path,
+        provider: &ProviderProfile,
+    ) -> Result<(), AppError> {
+        let pending = self.pending.lock().map_err(|_| AppError::StaleOperation)?;
+        if pending.get(operation_id).is_some_and(|patch| {
+            patch.target.parent() == Some(home)
+                && patch.provider_revision
+                    == crate::storage::ProviderSnapshotRevision::from_provider(provider)
+        }) {
+            Ok(())
+        } else {
+            Err(AppError::StaleOperation)
+        }
     }
 
     #[cfg(test)]
@@ -292,9 +311,7 @@ impl ConfigManager {
         {
             return Err(AppError::StaleOperation);
         }
-        let _: DocumentMut = pending.rendered.parse().map_err(|error| {
-            AppError::InvalidConfig(format!("生成的 Codex 配置格式不正确，请重新预览：{error}"))
-        })?;
+        parse_config_document(&pending.rendered)?;
         let _: serde_json::Map<String, serde_json::Value> =
             parse_auth_object(&pending.auth_rendered)?;
         // 最终落盘前再次复核停止状态；快照复核与后续逐文件替换只能缩小
@@ -334,6 +351,7 @@ impl ConfigManager {
     fn remember(&self, draft: PatchDraft<'_>) -> Result<ConfigPatchPreview, AppError> {
         let PatchDraft {
             target,
+            provider_revision,
             original,
             rendered,
             auth_rendered,
@@ -351,18 +369,20 @@ impl ConfigManager {
             .lock()
             .map_err(|_| AppError::Internal("配置预览暂时不可用，请重启应用后再试。".into()))?;
         pending.retain(|_, patch| patch.created_at.elapsed() < Duration::from_secs(600));
-        if pending.len() >= 32
-            && let Some(oldest) = pending
+        if pending.len() >= 32 {
+            if let Some(oldest) = pending
                 .iter()
                 .min_by_key(|(_, patch)| patch.created_at)
                 .map(|(id, _)| id.clone())
-        {
-            pending.remove(&oldest);
+            {
+                pending.remove(&oldest);
+            }
         }
         pending.insert(
             operation_id.clone(),
             PendingPatch {
                 target,
+                provider_revision,
                 rendered,
                 auth_rendered,
                 catalog,
@@ -581,6 +601,95 @@ pub fn read_official_account(codex_home: &Path) -> Result<Option<CodexAuthCreden
     Ok(Some(credential))
 }
 
+pub(crate) fn chat_route_digest(
+    provider: &ProviderProfile,
+    proxy_key: &str,
+) -> Result<String, AppError> {
+    // Bind this local key to the committed route without including upstream credentials in TOML.
+    let bytes = serde_json::to_vec(&(
+        proxy_key,
+        &provider.id,
+        &provider.base_url,
+        &provider.api_key,
+        &provider.headers,
+        provider.timeout_secs,
+    ))
+    .map_err(|_| AppError::Internal("无法生成本机代理配置标识。".into()))?;
+    Ok(digest_bytes(&bytes))
+}
+
+pub(crate) enum SavedChatProxyKey {
+    Confirmed(String),
+    RequiresRotation(String),
+}
+
+pub(crate) fn saved_chat_proxy_key(
+    home: &Path,
+    provider: &ProviderProfile,
+    base_url: &str,
+    committed_binding: &crate::models::ChatRouteBinding,
+) -> Result<SavedChatProxyKey, AppError> {
+    let mismatch = || {
+        AppError::InvalidConfig(
+            "本机代理与当前 Codex 配置不匹配，请在设置中重新应用当前服务配置。".into(),
+        )
+    };
+    let doc = parse_config_document(&read_optional(&home.join("config.toml"))?)?;
+    let custom = doc
+        .get("model_providers")
+        .and_then(|p| p.get(MANAGED_PROVIDER_ID))
+        .ok_or_else(mismatch)?;
+    if doc.get("model_provider").and_then(Item::as_str) != Some(MANAGED_PROVIDER_ID)
+        || custom.get("base_url").and_then(Item::as_str) != Some(base_url)
+        || custom.get("name").and_then(Item::as_str) != Some(provider.name.as_str())
+    {
+        return Err(mismatch());
+    }
+    let snapshot = OptionalFileSnapshot::capture(
+        home.join("auth.json"),
+        MAX_CODEX_AUTH_BYTES,
+        "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
+    )?;
+    let auth = parse_auth_object(snapshot.contents.as_deref().unwrap_or_default())?;
+    let key = auth
+        .get("OPENAI_API_KEY")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(mismatch)?;
+    if auth.get("tokens").is_some_and(|tokens| !tokens.is_null())
+        || Some(key) == provider.api_key.as_deref()
+        || key.len() != 3 * 36
+        || !key.as_bytes().chunks_exact(36).all(|part| {
+            uuid::Uuid::try_parse_ascii(part).is_ok_and(|id| {
+                id.get_version_num() == 4 && id.get_variant() == uuid::Variant::RFC4122
+            })
+        })
+    {
+        return Err(mismatch());
+    }
+    let digest = chat_route_digest(provider, key)?;
+    // A legacy TOML without a marker is usable only if the store independently
+    // confirms this exact local key and upstream.
+    if let Some(binding) = custom
+        .as_table()
+        .and_then(|table| table.decor().suffix())
+        .and_then(|suffix| suffix.as_str())
+        .and_then(|suffix| suffix.trim().strip_prefix(CHAT_ROUTE_COMMENT))
+    {
+        if binding != digest {
+            return Err(mismatch());
+        }
+    }
+    match committed_binding {
+        crate::models::ChatRouteBinding::Confirmed(saved) if saved == &digest => {
+            Ok(SavedChatProxyKey::Confirmed(key.to_owned()))
+        }
+        crate::models::ChatRouteBinding::Legacy => {
+            Ok(SavedChatProxyKey::RequiresRotation(key.to_owned()))
+        }
+        _ => Err(mismatch()),
+    }
+}
+
 pub fn inspect(codex_home: &Path) -> ConfigInspection {
     let path = codex_home.join("config.toml");
     let text = match read_optional(&path) {
@@ -595,7 +704,7 @@ pub fn inspect(codex_home: &Path) -> ConfigInspection {
             };
         }
     };
-    match text.parse::<DocumentMut>() {
+    match parse_config_document(&text) {
         Ok(document) => {
             let custom = document
                 .get("model_providers")
@@ -618,7 +727,7 @@ pub fn inspect(codex_home: &Path) -> ConfigInspection {
             valid: false,
             active_provider: None,
             managed_provider_present: false,
-            warnings: vec![format!("Codex 配置文件格式有误：{error}")],
+            warnings: vec![error.to_string()],
         },
     }
 }
@@ -670,6 +779,120 @@ fn apply_custom_fields(
     Ok(())
 }
 
+fn candidate_models(provider: &ProviderProfile) -> Vec<String> {
+    match provider.selected_models.as_ref() {
+        Some(selected) => selected.clone(),
+        None => {
+            let mut models = provider.available_models.clone();
+            for custom in &provider.custom_models {
+                if !models.contains(custom) {
+                    models.push(custom.clone());
+                }
+            }
+            models
+        }
+    }
+}
+
+pub(crate) fn refresh_background_model_files(
+    store: &crate::storage::Store,
+    home: &Path,
+    provider: &ProviderProfile,
+    expected_url: &str,
+    catalog_changed: bool,
+) -> Result<bool, AppError> {
+    refresh_background_model_files_with(
+        store,
+        home,
+        provider,
+        expected_url,
+        catalog_changed,
+        crate::storage::atomic_write_if_unchanged,
+    )
+}
+
+fn refresh_background_model_files_with(
+    store: &crate::storage::Store,
+    home: &Path,
+    provider: &ProviderProfile,
+    expected_url: &str,
+    catalog_changed: bool,
+    write_config: impl Fn(&Path, &[u8], &[u8]) -> anyhow::Result<crate::storage::ConditionalWrite>,
+) -> Result<bool, AppError> {
+    let config = home.join("config.toml");
+    let managed = store.last_managed_model()?;
+    let candidates = candidate_models(provider);
+    let retired = managed
+        .as_deref()
+        .filter(|model| !candidates.iter().any(|m| m == model));
+    let mut patch = None;
+    if let Some(previous) = retired {
+        let original = read_optional(&config)?;
+        let mut document = parse_config_document(&original)?;
+        let table = document
+            .get("model_providers")
+            .and_then(|item| item.get(MANAGED_PROVIDER_ID));
+        let catalog_path = format!("{MODEL_CATALOG_DIR}/{MODEL_CATALOG_FILE}");
+        if document.get("model").and_then(Item::as_str) == Some(previous)
+            && document.get("model_provider").and_then(Item::as_str) == Some(MANAGED_PROVIDER_ID)
+            && document.get("model_catalog_json").and_then(Item::as_str)
+                == Some(catalog_path.as_str())
+            && table.and_then(|t| t.get("name")).and_then(Item::as_str)
+                == Some(provider.name.trim())
+            && table.and_then(|t| t.get("base_url")).and_then(Item::as_str)
+                == Some(expected_url.trim_end_matches('/'))
+        {
+            let next = effective_provider_model(&document, &candidates)?;
+            let model = document["model"]
+                .as_value_mut()
+                .expect("matched a TOML string");
+            let decor = model.decor().clone();
+            *model = Value::from(next.as_str());
+            *model.decor_mut() = decor;
+            patch = Some((original, document.to_string(), next));
+        }
+    }
+    if !catalog_changed && patch.is_none() {
+        return Ok(false);
+    }
+    let catalog = model_unlock::build_model_catalog_with_windows_for_provider(provider, home);
+    crate::activation::ensure_codex_stopped(store)?;
+    let Some((original, rendered, next)) = patch else {
+        model_unlock::write_model_catalog(home, &catalog)?;
+        return Ok(true);
+    };
+    let previous_catalog = OptionalFileSnapshot::capture(
+        home.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE),
+        MAX_MODEL_CATALOG_BYTES,
+        "Codex 模型目录超过 16 MB，程序已停止读取以避免占用过多内存。",
+    )?;
+    model_unlock::write_model_catalog(home, &catalog)?;
+    let replace_config = |from: &str, to: &str| {
+        if write_config(&config, from.as_bytes(), to.as_bytes())?.confirm_publication(&config) {
+            Ok(())
+        } else {
+            Err(AppError::StaleOperation)
+        }
+    };
+    let commit = replace_config(&original, &rendered).and_then(|()| {
+        store.save_last_managed_model(Some(next)).map_err(|error| {
+            match replace_config(&rendered, &original) {
+                Ok(()) => error,
+                Err(rollback) => {
+                    AppError::Internal(format!("{error}；默认模型回滚失败：{rollback}"))
+                }
+            }
+        })
+    });
+    if let Err(error) = commit {
+        restore_optional_file(&previous_catalog).map_err(|rollback| {
+            AppError::Internal(format!("{error}；模型目录回滚失败：{rollback}"))
+        })?;
+        return Err(error);
+    }
+    Ok(true)
+}
+
 /// 从候选模型列表中选择本次配置要使用的模型。Codex 当前模型仍在
 /// 列表中时保持不变，否则使用稳定排序后的首项。标准 `/models` 不声明
 /// “默认模型”，因此首项只是保证首次请求可用的确定性回退。
@@ -679,11 +902,8 @@ fn effective_provider_model(document: &DocumentMut, models: &[String]) -> Result
         .and_then(Item::as_str)
         .map(str::trim)
         .filter(|model| !model.is_empty());
-    if let Some(current) = current
-        && models
-            .iter()
-            .map(|model| model.trim())
-            .any(|model| model == current)
+    if let Some(current) =
+        current.filter(|current| models.iter().any(|model| model.trim() == *current))
     {
         return Ok(current.to_owned());
     }
@@ -758,11 +978,9 @@ fn clear_custom_provider_fields(
     root.remove("model_provider");
     // 只有当我们之前写入的第三方模型仍然生效时，才把它一并移除，
     // 避免把用户手动设置的模型误删。
-    if let Some(managed) = managed_model.filter(|value| !value.trim().is_empty())
-        && root
-            .get("model")
-            .and_then(Item::as_str)
-            .is_some_and(|current| current == managed.trim())
+    if managed_model
+        .filter(|value| !value.trim().is_empty())
+        .is_some_and(|managed| root.get("model").and_then(Item::as_str) == Some(managed.trim()))
     {
         root.remove("model");
     }
@@ -836,13 +1054,29 @@ fn merged_headers(provider: &ProviderProfile) -> BTreeMap<String, String> {
     headers
 }
 
-fn parse_config_document(text: &str) -> Result<DocumentMut, AppError> {
+pub(crate) fn parse_config_document(text: &str) -> Result<DocumentMut, AppError> {
     if text.trim().is_empty() {
         return Ok(DocumentMut::new());
     }
     text.parse::<DocumentMut>().map_err(|error| {
+        // TOML errors include source lines and sometimes literal values. Only expose the position.
+        let position = error
+            .span()
+            .and_then(|span| text.get(..span.start))
+            .map(|prefix| {
+                let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let column = prefix
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
+                    + 1;
+                format!("（第 {line} 行，第 {column} 列）")
+            })
+            .unwrap_or_default();
         AppError::InvalidConfig(format!(
-            "Codex 配置文件格式有误，请修复 config.toml 后再试：{error}"
+            "Codex 配置文件格式有误，请检查 config.toml{position}。"
         ))
     })
 }
@@ -1043,6 +1277,175 @@ mod tests {
             base_url: base_url.into(),
             proxy_api_key: None,
         }
+    }
+
+    #[test]
+    fn background_model_refresh_keeps_config_catalog_and_marker_in_agreement() {
+        use crate::storage::{ConditionalWrite, FilePublication, Store, atomic_write_if_unchanged};
+
+        for published in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            prepare_home(&home);
+            let root = temp.path().join("fixture-data");
+            let store = Store::open(root.clone()).unwrap();
+            let mut provider = provider();
+            let config = home.join("config.toml");
+            let catalog = home.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE);
+            let manager = ConfigManager::default();
+            let preview = manager
+                .preview_custom(&home, &provider, &direct_target(&provider.base_url))
+                .unwrap();
+            manager.apply(&preview.operation_id).unwrap();
+            store
+                .update(|state| {
+                    state.codex.home = home.display().to_string();
+                    state.codex.last_managed_model = Some("api-model".into());
+                    Ok(())
+                })
+                .unwrap();
+            let old_config = fs::read(&config).unwrap();
+            let old_catalog = fs::read(&catalog).unwrap();
+            provider.available_models = vec!["replacement".into()];
+            let result = refresh_background_model_files_with(
+                &store,
+                &home,
+                &provider,
+                &provider.base_url,
+                true,
+                |path, expected, bytes| {
+                    if !published {
+                        anyhow::bail!("injected failure before publication");
+                    }
+                    assert!(atomic_write_if_unchanged(path, expected, bytes)?.written());
+                    Ok(ConditionalWrite::Written {
+                        retained: None,
+                        publication: FilePublication::DirectorySyncFailed(std::io::Error::other(
+                            "injected directory sync failure",
+                        )),
+                    })
+                },
+            );
+            drop(store);
+            let store = Store::open(root).unwrap();
+            if published {
+                assert!(result.unwrap());
+                assert_eq!(
+                    store.last_managed_model().unwrap().as_deref(),
+                    Some("replacement")
+                );
+                let config: DocumentMut = fs::read_to_string(config).unwrap().parse().unwrap();
+                assert_eq!(config["model"].as_str(), Some("replacement"));
+                let catalog: serde_json::Value =
+                    serde_json::from_slice(&fs::read(catalog).unwrap()).unwrap();
+                assert_eq!(catalog["models"][0]["slug"], "replacement");
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    store.last_managed_model().unwrap().as_deref(),
+                    Some("api-model")
+                );
+                assert_eq!(fs::read(config).unwrap(), old_config);
+                assert_eq!(fs::read(catalog).unwrap(), old_catalog);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_mode_activation_preserves_speed_and_reasoning_preferences() {
+        for speed in ["default", "priority"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let original = format!(
+                "service_tier = \"{speed}\"\nmodel_reasoning_effort = \"high\"\n\
+                 [profiles.work]\nservice_tier = \"default\"\nmodel_reasoning_effort = \"xhigh\"\n"
+            );
+            fs::write(home.join("config.toml"), &original).unwrap();
+            let mut provider = provider();
+            provider.models_dev_meta = provider
+                .available_models
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        serde_json::from_value(serde_json::json!({
+                            "serviceTiers": [{"id": "priority", "name": "Fast", "description": ""}]
+                        }))
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            let manager = ConfigManager::default();
+            let preview = manager
+                .preview_custom(home, &provider, &direct_target(&provider.base_url))
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(home.join("config.toml")).unwrap(),
+                original
+            );
+            manager.apply(&preview.operation_id).unwrap();
+            let document: DocumentMut = fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(document["service_tier"].as_str(), Some(speed));
+            assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"));
+            assert_eq!(
+                document["profiles"]["work"]["service_tier"].as_str(),
+                Some("default")
+            );
+            assert_eq!(
+                document["profiles"]["work"]["model_reasoning_effort"].as_str(),
+                Some("xhigh")
+            );
+            assert!(document.get("features").is_none());
+        }
+    }
+
+    #[test]
+    fn reasoning_preview_and_activation_use_the_configured_cache_and_preserve_effort() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        fs::write(
+            home.join("config.toml"),
+            "model_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("models_cache.json"),
+            serde_json::json!({
+                "models": [{
+                    "slug": "gpt-6-astra",
+                    "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut provider = provider();
+        provider.available_models = vec!["gpt-6-astra".into()];
+        let manager = ConfigManager::default();
+        let preview = manager
+            .preview_custom(home, &provider, &direct_target(&provider.base_url))
+            .unwrap();
+        // 对外预览只展示本应用管理的字段；原有推理强度应在实际配置中保持不变。
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            "model_reasoning_effort = \"high\"\n"
+        );
+        let path = home.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE);
+        assert!(!path.exists(), "preview must not write the catalog");
+        manager.apply(&preview.operation_id).unwrap();
+        let catalog: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            catalog["models"][0]["supported_reasoning_levels"][5]["effort"],
+            "ultra"
+        );
+        assert!(
+            fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .contains("model_reasoning_effort = \"high\"")
+        );
     }
 
     #[test]

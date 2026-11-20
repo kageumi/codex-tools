@@ -113,7 +113,11 @@ function officialPricingCatalogChanged(
   previous: OfficialPricingCatalog | undefined,
   next: OfficialPricingCatalog
 ) {
-  return !previous || previous.contentSha256 !== next.contentSha256
+  return (
+    next.usageRepriced ||
+    !previous ||
+    previous.contentSha256 !== next.contentSha256
+  )
 }
 
 export function UsagePage({
@@ -144,7 +148,7 @@ export function UsagePage({
   const [officialCatalog, setOfficialCatalog] =
     useState<OfficialPricingCatalog>()
   const [officialPricingError, setOfficialPricingError] = useState<string>()
-  const [syncing, setSyncing] = useState(false)
+  const [syncing, setSyncing] = useState(true)
   const [overviewRequestGate] = useState(createRequestGate)
   const mounted = useRef(true)
   const currentScan = useRef<
@@ -297,6 +301,8 @@ export function UsagePage({
         }
       } catch (reason) {
         if (!cancelled) setOfficialPricingError(errorMessage(reason))
+      } finally {
+        if (!cancelled) setSyncing(false)
       }
     })()
     return () => {

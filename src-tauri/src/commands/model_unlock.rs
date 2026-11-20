@@ -26,6 +26,8 @@ pub(crate) async fn settings_unlock_models(
 pub(crate) async fn settings_launch_codex_debug(
     store: State<'_, Store>,
     activation: State<'_, ActivationLock>,
+    proxy: State<'_, crate::chat_proxy::ChatProxyRegistry>,
+    manager: State<'_, crate::codex::ConfigManager>,
 ) -> Result<ModelUnlockResult, AppError> {
-    model_unlock::launch_with_debug(&store, &activation).await
+    model_unlock::launch_with_debug(&store, &activation, &proxy, &manager).await
 }

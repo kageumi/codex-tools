@@ -356,8 +356,10 @@ fn redact_home_text(value: &str) -> String {
 pub(crate) async fn dashboard_launch(
     store: State<'_, Store>,
     activation: State<'_, ActivationLock>,
+    proxy: State<'_, crate::chat_proxy::ChatProxyRegistry>,
+    manager: State<'_, crate::codex::ConfigManager>,
 ) -> Result<ModelUnlockResult, AppError> {
-    model_unlock::launch_with_debug(&store, &activation).await
+    model_unlock::launch_with_debug(&store, &activation, &proxy, &manager).await
 }
 
 /// 读取 Codex 应用路径设置（手动配置 + 实际检测结果）。
@@ -409,6 +411,11 @@ mod tests {
         let home = temp.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
         UsageLedger::open(&root).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            "# 测试配置\napi_key = fixture-private-value\n",
+        )
+        .unwrap();
 
         let report = build_support_diagnostics(
             &root,
@@ -424,6 +431,9 @@ mod tests {
         assert_eq!(report.storage.usage_database.quick_check, "ok");
         assert_eq!(report.storage.usage_database.event_count, Some(0));
         assert!(report.privacy.home_paths_redacted);
+        assert!(!report.configuration.valid);
+        assert!(report.configuration.warnings[0].contains("第 2 行"));
+        assert!(!serialized.contains("fixture-private-value"));
         assert!(!serialized.contains("api_key"));
         assert!(!serialized.contains("access_token"));
     }

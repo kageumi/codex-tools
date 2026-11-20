@@ -41,6 +41,7 @@ const COLLECTION_EPOCH_METADATA_KEY: &str = "usage_collection_started_at_ms";
 const COLLECTION_VERSION_METADATA_KEY: &str = "usage_collection_started_version";
 const COLLECTION_MODE_METADATA_KEY: &str = "usage_collection_mode";
 const PARSER_VERSION_METADATA_KEY: &str = "usage_parser_version";
+const PENDING_PARSER_PATHS: &str = "usage_parser_pending_paths";
 const COLLECTION_MODE: &str = "after_update";
 const COLLECTION_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PARSER_VERSION: &str = "6";
@@ -311,8 +312,17 @@ impl UsageLedger {
         now_utc_ms: i64,
     ) -> Result<UsageRefreshResult, AppError> {
         let started = Instant::now();
-        let mut connection = self.open_connection().map_err(AppError::from)?;
+        let connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
+        Self::scan_usage(connection, codex_home, now_utc_ms, started)
+    }
+
+    fn scan_usage(
+        mut connection: Connection,
+        codex_home: &Path,
+        now_utc_ms: i64,
+        started: Instant,
+    ) -> Result<UsageRefreshResult, AppError> {
         let mut result = UsageRefreshResult {
             files_scanned: 0,
             files_skipped: 0,
@@ -339,18 +349,16 @@ impl UsageLedger {
             }
         };
 
-        let activations = load_activations(&connection).map_err(AppError::from)?;
-        let official_catalog = load_official_catalog(&connection).map_err(AppError::from)?;
-        let pricing_rules = load_pricing_rule_records(&connection).map_err(AppError::from)?;
-
-        // 整个扫描共用一个外层事务：成功文件的数据在最后一次性提交，
-        // 避免每个文件都做一次 fsync；单个文件失败时只回滚该文件的
-        // savepoint，不影响其余文件，也不让失败文件留下半截写入。
+        // Take the writer lock before choosing rates. A catalog update either reprices
+        // this scan after commit or supplies the rates used by the scan itself.
         let mut transaction = connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| AppError::Internal(format!("开始保存本机用量事务失败：{error}")))?;
-        let discoveries = rebuild_usage_for_parser_upgrade(&transaction, &paths, collection_epoch)?;
-        let upgrading = discoveries.is_some();
+        let activations = load_activations(&transaction)?;
+        let official_catalog = load_official_catalog(&transaction)?;
+        let pricing_rules = load_pricing_rule_records(&transaction)?;
+        let mut pending = pending_parser_upgrades(&transaction, &paths)?;
+        let had_pending = !pending.is_empty();
         let context = UsageScanContext {
             now_utc_ms,
             collection_epoch,
@@ -360,33 +368,51 @@ impl UsageLedger {
         };
         for path in paths {
             result.files_scanned += 1;
-            match refresh_file(
-                &mut transaction,
-                &path,
-                context,
-                discoveries
-                    .as_ref()
-                    .and_then(|files| files.get(&path))
-                    .cloned(),
-            ) {
+            let upgrading = pending.contains(&path);
+            match refresh_file(&mut transaction, &path, context, upgrading) {
                 Ok(file_result) => {
+                    pending.remove(&path);
                     result.events_added += file_result.events_added;
                     result.events_skipped += file_result.events_skipped;
                     result.partial_lines += file_result.partial_lines;
                     result.files_skipped += usize::from(file_result.file_skipped);
                     result.warnings.extend(file_result.warnings);
                 }
-                Err(error) if upgrading => {
+                Err(FileRefreshError::Database(error)) if upgrading => {
                     return Err(AppError::Internal(format!(
                         "升级用量解析器失败，原账本已保留（{}）：{error}",
                         path.display()
                     )));
                 }
-                Err(error) => result.warnings.push(UsageWarning {
-                    path: Some(path.display().to_string()),
-                    message: error,
-                }),
+                Err(error) => {
+                    result.files_skipped += 1;
+                    result.warnings.push(UsageWarning {
+                        path: Some(path.display().to_string()),
+                        message: if upgrading {
+                            format!("{error} 已保留原用量，下次刷新时重试。")
+                        } else {
+                            error.to_string()
+                        },
+                    });
+                }
             }
+        }
+        if !pending.is_empty() {
+            let remaining = serde_json::to_string(&pending).map_err(anyhow::Error::from)?;
+            transaction
+                .execute(
+                    "INSERT INTO usage_metadata(key,value) VALUES (?1,?2)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value <> excluded.value",
+                    params![PENDING_PARSER_PATHS, remaining],
+                )
+                .map_err(anyhow::Error::from)?;
+        } else if had_pending {
+            transaction
+                .execute(
+                    "DELETE FROM usage_metadata WHERE key=?1",
+                    [PENDING_PARSER_PATHS],
+                )
+                .map_err(anyhow::Error::from)?;
         }
         transaction
             .commit()
@@ -938,87 +964,82 @@ impl UsageLedger {
         load_official_catalog(&connection).map_err(AppError::from)
     }
 
-    pub(crate) fn save_official_pricing_catalog(
+    pub(crate) fn sync_official_pricing_catalog(
         &self,
-        catalog: &OfficialPricingCatalog,
-        _now_utc_ms: i64,
-    ) -> Result<bool, AppError> {
-        let serialized = serde_json::to_string(catalog)
-            .map_err(|error| AppError::Internal(format!("序列化官方价格目录失败：{error}")))?;
+        incoming: Option<OfficialPricingCatalog>,
+        now_utc_ms: i64,
+    ) -> Result<(Option<OfficialPricingCatalog>, bool), AppError> {
         let mut connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
-        let transaction = connection
+        let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| AppError::Internal(format!("开始保存官方价格目录失败：{error}")))?;
-        let existing = transaction
-            .query_row(
-                "SELECT version FROM official_pricing_catalogs
-                 WHERE content_sha256 = ?1 LIMIT 1",
-                params![catalog.content_sha256],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| AppError::Internal(format!("检查官方价格目录版本失败：{error}")))?;
-        if let Some(existing_version) = existing {
-            transaction
-                .execute("UPDATE official_pricing_catalogs SET active = 0", [])
-                .map_err(|error| AppError::Internal(format!("停用旧官方价格目录失败：{error}")))?;
-            transaction
-                .execute(
-                    "UPDATE official_pricing_catalogs SET active = 1 WHERE version = ?1",
-                    params![existing_version],
-                )
-                .map_err(|error| AppError::Internal(format!("激活官方价格目录失败：{error}")))?;
-            transaction
-                .commit()
-                .map_err(|error| AppError::Internal(format!("提交官方价格目录失败：{error}")))?;
-            return Ok(false);
-        }
-        transaction
-            .execute("UPDATE official_pricing_catalogs SET active = 0", [])
-            .map_err(|error| AppError::Internal(format!("停用旧官方价格目录失败：{error}")))?;
-        transaction
-            .execute(
-                "INSERT INTO official_pricing_catalogs(
-                    version, content_sha256, source_url, etag, last_modified,
-                    fetched_at_ms, normalized_json, active
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
-                params![
-                    catalog.version,
-                    catalog.content_sha256,
-                    catalog.source_url,
-                    catalog.etag,
-                    catalog.last_modified,
-                    catalog.fetched_at_ms,
-                    serialized,
-                ],
-            )
-            .map_err(|error| AppError::Internal(format!("写入官方价格目录失败：{error}")))?;
-        transaction
-            .execute(
-                "DELETE FROM official_pricing_catalogs
-                 WHERE version NOT IN (
-                   SELECT version FROM official_pricing_catalogs
-                   ORDER BY fetched_at_ms DESC LIMIT 3
-                 )",
-                [],
-            )
-            .map_err(|error| AppError::Internal(format!("清理旧官方价格目录失败：{error}")))?;
-        transaction
-            .commit()
-            .map_err(|error| AppError::Internal(format!("提交官方价格目录失败：{error}")))?;
-        Ok(true)
+            .map_err(anyhow::Error::from)?;
+        Self::sync_pricing_transaction(tx, incoming, now_utc_ms)
     }
 
-    pub(crate) fn reprice_current_cycle(&self, now_utc_ms: i64) -> Result<RepriceResult, AppError> {
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
-        let start = read_collection_epoch(&connection)?.unwrap_or(now_utc_ms);
-        drop(connection);
-        self.reprice(UsageRange {
-            start_at_ms: start,
-            end_at_ms: now_utc_ms.saturating_add(1),
-        })
+    fn sync_pricing_transaction(
+        tx: rusqlite::Transaction<'_>,
+        incoming: Option<OfficialPricingCatalog>,
+        now_utc_ms: i64,
+    ) -> Result<(Option<OfficialPricingCatalog>, bool), AppError> {
+        let mut active = load_official_catalog(&tx)?;
+        let mut changed_rates = false;
+        if let Some(mut catalog) = incoming {
+            if let Some(version) = tx
+                .query_row(
+                    "SELECT version FROM official_pricing_catalogs WHERE content_sha256 = ?1",
+                    [&catalog.content_sha256],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(anyhow::Error::from)?
+            {
+                catalog.version = version;
+            }
+            changed_rates = active
+                .as_ref()
+                .is_none_or(|old| old.version != catalog.version || old.models != catalog.models);
+            tx.execute(
+                "UPDATE official_pricing_catalogs SET active = 0 WHERE active = 1 AND version <> ?1",
+                [catalog.version],
+            ).map_err(anyhow::Error::from)?;
+            tx.execute(
+                "INSERT INTO official_pricing_catalogs(
+                    version, content_sha256, source_url, etag, last_modified, fetched_at_ms, normalized_json, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
+                 ON CONFLICT(content_sha256) DO UPDATE SET etag=excluded.etag, last_modified=excluded.last_modified,
+                    fetched_at_ms=excluded.fetched_at_ms, normalized_json=excluded.normalized_json, active=1",
+                params![catalog.version, catalog.content_sha256, catalog.source_url, catalog.etag, catalog.last_modified,
+                    catalog.fetched_at_ms, serde_json::to_string(&catalog).map_err(anyhow::Error::from)?],
+            ).map_err(anyhow::Error::from)?;
+            tx.execute(
+                "DELETE FROM official_pricing_catalogs WHERE active = 0 AND version NOT IN (
+                    SELECT version FROM official_pricing_catalogs ORDER BY active DESC, fetched_at_ms DESC LIMIT 3)",
+                [],
+            )
+                .map_err(anyhow::Error::from)?;
+            active = Some(catalog);
+        }
+        let mut usage_repriced = false;
+        if let Some(catalog) = active.as_ref() {
+            let applied = read_metadata(&tx, "official_pricing_repriced_version")?;
+            // The old, unprefixed marker could precede a scan that still used stale rates.
+            let version = format!("2:{}", catalog.version);
+            if changed_rates || applied.as_deref() != Some(version.as_str()) {
+                let start = read_collection_epoch(&tx)?.unwrap_or(now_utc_ms);
+                usage_repriced = Self::reprice_in_transaction(
+                    &tx,
+                    start,
+                    now_utc_ms.saturating_add(1),
+                    Some(catalog),
+                )?
+                .events_repriced
+                    > 0;
+                tx.execute("INSERT INTO usage_metadata(key,value) VALUES ('official_pricing_repriced_version',?1)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value", [version]).map_err(anyhow::Error::from)?;
+            }
+        }
+        tx.commit().map_err(anyhow::Error::from)?;
+        Ok((active, usage_repriced))
     }
 
     pub(crate) fn usage_save_pricing_rule(
@@ -1130,14 +1151,33 @@ impl UsageLedger {
         range.validate()?;
         let mut connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
-        let collection_epoch = read_collection_epoch(&connection)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(anyhow::Error::from)?;
+        let collection_epoch = read_collection_epoch(&transaction)?;
         let effective_start = collection_epoch
             .map(|epoch| range.start_at_ms.max(epoch))
             .unwrap_or(range.end_at_ms);
-        let rules = load_pricing_rule_records(&connection).map_err(AppError::from)?;
+        let catalog = load_official_catalog(&transaction)?;
+        let result = Self::reprice_in_transaction(
+            &transaction,
+            effective_start,
+            range.end_at_ms,
+            catalog.as_ref(),
+        )?;
+        transaction.commit().map_err(anyhow::Error::from)?;
+        Ok(result)
+    }
+
+    fn reprice_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        effective_start: i64,
+        end: i64,
+        official_catalog: Option<&OfficialPricingCatalog>,
+    ) -> Result<RepriceResult, AppError> {
+        let rules = load_pricing_rule_records(transaction)?;
         let rule_labels = pricing_rule_labels(&rules);
-        let official_catalog = load_official_catalog(&connection).map_err(AppError::from)?;
-        let mut statement = connection
+        let mut statement = transaction
             .prepare(
                 "SELECT event_id, occurred_at_ms, model, provider_id, account_id,
                         input_tokens, cached_input_tokens, cache_write_input_tokens,
@@ -1148,7 +1188,7 @@ impl UsageLedger {
             )
             .map_err(|error| AppError::Internal(format!("读取待重算用量失败：{error}")))?;
         let events = statement
-            .query_map(params![effective_start, range.end_at_ms], |row| {
+            .query_map(params![effective_start, end], |row| {
                 Ok(RepriceEvent {
                     event_id: row.get(0)?,
                     occurred_at_ms: row.get(1)?,
@@ -1171,9 +1211,6 @@ impl UsageLedger {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| AppError::Internal(format!("读取待重算用量失败：{error}")))?;
         drop(statement);
-        let transaction = connection
-            .transaction()
-            .map_err(|error| AppError::Internal(format!("开始重算用量事务失败：{error}")))?;
         let mut result = RepriceResult {
             events_repriced: 0,
             estimated_cost_microusd: 0,
@@ -1200,7 +1237,7 @@ impl UsageLedger {
             let outcome = price_for_source(
                 event.source_kind,
                 &rules,
-                official_catalog.as_ref(),
+                official_catalog,
                 &event.usage,
                 &PricingContext {
                     model: &event.model,
@@ -1266,9 +1303,6 @@ impl UsageLedger {
                 result.unpriced_events += 1;
             }
         }
-        transaction
-            .commit()
-            .map_err(|error| AppError::Internal(format!("提交重算用量事务失败：{error}")))?;
         Ok(result)
     }
 
@@ -1683,55 +1717,56 @@ fn read_collection_epoch(connection: &Connection) -> Result<Option<i64>, AppErro
         .filter(|value| *value > 0))
 }
 
-fn rebuild_usage_for_parser_upgrade(
+fn pending_parser_upgrades(
     connection: &Connection,
     paths: &[PathBuf],
-    collection_epoch: i64,
-) -> Result<Option<HashMap<PathBuf, DiscoveredRollout>>, AppError> {
-    if read_metadata(connection, PARSER_VERSION_METADATA_KEY)?.as_deref() == Some(PARSER_VERSION) {
-        return Ok(None);
-    }
-    // Runs inside the scan transaction: failure rolls back deletion and version.
-    // Preserve history whose source files are no longer available for replay.
-    let mut discoveries = HashMap::new();
-    for path in paths {
-        let discovered = discover_rollout(path).map_err(AppError::Internal)?;
-        let Some(discovered) = discovered else {
-            return Err(AppError::Internal(format!(
-                "无法确认日志身份，未升级账本：{}",
-                path.display()
-            )));
-        };
-        connection
-            .execute(
-                "DELETE FROM usage_events WHERE rollout_id = ?1 AND occurred_at_ms >= ?2",
-                params![discovered.rollout_id, collection_epoch],
-            )
-            .map_err(|error| AppError::Internal(format!("清理待重建用量失败：{error}")))?;
-        for previous_owner in std::iter::once(&discovered.logical_rollout_id)
-            .chain(discovered.parent_rollout_id.iter())
+) -> Result<BTreeSet<PathBuf>, AppError> {
+    let saved = read_metadata(connection, PENDING_PARSER_PATHS)?;
+    let mut pending: BTreeSet<PathBuf> = match saved {
+        Some(value) => serde_json::from_str(&value).map_err(anyhow::Error::from)?,
+        None => BTreeSet::new(),
+    };
+    if read_metadata(connection, PARSER_VERSION_METADATA_KEY)?.as_deref() != Some(PARSER_VERSION) {
+        let mut stmt = connection
+            .prepare("SELECT last_path FROM usage_cursors")
+            .map_err(anyhow::Error::from)?;
+        for path in stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(anyhow::Error::from)?
         {
-            connection
-                .execute(
-                    "DELETE FROM usage_events WHERE occurred_at_ms >= ?1 AND rollout_id = ?2
-                 AND EXISTS(SELECT 1 FROM usage_cursors WHERE rollout_id = ?2 AND last_path = ?3)",
-                    params![collection_epoch, previous_owner, path.display().to_string()],
-                )
-                .map_err(|error| AppError::Internal(format!("清理旧会话身份用量失败：{error}")))?;
+            pending.insert(PathBuf::from(path.map_err(anyhow::Error::from)?));
         }
-        discoveries.insert(path.clone(), discovered);
+        pending.extend(paths.iter().cloned());
+        connection.execute("INSERT INTO usage_metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![PARSER_VERSION_METADATA_KEY, PARSER_VERSION]).map_err(anyhow::Error::from)?;
     }
-    connection
-        .execute("DELETE FROM usage_cursors", [])
-        .map_err(|error| AppError::Internal(format!("重置本机用量游标失败：{error}")))?;
-    connection
-        .execute(
-            "INSERT INTO usage_metadata(key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![PARSER_VERSION_METADATA_KEY, PARSER_VERSION],
-        )
-        .map_err(|error| AppError::Internal(format!("保存本机用量解析器版本失败：{error}")))?;
-    Ok(Some(discoveries))
+    Ok(pending)
+}
+
+fn clear_upgrading_rollout(
+    connection: &Connection,
+    path: &Path,
+    discovered: &DiscoveredRollout,
+    collection_epoch: i64,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "DELETE FROM usage_events WHERE rollout_id = ?1 AND occurred_at_ms >= ?2",
+        params![discovered.rollout_id, collection_epoch],
+    )?;
+    for previous_owner in
+        std::iter::once(&discovered.logical_rollout_id).chain(discovered.parent_rollout_id.iter())
+    {
+        connection.execute(
+            "DELETE FROM usage_events WHERE occurred_at_ms >= ?1 AND rollout_id = ?2
+             AND EXISTS(SELECT 1 FROM usage_cursors WHERE rollout_id = ?2 AND last_path = ?3)",
+            params![collection_epoch, previous_owner, path.display().to_string()],
+        )?;
+    }
+    connection.execute(
+        "DELETE FROM usage_cursors WHERE rollout_id = ?1 OR last_path = ?2",
+        params![discovered.rollout_id, path.display().to_string()],
+    )?;
+    Ok(())
 }
 
 fn initialize_collection_epoch(
@@ -1912,12 +1947,32 @@ fn update_activation_status(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+enum FileRefreshError {
+    #[error("{0}")]
+    File(String),
+    #[error("保存本机用量失败：{0}")]
+    Database(#[from] rusqlite::Error),
+}
+
+impl From<String> for FileRefreshError {
+    fn from(message: String) -> Self {
+        Self::File(message)
+    }
+}
+
+impl From<&str> for FileRefreshError {
+    fn from(message: &str) -> Self {
+        Self::File(message.to_owned())
+    }
+}
+
 fn refresh_file(
     transaction: &mut rusqlite::Transaction<'_>,
     path: &Path,
     context: UsageScanContext<'_>,
-    discovered: Option<DiscoveredRollout>,
-) -> Result<FileRefreshResult, String> {
+    upgrading: bool,
+) -> Result<FileRefreshResult, FileRefreshError> {
     let UsageScanContext {
         now_utc_ms,
         collection_epoch,
@@ -1932,7 +1987,9 @@ fn refresh_file(
     let file_modified_at_ms = file_modified_at_ms(&metadata);
     // 先按路径和文件戳命中游标，避免每次刷新都读取 JSONL 头部来发现 rollout_id。
     // 只有新增、追加、截断或替换的文件才进入 discover_rollout/增量解析。
-    if unchanged_cursor_matches(transaction, path, metadata.len(), file_modified_at_ms)? {
+    if !upgrading
+        && unchanged_cursor_matches(transaction, path, metadata.len(), file_modified_at_ms)?
+    {
         return Ok(FileRefreshResult {
             events_added: 0,
             events_skipped: 0,
@@ -1941,11 +1998,10 @@ fn refresh_file(
             warnings: vec![],
         });
     }
-    let discovered = match discovered {
-        Some(discovered) => Some(discovered),
-        None => discover_rollout(path)?,
-    };
-    let Some(discovered) = discovered else {
+    let Some(discovered) = discover_rollout(path)? else {
+        if upgrading {
+            return Err("会话文件缺少有效 session_meta.id。".into());
+        }
         return Ok(FileRefreshResult {
             events_added: 0,
             events_skipped: 0,
@@ -1959,7 +2015,11 @@ fn refresh_file(
     };
     let rollout_id = discovered.rollout_id.clone();
 
-    let cursor = load_cursor(transaction, &rollout_id)?;
+    let cursor = if upgrading {
+        None
+    } else {
+        load_cursor(transaction, &rollout_id)?
+    };
     let mut rebuild_rollout = discovered.is_subagent
         && discovered.boundary_marker_required
         && cursor
@@ -2049,6 +2109,9 @@ fn refresh_file(
             break;
         }
         if !line.complete {
+            if upgrading {
+                return Err("会话日志末行尚未写完。".into());
+            }
             partial_lines += 1;
             break;
         }
@@ -2060,6 +2123,9 @@ fn refresh_file(
             continue;
         }
         if line.truncated || trimmed.len() > MAX_RECORD_LINE_BYTES {
+            if upgrading {
+                return Err("会话日志行超过 8 MB。".into());
+            }
             events_skipped += 1;
             warnings.push(UsageWarning {
                 path: Some(path.display().to_string()),
@@ -2075,33 +2141,27 @@ fn refresh_file(
                 events_skipped += 1;
                 inherited_events_skipped += 1;
             }
-            Ok(LineResult::Warning(message)) => {
+            Ok(LineResult::Warning(message)) | Err(message) => {
+                if upgrading {
+                    return Err(message.into());
+                }
                 events_skipped += 1;
                 warnings.push(UsageWarning {
                     path: Some(path.display().to_string()),
                     message,
                 });
             }
-            Err(error) => {
-                events_skipped += 1;
-                warnings.push(UsageWarning {
-                    path: Some(path.display().to_string()),
-                    message: error,
-                });
-            }
         }
     }
 
-    let savepoint = transaction
-        .savepoint()
-        .map_err(|error| format!("开始保存本机用量事务失败：{error}"))?;
-    if rebuild_rollout {
-        savepoint
-            .execute(
-                "DELETE FROM usage_events WHERE rollout_id = ?1",
-                params![rollout_id],
-            )
-            .map_err(|error| format!("重建会话用量失败：{error}"))?;
+    let savepoint = transaction.savepoint()?;
+    if upgrading {
+        clear_upgrading_rollout(&savepoint, path, &discovered, collection_epoch)?;
+    } else if rebuild_rollout {
+        savepoint.execute(
+            "DELETE FROM usage_events WHERE rollout_id = ?1",
+            params![rollout_id],
+        )?;
     }
     let mut events_added = 0;
     for event in events {
@@ -2121,32 +2181,28 @@ fn refresh_file(
             events_added += 1;
         }
     }
-    savepoint
-        .execute(
-            UPSERT_USAGE_CURSOR_SQL,
-            params![
-                rollout_id,
-                path.display().to_string(),
-                i64::try_from(current_offset).map_err(|_| "会话文件游标超过数据库范围。")?,
-                i64::try_from(state.next_event_ordinal)
-                    .map_err(|_| "Token 事件序号超过数据库范围。")?,
-                state.model,
-                state.model_provider,
-                i64::from(usage_boundary_passed(state.usage_boundary)),
-                usage_boundary_code(state.usage_boundary),
-                subagent_boundary_mode(&discovered),
-                i64::try_from(metadata.len()).map_err(|_| "会话文件大小超过数据库范围。")?,
-                file_modified_at_ms,
-                prefix_hasher.finalize_hex(),
-                now_utc_ms,
-                serde_json::to_string(&state.last_cumulative_usage)
-                    .map_err(|error| format!("保存累计 Token 基线失败：{error}"))?,
-            ],
-        )
-        .map_err(|error| format!("保存本机用量游标失败：{error}"))?;
-    savepoint
-        .commit()
-        .map_err(|error| format!("提交本机用量事务失败：{error}"))?;
+    savepoint.execute(
+        UPSERT_USAGE_CURSOR_SQL,
+        params![
+            rollout_id,
+            path.display().to_string(),
+            i64::try_from(current_offset).map_err(|_| "会话文件游标超过数据库范围。")?,
+            i64::try_from(state.next_event_ordinal)
+                .map_err(|_| "Token 事件序号超过数据库范围。")?,
+            state.model,
+            state.model_provider,
+            i64::from(usage_boundary_passed(state.usage_boundary)),
+            usage_boundary_code(state.usage_boundary),
+            subagent_boundary_mode(&discovered),
+            i64::try_from(metadata.len()).map_err(|_| "会话文件大小超过数据库范围。")?,
+            file_modified_at_ms,
+            prefix_hasher.finalize_hex(),
+            now_utc_ms,
+            serde_json::to_string(&state.last_cumulative_usage)
+                .map_err(|error| format!("保存累计 Token 基线失败：{error}"))?,
+        ],
+    )?;
+    savepoint.commit()?;
 
     if inherited_events_skipped > 0
         && matches!(
@@ -2247,10 +2303,10 @@ fn committed_prefix_matches(
         if trimmed.is_empty() || line.truncated || trimmed.len() > MAX_RECORD_LINE_BYTES {
             continue;
         }
-        if let Ok(LineResult::Event(event)) = parse_line(trimmed, &mut state)
-            && event.occurred_at_ms >= collection_epoch
-        {
-            expected_events.push((event.ordinal, event_id(&discovered.rollout_id, &event)));
+        if let Ok(LineResult::Event(event)) = parse_line(trimmed, &mut state) {
+            if event.occurred_at_ms >= collection_epoch {
+                expected_events.push((event.ordinal, event_id(&discovered.rollout_id, &event)));
+            }
         }
     }
 
@@ -2789,7 +2845,7 @@ fn insert_event(
     activations: &[ActivationSnapshot],
     pricing_rules: &[PricingRuleRecord],
     official_catalog: Option<&OfficialPricingCatalog>,
-) -> Result<bool, String> {
+) -> Result<bool, FileRefreshError> {
     let event_id = event_id(rollout_id, event);
     let usage_quality = match (event.quality, event.model_provider.is_none()) {
         (crate::usage_log::UsageQuality::Complete, true) => "compatible_fallback",
@@ -2896,9 +2952,8 @@ fn insert_event(
     } else if !matches!(event.quality, crate::usage_log::UsageQuality::Complete) {
         cost_status = "partial";
     }
-    let affected = connection
-        .execute(
-            "INSERT OR IGNORE INTO usage_events(
+    let affected = connection.execute(
+        "INSERT OR IGNORE INTO usage_events(
                 event_id, rollout_id, event_ordinal, occurred_at_ms, model,
                 model_provider, source_kind, provider_id, account_id, source_name,
                 input_tokens, cached_input_tokens, cache_write_input_tokens,
@@ -2908,33 +2963,32 @@ fn insert_event(
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                        ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                        ?18, ?19, ?20, ?21, ?22, ?23)",
-            params![
-                event_id,
-                rollout_id,
-                i64::try_from(event.ordinal).map_err(|_| "Token 事件序号超过数据库范围。")?,
-                event.occurred_at_ms,
-                event.model,
-                event.model_provider,
-                source_kind,
-                provider_id,
-                account_id,
-                source_name,
-                u64_db(event.usage.input_tokens)?,
-                u64_db(event.usage.cached_input_tokens)?,
-                u64_db(event.usage.cache_write_input_tokens)?,
-                u64_db(event.usage.output_tokens)?,
-                u64_db(event.usage.reasoning_output_tokens)?,
-                u64_db(event.usage.total_tokens)?,
-                usage_quality,
-                pricing_rule_id,
-                pricing_rule_version,
-                pricing_rule_name,
-                estimated_cost,
-                cost_status,
-                created_at_ms,
-            ],
-        )
-        .map_err(|error| format!("保存本机 Token 事件失败：{error}"))?;
+        params![
+            event_id,
+            rollout_id,
+            i64::try_from(event.ordinal).map_err(|_| "Token 事件序号超过数据库范围。")?,
+            event.occurred_at_ms,
+            event.model,
+            event.model_provider,
+            source_kind,
+            provider_id,
+            account_id,
+            source_name,
+            u64_db(event.usage.input_tokens)?,
+            u64_db(event.usage.cached_input_tokens)?,
+            u64_db(event.usage.cache_write_input_tokens)?,
+            u64_db(event.usage.output_tokens)?,
+            u64_db(event.usage.reasoning_output_tokens)?,
+            u64_db(event.usage.total_tokens)?,
+            usage_quality,
+            pricing_rule_id,
+            pricing_rule_version,
+            pricing_rule_name,
+            estimated_cost,
+            cost_status,
+            created_at_ms,
+        ],
+    )?;
     Ok(affected > 0)
 }
 
@@ -4051,8 +4105,133 @@ mod tests {
         )
         .unwrap();
         ledger
-            .save_official_pricing_catalog(&catalog, 20260801)
+            .sync_official_pricing_catalog(Some(catalog), 20260801)
             .unwrap();
+    }
+
+    #[test]
+    fn pricing_failure_rolls_back_catalog_and_not_modified_repairs_legacy_costs_once() {
+        let (temp, ledger) = estimate_test_ledger();
+        ledger.refresh(&temp.path().join("home"), 1000).unwrap();
+        insert_estimate_event(&ledger, 1, 1100, "account", "estimated", Some(1));
+        let document = "### Standard pricing data\n| Model | Input | Output |\n| --- | --- | --- |\n| gpt-5.6 | $1 | $4 |";
+        let first = build_catalog(document, 1200, Some("v1".into()), None).unwrap();
+        let next =
+            build_catalog(&document.replace("$4", "$7"), 1300, Some("v2".into()), None).unwrap();
+        let db = ledger.open_connection().unwrap();
+        let cost = || {
+            db.query_row(
+                "SELECT estimated_cost_microusd FROM usage_events",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let fail = "CREATE TRIGGER fail_price BEFORE UPDATE ON usage_events BEGIN SELECT RAISE(ABORT,'injected pricing error'); END";
+        ledger
+            .sync_official_pricing_catalog(Some(first), 1200)
+            .unwrap();
+        assert_eq!(cost(), 5);
+        db.execute_batch(fail).unwrap();
+        assert!(
+            ledger
+                .sync_official_pricing_catalog(Some(next.clone()), 1300)
+                .is_err()
+        );
+        assert_eq!(
+            ledger
+                .official_pricing_catalog()
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(cost(), 5);
+        db.execute_batch("DROP TRIGGER fail_price").unwrap();
+        ledger
+            .sync_official_pricing_catalog(Some(next), 1400)
+            .unwrap();
+        assert_eq!(cost(), 8);
+        // Earlier releases could mark a version complete before a racing scan inserted old costs.
+        db.execute_batch("UPDATE usage_metadata SET value='1300' WHERE key='official_pricing_repriced_version'; UPDATE usage_events SET estimated_cost_microusd=5").unwrap();
+        drop(ledger);
+        let reopened = UsageLedger::open(&temp.path().join("app")).unwrap();
+        assert!(
+            reopened
+                .sync_official_pricing_catalog(None, 1500)
+                .unwrap()
+                .1
+        );
+        assert_eq!(cost(), 8);
+        db.execute_batch(fail).unwrap();
+        assert!(
+            !reopened
+                .sync_official_pricing_catalog(None, 1600)
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
+    fn scan_waits_for_pricing_commit_before_reading_rates() {
+        let (temp, ledger) = estimate_test_ledger();
+        let home = temp.path().join("home");
+        let now = 1_785_580_000_000;
+        ledger.refresh(&home, now - 2_000_000).unwrap();
+        let document = "### Standard pricing data\n| Model | Input | Cached input | Output |\n| --- | --- | --- | --- |\n| gpt-5.6-sol | $1 | $1 | $1 |";
+        let old = build_catalog(document, now - 1, None, None).unwrap();
+        ledger
+            .sync_official_pricing_catalog(Some(old), now)
+            .unwrap();
+        write_rollout(&home, &format!("{}{}", rollout_prefix(), rollout_event()));
+        let new = build_catalog(&document.replace("$1", "$2"), now, None, None).unwrap();
+        let mut writer = ledger.open_connection().unwrap();
+        let reader = ledger.open_connection().unwrap();
+        let tx = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (committed_tx, committed_rx) = mpsc::channel();
+        let scan = thread::spawn(move || {
+            // SQLite calls this only when the scan actually reaches the competing writer.
+            thread_local! {
+                static WRITER: std::cell::OnceCell<(mpsc::Sender<()>, mpsc::Receiver<()>)> = const { std::cell::OnceCell::new() };
+            }
+            WRITER.with(|writer| writer.set((waiting_tx, committed_rx)).unwrap());
+            reader
+                .busy_handler(Some(|attempt| {
+                    attempt == 0
+                        && WRITER.with(|writer| {
+                            let (waiting, committed) = writer.get().unwrap();
+                            waiting.send(()).is_ok()
+                                && committed.recv_timeout(Duration::from_secs(5)).is_ok()
+                        })
+                }))
+                .unwrap();
+            UsageLedger::scan_usage(reader, &home, now, std::time::Instant::now())
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        UsageLedger::sync_pricing_transaction(tx, Some(new), now).unwrap();
+        committed_tx.send(()).unwrap();
+        assert_eq!(scan.join().unwrap().unwrap().events_added, 1);
+        let recorded = || {
+            writer
+                .query_row(
+                    "SELECT pricing_rule_version, estimated_cost_microusd FROM usage_events",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(recorded(), (now, 216));
+        assert!(
+            !ledger
+                .sync_official_pricing_catalog(None, now + 1)
+                .unwrap()
+                .1
+        );
+        assert_eq!(recorded(), (now, 216));
     }
 
     #[test]
@@ -4074,9 +4253,15 @@ mod tests {
         )
         .unwrap();
 
-        assert!(ledger.save_official_pricing_catalog(&catalog_a, 1).unwrap());
-        assert!(ledger.save_official_pricing_catalog(&catalog_b, 2).unwrap());
-        assert!(!ledger.save_official_pricing_catalog(&catalog_a, 3).unwrap());
+        ledger
+            .sync_official_pricing_catalog(Some(catalog_a.clone()), 1)
+            .unwrap();
+        ledger
+            .sync_official_pricing_catalog(Some(catalog_b), 2)
+            .unwrap();
+        ledger
+            .sync_official_pricing_catalog(Some(catalog_a.clone()), 3)
+            .unwrap();
 
         let connection = ledger.open_connection().unwrap();
         let active: Vec<i64> = connection
@@ -4727,6 +4912,101 @@ mod tests {
                 .as_deref(),
             Some(super::PARSER_VERSION)
         );
+    }
+
+    #[test]
+    fn parser_upgrade_rolls_back_only_the_file_with_an_overflowing_event() {
+        let (temp, ledger) = estimate_test_ledger();
+        let home = temp.path().join("codex");
+        let start = 1_754_121_000_000;
+        ledger.refresh(&home, start).unwrap();
+        let log = format!("{}{}", rollout_prefix(), rollout_event());
+        let broken = write_rollout(&home, &log);
+        ledger.refresh(&home, start + 1).unwrap();
+        let db = ledger.open_connection().unwrap();
+        let cursor = || {
+            db.query_row("SELECT byte_offset, prefix_sha256 FROM usage_cursors WHERE rollout_id='rollout-ledger'", [],
+            |row| Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?))).unwrap()
+        };
+        let original = cursor();
+        db.execute(
+            "UPDATE usage_metadata SET value='5' WHERE key='usage_parser_version'",
+            [],
+        )
+        .unwrap();
+        fs::write(
+            &broken,
+            format!(
+                "{}{}",
+                log,
+                rollout_event_later().replace(
+                    "\"input_tokens\":100",
+                    "\"input_tokens\":9223372036854775808"
+                )
+            ),
+        )
+        .unwrap();
+        fs::write(
+            broken.with_file_name("rollout-healthy.jsonl"),
+            log.replace("rollout-ledger", "healthy"),
+        )
+        .unwrap();
+        let result = ledger.refresh(&home, start + 2).unwrap();
+        assert_eq!(result.events_added, 1);
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].message.contains("SQLite"));
+        assert_eq!(cursor(), original);
+        assert_eq!(query(&ledger).totals.requests, 2);
+        let reopened = UsageLedger::open(&temp.path().join("app")).unwrap();
+        assert_eq!(reopened.refresh(&home, start + 3).unwrap().events_added, 0);
+        fs::write(&broken, format!("{log}{}", rollout_event_later())).unwrap();
+        let repaired = reopened.refresh(&home, start + 4).unwrap();
+        assert!(repaired.warnings.is_empty());
+        assert_eq!(repaired.events_added, 2);
+        assert_eq!(query(&reopened).totals.requests, 3);
+        assert_eq!(reopened.refresh(&home, start + 5).unwrap().events_added, 0);
+    }
+
+    #[test]
+    fn parser_upgrade_isolates_unidentified_log_and_replays_it_once_after_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let root = temp.path().join("app");
+        let ledger = UsageLedger::open(&root).unwrap();
+        let start = 1_754_121_000_000;
+        ledger.refresh(&home, start).unwrap();
+        let log = format!("{}{}", rollout_prefix(), rollout_event());
+        let broken = write_rollout(&home, &log);
+        ledger.refresh(&home, start + 1).unwrap();
+        let before = query(&ledger).totals.tokens.total_tokens;
+        assert!(before > 0);
+        let connection = ledger.open_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE usage_metadata SET value='5' WHERE key='usage_parser_version'",
+                [],
+            )
+            .unwrap();
+        fs::write(&broken, "invalid header\n").unwrap();
+        let healthy = broken.with_file_name("rollout-healthy.jsonl");
+        fs::write(&healthy, log.replace("rollout-ledger", "healthy")).unwrap();
+        let result = ledger.refresh(&home, start + 2).unwrap();
+        assert_eq!(result.events_added, 1);
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(
+            result.warnings[0].path.as_deref().map(std::path::Path::new),
+            Some(broken.as_path())
+        );
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 2 * before);
+        drop(ledger);
+        let ledger = UsageLedger::open(&root).unwrap();
+        assert_eq!(ledger.refresh(&home, start + 3).unwrap().events_added, 0);
+        fs::write(&broken, &log).unwrap();
+        let repaired = ledger.refresh(&home, start + 4).unwrap();
+        assert_eq!(repaired.events_added, 1);
+        assert!(repaired.warnings.is_empty());
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 2 * before);
+        assert_eq!(ledger.refresh(&home, start + 5).unwrap().events_added, 0);
     }
 
     #[test]

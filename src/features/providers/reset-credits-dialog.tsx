@@ -43,6 +43,8 @@ import type {
   ResetCreditDetails,
 } from "@/types"
 
+import { resetCreditFailure } from "./reset-credits"
+
 type CachedDetails = { revision: number | null; details: ResetCreditDetails }
 const detailCache = new Map<string, CachedDetails>()
 const detailInflight = new Map<string, Promise<ResetCreditDetails>>()
@@ -185,9 +187,10 @@ export function ResetCreditsDialog({
       onChanged()
       restoreFocus()
     } catch (reason) {
-      unknownOperations.add(key)
+      const failure = resetCreditFailure(reason)
+      if (failure.unknown) unknownOperations.add(key)
       setConfirming(undefined)
-      setResultMessage(`${errorMessage(reason)} 结果可能未知，未自动重试。`)
+      setResultMessage(failure.message)
       restoreFocus()
     } finally {
       usingRef.current = false

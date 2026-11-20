@@ -8,18 +8,37 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Mutex, RwLock, RwLockReadGuard},
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard},
 };
+
+#[cfg(any(target_os = "macos", test))]
+mod rollout_exchange;
 
 const MAX_SAVED_PROVIDERS: usize = 500;
 pub(crate) const MAX_SAVED_OPENAI_ACCOUNTS: usize = 500;
-const MAX_EMAIL_CHARS: usize = 320;
+pub(crate) const MAX_EMAIL_CHARS: usize = 320;
 const STATE_TRANSACTION_FILE: &str = "state-transaction.json";
 const COMPLETED_STATE_TRANSACTION_FILE: &str = ".state-transaction.completed";
+const PENDING_OFFICIAL_IMPORT_FILE: &str = "pending-official-import.json";
 const STATE_TRANSACTION_VERSION: u32 = 1;
 const MAX_STATE_TRANSACTION_BYTES: u64 = 129 * 1024 * 1024;
 #[cfg(test)]
-const MAX_APP_DATA_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_APP_DATA_BYTES: u64 = crate::json_store::MAX_JSON_BYTES;
+
+pub(crate) fn codex_rollout_walks(home: &Path) -> impl Iterator<Item = walkdir::WalkDir> {
+    let mut seen = BTreeSet::new();
+    ["sessions", "archived_sessions"]
+        .into_iter()
+        .filter_map(move |name| {
+            let path = home.join(name);
+            let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
+            seen.insert(identity).then(|| {
+                walkdir::WalkDir::new(path)
+                    .follow_root_links(true)
+                    .follow_links(false)
+            })
+        })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +47,21 @@ struct AppFile {
     codex: CodexPreferences,
     #[serde(default)]
     active: ActiveState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied_official_import: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    unconfirmed_official_refreshes: BTreeMap<String, String>,
+}
+
+impl From<&AppConfig> for AppFile {
+    fn from(state: &AppConfig) -> Self {
+        Self {
+            codex: state.codex.clone(),
+            active: state.active.clone(),
+            applied_official_import: state.applied_official_import.clone(),
+            unconfirmed_official_refreshes: state.unconfirmed_official_refreshes.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -60,14 +94,63 @@ struct StateTransaction {
     deletion_tombstones: DeletionTombstones,
 }
 
+#[derive(Clone)]
 pub struct Store {
     root: PathBuf,
     path: PathBuf,
     connections_path: PathBuf,
     credentials_path: PathBuf,
     tombstones_path: PathBuf,
-    state: RwLock<AppConfig>,
-    persist_mutex: Mutex<()>,
+    // The blocking session-repair worker shares the same state and write lock.
+    state: Arc<RwLock<AppConfig>>,
+    persist_mutex: Arc<Mutex<()>>,
+    pending_official_import: Arc<Mutex<Option<PendingOfficialImport>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingOfficialImport {
+    #[serde(flatten)]
+    account: StoredOfficialAccount,
+    // A missing ID in memory means receipt publication failed. A legacy
+    // receipt read from disk gets a stable ID before it is replayed.
+    #[serde(default)]
+    receipt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refreshed_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_fingerprint: Option<String>,
+}
+
+impl PendingOfficialImport {
+    fn save_in_state(
+        &self,
+        state: &mut AppConfig,
+        account: StoredOfficialAccount,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        if let Some(id) = self.refreshed_account_id.as_deref() {
+            return save_refreshed_official_account_in_state(state, id, account);
+        }
+        let records = save_official_accounts_in_state(state, vec![account])?;
+        Ok(records.into_iter().next().expect("one account saved"))
+    }
+
+    fn clear_attempt(&self, state: &mut AppConfig) -> bool {
+        if let Some(fingerprint) = self.import_fingerprint.as_deref() {
+            return state
+                .unconfirmed_official_refreshes
+                .remove(&import_refresh_key(fingerprint))
+                .is_some();
+        }
+        self.refreshed_account_id
+            .as_ref()
+            .is_some_and(|id| state.unconfirmed_official_refreshes.remove(id).is_some())
+    }
+}
+
+pub(crate) enum RotatedOfficialImportError {
+    Invalid(AppError),
+    Pending { on_disk: bool },
 }
 
 /// 标识一次 `/models` 请求所对应的服务源。包含会改变请求目标、鉴权、
@@ -118,12 +201,14 @@ impl Store {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
         fs::create_dir_all(&root)?;
         secure_directory(&root)?;
-        recover_state_transaction(&root)?;
         let path = root.join("app.json");
         let connections_path = root.join("connections.json");
         let credentials_path = root.join("credentials.json");
         let tombstones_path = root.join("deletion_tombstones.json");
-        let mut state = load_state_files(&root)?;
+        let mut state = match recover_state_transaction(&root)? {
+            Some(recovered) => recovered,
+            None => load_state_files(&root)?,
+        };
         let mut requires_persist = false;
         // 当前目录可能被旧版重写过 connections.json；先清理已被墓碑覆盖的连接，
         // 并修正因此产生的悬空 active 选择。
@@ -163,15 +248,36 @@ impl Store {
                 JsonStore::ensure_object(&root.join(name))?;
             }
         }
-        Ok(Self {
+        let mut pending: Option<PendingOfficialImport> =
+            JsonStore::read_or_default(&root.join(PENDING_OFFICIAL_IMPORT_FILE), || None)
+                .map_err(|_| anyhow::anyhow!("无法读取待保存的 OpenAI 登录凭据。"))?;
+        if let Some(receipt) = pending
+            .as_mut()
+            .filter(|receipt| receipt.receipt_id.is_none())
+        {
+            use sha2::{Digest, Sha256};
+
+            let bytes = serde_json::to_vec(&receipt.account)?;
+            receipt.receipt_id = Some(format!("legacy-{:x}", Sha256::digest(bytes)));
+        }
+        let store = Self {
             root,
             path,
             connections_path,
             credentials_path,
             tombstones_path,
-            state: RwLock::new(state),
-            persist_mutex: Mutex::new(()),
-        })
+            state: Arc::new(RwLock::new(state)),
+            persist_mutex: Arc::new(Mutex::new(())),
+            pending_official_import: Arc::new(Mutex::new(pending)),
+        };
+        // The main journal was already recovered above and this Store is
+        // still private to the caller creating it.
+        let mut pending = store.lock_pending_official_import()?;
+        if let Err(error) = store.commit_pending_official_import(&mut pending) {
+            tracing::warn!(%error, "待保存的 OpenAI 登录凭据尚未恢复");
+        }
+        drop(pending);
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {
@@ -188,11 +294,136 @@ impl Store {
             .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))
     }
 
-    fn current_state_for_update(&self) -> Result<AppConfig, AppError> {
-        self.state
-            .read()
-            .map(|state| state.clone())
+    fn lock_for_update(&self) -> Result<MutexGuard<'_, ()>, AppError> {
+        self.persist_mutex
+            .lock()
             .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))
+    }
+
+    fn recover_state_to_memory(&self) -> Result<(), AppError> {
+        // Called under persist_mutex. Publish a replay even if the next edit is
+        // rejected or turns out to be a no-op.
+        if let Some(recovered) = recover_state_transaction(&self.root)? {
+            *self.state.write().map_err(|_| {
+                AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into())
+            })? = recovered;
+        }
+        Ok(())
+    }
+
+    fn recover_before_update(&self) -> Result<(), AppError> {
+        self.recover_state_to_memory()?;
+        let mut pending = self.lock_pending_official_import()?;
+        self.commit_pending_official_import(&mut pending)
+    }
+
+    fn lock_pending_official_import(
+        &self,
+    ) -> Result<MutexGuard<'_, Option<PendingOfficialImport>>, AppError> {
+        self.pending_official_import
+            .lock()
+            .map_err(|_| AppError::Internal("暂时无法读取待保存的 OpenAI 登录凭据。".into()))
+    }
+
+    pub(crate) fn retry_pending_official_import(&self) -> Result<(), AppError> {
+        let _transaction = self.lock_for_update()?;
+        self.recover_before_update()
+    }
+
+    fn commit_pending_official_import(
+        &self,
+        pending: &mut Option<PendingOfficialImport>,
+    ) -> Result<(), AppError> {
+        let Some(receipt) = pending.as_ref() else {
+            return Ok(());
+        };
+        let receipt_id = receipt.receipt_id.as_ref();
+        let applied = receipt_id.is_some()
+            && self.read(|state| state.applied_official_import.as_ref() == receipt_id)?;
+        if !applied {
+            let mut account = receipt.account.clone();
+            normalize_official_account(&mut account)?;
+            self.commit_update(|state| {
+                // Replaying the main journal may already have saved these credentials.
+                let already_saved = state.official_accounts.iter().any(|saved| {
+                    saved.credential == account.credential
+                        && official_account_identity_matches(saved, &account)
+                        && receipt
+                            .refreshed_account_id
+                            .as_ref()
+                            .is_none_or(|id| id == &saved.id)
+                });
+                if !already_saved {
+                    receipt.save_in_state(state, account)?;
+                }
+                let attempt_cleared = receipt.clear_attempt(state);
+                // Commit the receipt ID with the account so a leftover file cannot
+                // overwrite newer credentials or bring back a deleted account.
+                if let Some(id) = receipt_id {
+                    state.applied_official_import = Some(id.clone());
+                }
+                Ok((
+                    (),
+                    !already_saved || attempt_cleared || receipt_id.is_some(),
+                ))
+            })?;
+        }
+        self.clear_pending_official_import(pending);
+        Ok(())
+    }
+
+    fn clear_pending_official_import(&self, pending: &mut Option<PendingOfficialImport>) {
+        if pending
+            .take()
+            .is_some_and(|receipt| receipt.receipt_id.is_some())
+        {
+            let path = self.root.join(PENDING_OFFICIAL_IMPORT_FILE);
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    let _ = sync_parent_directory(&path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(%error, "已保存的 OpenAI 登录凭据暂存文件未能清理"),
+            }
+        }
+    }
+
+    fn remove_connection(
+        &self,
+        remove: impl FnOnce(&mut AppConfig) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        let _transaction = self.lock_for_update()?;
+        self.recover_state_to_memory()?;
+        let mut pending = self.lock_pending_official_import()?;
+        let discarded = self.commit_update(|state| {
+            let pending_account_exists = |state: &AppConfig| {
+                pending.as_ref().is_some_and(|receipt| {
+                    state
+                        .official_accounts
+                        .iter()
+                        .any(|saved| official_account_identity_matches(saved, &receipt.account))
+                })
+            };
+            let was_present = pending_account_exists(state);
+            remove(state)?;
+            let discarded = was_present && !pending_account_exists(state);
+            if let Some(receipt) = pending.as_ref().filter(|_| discarded) {
+                receipt.clear_attempt(state);
+                if let Some(id) = &receipt.receipt_id {
+                    // A user's deletion takes precedence over recovery for this identity.
+                    state.applied_official_import = Some(id.clone());
+                }
+            }
+            Ok((discarded, true))
+        })?;
+        if discarded {
+            self.clear_pending_official_import(&mut pending);
+        } else if let Err(error) = self.commit_pending_official_import(&mut pending) {
+            // Freeing space has already committed. A receipt that still cannot
+            // fit must remain available while the user deletes more entries.
+            tracing::warn!(%error, "已删除连接，待保存的 OpenAI 登录凭据尚未恢复");
+        }
+        Ok(())
     }
 
     pub(crate) fn read<T>(&self, project: impl FnOnce(&AppConfig) -> T) -> Result<T, AppError> {
@@ -238,10 +469,12 @@ impl Store {
     }
 
     pub fn save_last_managed_model(&self, model: Option<String>) -> Result<(), AppError> {
-        self.update(|state| {
-            state.codex.last_managed_model = model;
-            Ok(())
+        self.update_app_file(|_, app| {
+            let changed = app.codex.last_managed_model != model;
+            app.codex.last_managed_model = model;
+            Ok(changed)
         })
+        .map(|_| ())
     }
 
     pub fn is_active_provider(&self, id: &str) -> Result<bool, AppError> {
@@ -250,22 +483,97 @@ impl Store {
             && state.active.provider_id.as_deref() == Some(id))
     }
 
+    pub(crate) fn confirm_chat_route(
+        &self,
+        provider_id: &str,
+        binding: Option<String>,
+    ) -> Result<(), AppError> {
+        self.update_app_file(|_, app| {
+            if !matches!(app.active.kind, ActiveKind::Provider)
+                || app.active.provider_id.as_deref() != Some(provider_id)
+            {
+                return Err(AppError::StaleOperation);
+            }
+            let binding = binding.map_or(ChatRouteBinding::Legacy, ChatRouteBinding::Confirmed);
+            let changed = app.active.chat_route_binding != binding;
+            app.active.chat_route_binding = binding;
+            Ok(changed)
+        })
+        .map(|_| ())
+    }
+
+    fn update_app_file(
+        &self,
+        update: impl FnOnce(&AppConfig, &mut AppFile) -> Result<bool, AppError>,
+    ) -> Result<FilePublication, AppError> {
+        let _transaction = self.lock_for_update()?;
+        self.recover_before_update()?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
+        let mut app = AppFile::from(&*state);
+        if !update(&state, &mut app)? {
+            return Ok(FilePublication::Synced);
+        }
+        let bytes = JsonStore::encode(&self.path, &app)?;
+        // These changes accompany other files on disk. Publish app.json
+        // directly so an aborted write cannot be replayed after file rollback.
+        let publication = publish_temporary(&write_temporary(&self.path, &bytes)?, &self.path)?;
+        state.codex = app.codex;
+        state.active = app.active;
+        state.applied_official_import = app.applied_official_import;
+        state.unconfirmed_official_refreshes = app.unconfirmed_official_refreshes;
+        publication.warn_if_unsynced(&self.path);
+        Ok(publication)
+    }
+
+    pub(crate) fn active_provider_and_home(
+        &self,
+    ) -> Result<(PathBuf, Option<ProviderProfile>), AppError> {
+        self.read(|state| {
+            let provider = state
+                .active
+                .provider_id
+                .as_deref()
+                .filter(|_| matches!(state.active.kind, ActiveKind::Provider))
+                .and_then(|id| state.providers.iter().find(|p| p.id == id))
+                .cloned();
+            (crate::codex::home(&state.codex.home), provider)
+        })
+    }
+
     pub fn update<T>(
         &self,
         mutate: impl FnOnce(&mut AppConfig) -> Result<T, AppError>,
     ) -> Result<T, AppError> {
+        self.update_if_changed(|state| mutate(state).map(|result| (result, true)))
+    }
+
+    fn update_if_changed<T>(
+        &self,
+        mutate: impl FnOnce(&mut AppConfig) -> Result<(T, bool), AppError>,
+    ) -> Result<T, AppError> {
         // 串行化“候选状态 -> 落盘 -> 内存提交”的整个事务，避免并发更新
         // 从同一旧快照出发。落盘失败时不更换内存状态，调用方收到错误后
         // 仍能看到与持久化前一致的状态。
-        let _transaction = self
-            .persist_mutex
-            .lock()
-            .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
+        let _transaction = self.lock_for_update()?;
 
         // 候选状态上的变更和 fsync 都不持有状态写锁，读操作在提交前
         // 继续看到稳定的旧状态。
-        let mut draft = self.current_state_for_update()?;
-        let result = mutate(&mut draft)?;
+        self.recover_before_update()?;
+        self.commit_update(mutate)
+    }
+
+    fn commit_update<T>(
+        &self,
+        mutate: impl FnOnce(&mut AppConfig) -> Result<(T, bool), AppError>,
+    ) -> Result<T, AppError> {
+        let mut draft = self.read_state()?.clone();
+        let (result, changed) = mutate(&mut draft)?;
+        if !changed {
+            return Ok(result);
+        }
         if let Err(error) = persist_files(
             &self.root,
             &self.path,
@@ -345,21 +653,10 @@ impl Store {
                 .find(|value| value.id == provider.id)
                 .cloned();
             let is_new = existing.is_none();
-            if let Some(existing) = existing.as_ref() {
-                preserve_redacted_headers(&mut provider.headers, &existing.headers);
-                // 前端返回的是脱敏后的 api_key（None），保留已保存的 Key。
-                if provider
-                    .api_key
-                    .as_deref()
-                    .is_none_or(|value| value.trim().is_empty())
-                {
-                    provider.api_key = existing.api_key.clone();
-                }
-            }
             // `model` 仅用于兼容旧版 connections.json 的反序列化。模型选择现在
             // 完全由服务 `/models` 返回的 available_models 和 Codex 当前配置决定。
             provider.model.clear();
-            provider.normalize_and_validate()?;
+            provider.validate_with_saved_credentials(existing.as_ref())?;
             let model_source_changed = existing.as_ref().is_none_or(|existing| {
                 existing.name != provider.name
                     || existing.base_url != provider.base_url
@@ -403,10 +700,17 @@ impl Store {
             provider.active = false;
             provider.has_api_key = provider.api_key.is_some();
 
-            if matches!(state.active.kind, ActiveKind::Provider)
-                && state.active.provider_id.as_deref() == Some(provider.id.as_str())
-                && !provider.enabled
+            let is_active = matches!(state.active.kind, ActiveKind::Provider)
+                && state.active.provider_id.as_deref() == Some(provider.id.as_str());
+            if is_active
+                && provider.api_type == ProviderApiType::Chat
+                && state.active.chat_route_binding.is_legacy()
             {
+                // A crash between saving a draft and applying its config must
+                // not make it look like an untouched pre-binding installation.
+                state.active.chat_route_binding = ChatRouteBinding::Pending;
+            }
+            if is_active && !provider.enabled {
                 return Err(AppError::InvalidConfig(
                     "正在使用此服务，切换到其他账号或服务后才能停用。".into(),
                 ));
@@ -432,7 +736,7 @@ impl Store {
     }
 
     pub fn connections_delete_provider(&self, id: &str) -> Result<(), AppError> {
-        self.update(|state| {
+        self.remove_connection(|state| {
             if state.active.provider_id.as_deref() == Some(id) {
                 return Err(AppError::InvalidConfig(
                     "正在使用此服务，切换后才能删除。".into(),
@@ -462,17 +766,18 @@ impl Store {
         windows: BTreeMap<String, u64>,
         meta: BTreeMap<String, ProviderModelsDevMeta>,
     ) -> Result<Option<ProviderSnapshotRevision>, AppError> {
-        self.update(|state| {
+        self.update_if_changed(|state| {
+            let active = matches!(state.active.kind, ActiveKind::Provider)
+                && state.active.provider_id.as_deref() == Some(id);
             let Some(provider) = state.providers.iter_mut().find(|value| value.id == id) else {
-                return Ok(None);
+                return Ok((None, false));
             };
             if ProviderSourceFingerprint::from_provider(provider) != *expected_source {
-                return Ok(None);
+                return Ok((None, false));
             }
-            if expected_revision.is_some_and(|revision| {
-                ProviderSnapshotRevision::from_provider(provider) != *revision
-            }) {
-                return Ok(None);
+            let previous = ProviderSnapshotRevision::from_provider(provider);
+            if expected_revision.is_some_and(|revision| previous != *revision) {
+                return Ok((None, false));
             }
             provider.available_models = models;
             provider.model_context_windows = windows;
@@ -482,10 +787,22 @@ impl Store {
                     provider.available_models.contains(model)
                         || provider.custom_models.contains(model)
                 });
+                // An older refresh may already have saved an empty selection.
+                if active && selected.is_empty() {
+                    let fallback = state
+                        .codex
+                        .last_managed_model
+                        .as_ref()
+                        .filter(|model| provider.available_models.contains(model))
+                        .or_else(|| provider.available_models.first());
+                    selected.extend(fallback.cloned());
+                }
             }
             // 刷新模型列表时顺带清理尚未经过“保存服务”迁移的旧默认模型。
             provider.model.clear();
-            Ok(Some(ProviderSnapshotRevision::from_provider(provider)))
+            let revision = ProviderSnapshotRevision::from_provider(provider);
+            let changed = revision != previous;
+            Ok((Some(revision), changed))
         })
     }
 
@@ -560,18 +877,7 @@ impl Store {
         let official_accounts = state
             .official_accounts
             .iter()
-            .map(|account| {
-                let active = matches!(state.active.kind, ActiveKind::Official)
-                    && state.active.account_id.as_deref() == Some(account.id.as_str());
-                account.view_with_credential_refresh(
-                    active,
-                    state
-                        .credential_refresh
-                        .get(&account.id)
-                        .cloned()
-                        .unwrap_or_default(),
-                )
-            })
+            .map(|account| official_account_view(&state, account))
             .collect();
         Ok(ProviderOverview {
             providers,
@@ -606,6 +912,11 @@ impl Store {
                 kind: ActiveKind::Provider,
                 provider_id: Some(provider_id.to_owned()),
                 account_id: None,
+                chat_route_binding: if provider.api_type == ProviderApiType::Chat {
+                    ChatRouteBinding::Pending
+                } else {
+                    ChatRouteBinding::Legacy
+                },
             };
             Ok(())
         })
@@ -658,16 +969,28 @@ impl Store {
             .iter()
             .find(|account| account.id == id)
             .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))?;
-        let active = matches!(state.active.kind, ActiveKind::Official)
-            && state.active.account_id.as_deref() == Some(account.id.as_str());
-        Ok(account.view_with_credential_refresh(
-            active,
-            state
-                .credential_refresh
-                .get(id)
-                .cloned()
-                .unwrap_or_default(),
-        ))
+        Ok(official_account_view(&state, account))
+    }
+
+    pub(crate) fn saved_account_views(
+        &self,
+        saved: &[StoredOfficialAccount],
+    ) -> Result<Vec<OfficialAccountView>, AppError> {
+        let state = self.read_state()?;
+        let accounts: BTreeMap<_, _> = state
+            .official_accounts
+            .iter()
+            .map(|account| (account.id.as_str(), account))
+            .collect();
+        saved
+            .iter()
+            .map(|record| {
+                let account = accounts.get(record.id.as_str()).ok_or_else(|| {
+                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
+                })?;
+                Ok(official_account_view(&state, account))
+            })
+            .collect()
     }
 
     pub(crate) fn official_accounts_for_maintenance(
@@ -756,6 +1079,92 @@ impl Store {
             .ok_or_else(|| AppError::Internal("OpenAI 账号保存结果为空。".into()))
     }
 
+    pub(crate) fn record_official_refresh_attempt(
+        &self,
+        account: &StoredOfficialAccount,
+    ) -> Result<String, AppError> {
+        let token = &account.credential.tokens.refresh_token;
+        let fingerprint = refresh_fingerprint(token);
+        self.record_refresh_attempt(&account.id, &fingerprint, |state| {
+            if !state.official_accounts.iter().any(|current| {
+                current.id == account.id && current.credential.tokens.refresh_token == *token
+            }) {
+                return Err(AppError::StaleOperation);
+            }
+            Ok(())
+        })?;
+        Ok(fingerprint)
+    }
+
+    pub(crate) fn record_import_refresh_attempt(&self, token: &str) -> Result<String, AppError> {
+        let fingerprint = refresh_fingerprint(token);
+        self.record_refresh_attempt(&import_refresh_key(&fingerprint), &fingerprint, |_| Ok(()))?;
+        Ok(fingerprint)
+    }
+
+    fn record_refresh_attempt(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        verify: impl FnOnce(&AppConfig) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        let publication = self.update_app_file(|state, app| {
+            verify(state)?;
+            if app
+                .unconfirmed_official_refreshes
+                .values()
+                .any(|value| value == fingerprint)
+            {
+                return Err(unconfirmed_official_refresh_error());
+            }
+            app.unconfirmed_official_refreshes
+                .insert(key.to_owned(), fingerprint.to_owned());
+            Ok(true)
+        })?;
+        self.confirm_refresh_attempt(publication, key, fingerprint)
+    }
+
+    fn confirm_refresh_attempt(
+        &self,
+        publication: FilePublication,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<(), AppError> {
+        if let Err(error) = publication.directory_sync() {
+            // The name may be live even though the request has never been sent.
+            if let Err(cleanup) = self.clear_official_refresh_attempt(key, fingerprint) {
+                tracing::warn!(%cleanup, "未发送的 OpenAI 刷新记录未能清理");
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_import_refresh_attempt(&self, fingerprint: &str) -> Result<(), AppError> {
+        self.clear_official_refresh_attempt(&import_refresh_key(fingerprint), fingerprint)
+    }
+
+    pub(crate) fn clear_official_refresh_attempt(
+        &self,
+        id: &str,
+        fingerprint: &str,
+    ) -> Result<(), AppError> {
+        self.update_app_file(|_, app| {
+            if app
+                .unconfirmed_official_refreshes
+                .get(id)
+                .map(String::as_str)
+                != Some(fingerprint)
+            {
+                return Ok(false);
+            }
+            app.unconfirmed_official_refreshes.remove(id);
+            Ok(true)
+        })?
+        .directory_sync()?;
+        Ok(())
+    }
+
     /// Updates credentials obtained by refreshing an existing OpenAI account.
     ///
     /// Account remarks and quota snapshots are edited through separate paths.
@@ -767,30 +1176,20 @@ impl Store {
         id: &str,
         refreshed: &StoredOfficialAccount,
     ) -> Result<StoredOfficialAccount, AppError> {
-        let mut refreshed = refreshed.clone();
-        normalize_official_account(&mut refreshed)?;
-        self.update(|state| {
-            let existing = state
-                .official_accounts
-                .iter_mut()
-                .find(|account| account.id == id)
-                .ok_or_else(|| {
-                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
-                })?;
-            if !official_account_identity_matches(existing, &refreshed) {
-                return Err(AppError::InvalidConfig(
-                    "OpenAI 返回的凭据属于其他账号，请重新进行官方授权。".into(),
-                ));
-            }
-
-            refreshed.id = existing.id.clone();
-            refreshed.remark = existing.remark.clone();
-            refreshed.quota = existing.quota.clone();
-            refreshed.created_at = existing.created_at;
-            refreshed.updated_at = chrono::Utc::now().timestamp();
-            *existing = refreshed.clone();
-            state.credential_refresh.remove(id);
-            Ok(refreshed)
+        self.save_rotated_official_connection(PendingOfficialImport {
+            account: refreshed.clone(),
+            receipt_id: None,
+            refreshed_account_id: Some(id.to_owned()),
+            import_fingerprint: None,
+        })
+        .map_err(|error| match error {
+            RotatedOfficialImportError::Invalid(error) => error,
+            RotatedOfficialImportError::Pending { on_disk: true } => AppError::Internal(
+                "OpenAI 新凭据已暂存。恢复数据目录写入后，刷新账号列表即可补存。".into(),
+            ),
+            RotatedOfficialImportError::Pending { on_disk: false } => AppError::Internal(
+                "OpenAI 新凭据暂存在当前应用。请保持应用打开并恢复数据目录写入。".into(),
+            ),
         })
     }
 
@@ -802,117 +1201,70 @@ impl Store {
         for account in &mut incoming_accounts {
             normalize_official_account(account)?;
         }
-        let now = chrono::Utc::now().timestamp();
+        self.update(move |state| save_official_accounts_in_state(state, incoming_accounts))
+    }
 
-        self.update(move |state| {
-            ensure_official_account_capacity(&state.official_accounts, &incoming_accounts)?;
-            let mut saved_accounts = Vec::with_capacity(incoming_accounts.len());
-            for mut incoming in incoming_accounts {
-                // 相同 canonical 身份的显式登录是主动恢复，即使本地 record id 与
-                // 已删除的历史记录不同，也必须允许其重新出现。
-                state
-                    .deletion_tombstones
-                    .official_account_ids
-                    .remove(&canonical_official_account_id(&incoming));
-                let active_account_id = matches!(state.active.kind, ActiveKind::Official)
-                    .then_some(state.active.account_id.as_deref())
-                    .flatten();
-                let existing_index = state
-                    .official_accounts
-                    .iter()
-                    .position(|saved| {
-                        active_account_id == Some(saved.id.as_str())
-                            && official_account_identity_matches(saved, &incoming)
-                    })
-                    .or_else(|| {
-                        state
-                            .official_accounts
-                            .iter()
-                            .position(|saved| official_account_identity_matches(saved, &incoming))
-                    });
-                if let Some(existing_index) = existing_index {
-                    let existing = &state.official_accounts[existing_index];
-                    incoming.id = existing.id.clone();
-                    incoming.created_at = existing.created_at;
-                    // Remarks have a dedicated update path. Credential refreshes and
-                    // repeated logins must never overwrite a concurrent user edit.
-                    incoming.remark = existing.remark.clone();
-                    // Credential refreshes and repeated device logins must not clear
-                    // the last quota snapshot. Quota has its own dedicated update path.
-                    incoming.quota = existing.quota.clone();
-                    incoming.updated_at = now;
-                    let retained_id = incoming.id.clone();
-                    let duplicate_accounts = state
-                        .official_accounts
-                        .iter()
-                        .filter(|saved| {
-                            saved.id != retained_id
-                                && official_account_identity_matches(saved, &incoming)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    // 已有历史重复项也可能拥有另一份备注、额度或维护状态。保存新凭据时，
-                    // 保留本次传入的凭据，同时以同一套合并规则补全其他字段。
-                    for duplicate in &duplicate_accounts {
-                        incoming = merge_legacy_official_account(&incoming, duplicate);
-                    }
-                    state.official_accounts[existing_index] = incoming.clone();
-                    let duplicate_ids = duplicate_accounts
-                        .iter()
-                        .map(|saved| saved.id.clone())
-                        .collect::<Vec<_>>();
-                    if matches!(state.active.kind, ActiveKind::Official)
-                        && state
-                            .active
-                            .account_id
-                            .as_ref()
-                            .is_some_and(|id| duplicate_ids.contains(id))
-                    {
-                        state.active.account_id = Some(retained_id.clone());
-                    }
-                    state.official_accounts.retain(|saved| {
-                        saved.id == retained_id
-                            || !official_account_identity_matches(saved, &incoming)
-                    });
-                    // 维护状态由本地 id 关联；把重复项的时间线合并到保留 id，
-                    // 既不留下悬挂配置，也不因为去重抹去有效的检查/成功记录。
-                    for duplicate_id in duplicate_ids {
-                        if let Some(duplicate_refresh) =
-                            state.credential_refresh.remove(&duplicate_id)
-                        {
-                            let merged_refresh = state
-                                .credential_refresh
-                                .get(&retained_id)
-                                .map(|saved| {
-                                    merge_credential_refresh_state(saved, &duplicate_refresh)
-                                })
-                                .unwrap_or(duplicate_refresh);
-                            state
-                                .credential_refresh
-                                .insert(retained_id.clone(), merged_refresh);
-                        }
-                    }
-                    saved_accounts.push(incoming);
-                    continue;
-                }
-
-                if incoming.id.trim().is_empty()
-                    || state
-                        .official_accounts
-                        .iter()
-                        .any(|saved| saved.id == incoming.id)
-                {
-                    incoming.id = uuid::Uuid::new_v4().to_string();
-                }
-                if incoming.created_at == 0 {
-                    incoming.created_at = now;
-                }
-                incoming.updated_at = now;
-                state.official_accounts.push(incoming.clone());
-                saved_accounts.push(incoming);
-            }
-            Ok(saved_accounts)
+    pub(crate) fn save_rotated_official_import(
+        &self,
+        account: StoredOfficialAccount,
+        import_fingerprint: Option<String>,
+    ) -> Result<StoredOfficialAccount, RotatedOfficialImportError> {
+        self.save_rotated_official_connection(PendingOfficialImport {
+            account,
+            receipt_id: None,
+            refreshed_account_id: None,
+            import_fingerprint,
         })
+    }
+
+    fn save_rotated_official_connection(
+        &self,
+        mut receipt: PendingOfficialImport,
+    ) -> Result<StoredOfficialAccount, RotatedOfficialImportError> {
+        use RotatedOfficialImportError::{Invalid, Pending};
+
+        normalize_official_account(&mut receipt.account).map_err(Invalid)?;
+        let _transaction = self.lock_for_update().map_err(Invalid)?;
+        let mut pending = self.lock_pending_official_import().map_err(Invalid)?;
+        // The caller checks for a pending receipt before exchanging under the activation lock.
+        if pending.is_some() {
+            return Err(Invalid(AppError::StaleOperation));
+        }
+        let saved = self.recover_state_to_memory().and_then(|()| {
+            self.commit_update(|state| {
+                let saved = receipt.save_in_state(state, receipt.account.clone())?;
+                receipt.clear_attempt(state);
+                Ok((saved, true))
+            })
+        });
+        match saved {
+            Ok(record) => Ok(record),
+            Err(error @ (AppError::InvalidConfig(_) | AppError::StaleOperation))
+                if receipt.refreshed_account_id.is_some() =>
+            {
+                Err(Invalid(error))
+            }
+            Err(error) => {
+                // The main journal may have failed before it was created.
+                // Keep a small, private receipt independently of that journal.
+                let recovery = self.root.join(PENDING_OFFICIAL_IMPORT_FILE);
+                receipt.receipt_id = Some(uuid::Uuid::new_v4().to_string());
+                let publication = JsonStore::encode(&recovery, &receipt)
+                    .and_then(|bytes| write_temporary(&recovery, &bytes))
+                    .and_then(|staged| publish_temporary(&staged, &recovery));
+                let on_disk = publication.is_ok();
+                match publication {
+                    Ok(FilePublication::DirectorySyncFailed(error)) => {
+                        tracing::warn!(%error, "登录凭据已暂存，但目录同步失败")
+                    }
+                    Ok(FilePublication::Synced) => {}
+                    Err(_) => receipt.receipt_id = None,
+                }
+                *pending = Some(receipt);
+                tracing::warn!(%error, on_disk, "已换发的 OpenAI 凭据等待保存");
+                Err(Pending { on_disk })
+            }
+        }
     }
 
     #[cfg(test)]
@@ -933,13 +1285,18 @@ impl Store {
     pub fn ensure_official_account_capacity(
         &self,
         accounts: &[StoredOfficialAccount],
+        unresolved: usize,
     ) -> Result<(), AppError> {
         let mut incoming_accounts = accounts.to_vec();
         for account in &mut incoming_accounts {
             normalize_official_account(account)?;
         }
         self.read(|state| {
-            ensure_official_account_capacity(&state.official_accounts, &incoming_accounts)
+            ensure_official_account_capacity(
+                &state.official_accounts,
+                &incoming_accounts,
+                unresolved,
+            )
         })?
     }
 
@@ -1157,6 +1514,7 @@ impl Store {
                 kind: ActiveKind::Official,
                 provider_id: None,
                 account_id: Some(id.to_owned()),
+                chat_route_binding: ChatRouteBinding::Legacy,
             };
             state.codex.last_managed_model = None;
             Ok(())
@@ -1168,7 +1526,7 @@ impl Store {
     }
 
     pub fn delete_official_accounts(&self, ids: Vec<String>) -> Result<(), AppError> {
-        self.update(|state| {
+        self.remove_connection(|state| {
             let ids = ids.into_iter().collect::<BTreeSet<_>>();
             let deleted_accounts = state
                 .official_accounts
@@ -1227,6 +1585,9 @@ impl Store {
                 .credential_refresh
                 .retain(|id, _| !removed_ids.contains(id));
             state
+                .unconfirmed_official_refreshes
+                .retain(|id, _| !removed_ids.contains(id));
+            state
                 .deletion_tombstones
                 .official_account_ids
                 .extend(deleted_identity_ids);
@@ -1235,9 +1596,188 @@ impl Store {
     }
 }
 
+pub(crate) fn unconfirmed_official_refresh_error() -> AppError {
+    AppError::InvalidConfig("无法确认上一次 OpenAI 更新是否已换发凭据，请重新进行官方授权。".into())
+}
+
+fn refresh_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+fn import_refresh_key(fingerprint: &str) -> String {
+    format!("import:{fingerprint}")
+}
+
+fn save_refreshed_official_account_in_state(
+    state: &mut AppConfig,
+    id: &str,
+    mut refreshed: StoredOfficialAccount,
+) -> Result<StoredOfficialAccount, AppError> {
+    let existing = state
+        .official_accounts
+        .iter_mut()
+        .find(|account| account.id == id)
+        .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))?;
+    if !official_account_identity_matches(existing, &refreshed) {
+        return Err(AppError::InvalidConfig(
+            "OpenAI 返回的凭据属于其他账号，请重新进行官方授权。".into(),
+        ));
+    }
+    refreshed.id = existing.id.clone();
+    refreshed.remark = existing.remark.clone();
+    refreshed.quota = existing.quota.clone();
+    refreshed.created_at = existing.created_at;
+    refreshed.updated_at = chrono::Utc::now().timestamp();
+    *existing = refreshed.clone();
+    state.credential_refresh.remove(id);
+    Ok(refreshed)
+}
+
+fn official_account_view(
+    state: &AppConfig,
+    account: &StoredOfficialAccount,
+) -> OfficialAccountView {
+    let active = matches!(state.active.kind, ActiveKind::Official)
+        && state.active.account_id.as_deref() == Some(account.id.as_str());
+    account.view_with_credential_refresh(
+        active,
+        state
+            .credential_refresh
+            .get(&account.id)
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+fn save_official_accounts_in_state(
+    state: &mut AppConfig,
+    incoming_accounts: Vec<StoredOfficialAccount>,
+) -> Result<Vec<StoredOfficialAccount>, AppError> {
+    let now = chrono::Utc::now().timestamp();
+    ensure_official_account_capacity(&state.official_accounts, &incoming_accounts, 0)?;
+    let mut saved_accounts = Vec::with_capacity(incoming_accounts.len());
+    for mut incoming in incoming_accounts {
+        // 相同 canonical 身份的显式登录是主动恢复，即使本地 record id 与
+        // 已删除的历史记录不同，也必须允许其重新出现。
+        state
+            .deletion_tombstones
+            .official_account_ids
+            .remove(&canonical_official_account_id(&incoming));
+        let active_account_id = matches!(state.active.kind, ActiveKind::Official)
+            .then_some(state.active.account_id.as_deref())
+            .flatten();
+        let existing_index = state
+            .official_accounts
+            .iter()
+            .position(|saved| {
+                active_account_id == Some(saved.id.as_str())
+                    && official_account_identity_matches(saved, &incoming)
+            })
+            .or_else(|| {
+                state
+                    .official_accounts
+                    .iter()
+                    .position(|saved| official_account_identity_matches(saved, &incoming))
+            });
+        if let Some(existing_index) = existing_index {
+            let existing = &state.official_accounts[existing_index];
+            let refresh_token_changed = existing.credential.tokens.refresh_token
+                != incoming.credential.tokens.refresh_token;
+            incoming.id = existing.id.clone();
+            incoming.created_at = existing.created_at;
+            // Remarks have a dedicated update path. Credential refreshes and
+            // repeated logins must never overwrite a concurrent user edit.
+            incoming.remark = existing.remark.clone();
+            // Credential refreshes and repeated device logins must not clear
+            // the last quota snapshot. Quota has its own dedicated update path.
+            incoming.quota = existing.quota.clone();
+            incoming.updated_at = now;
+            let retained_id = incoming.id.clone();
+            let duplicate_accounts = state
+                .official_accounts
+                .iter()
+                .filter(|saved| {
+                    saved.id != retained_id && official_account_identity_matches(saved, &incoming)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            // 已有历史重复项也可能拥有另一份备注、额度或维护状态。保存新凭据时，
+            // 保留本次传入的凭据，同时以同一套合并规则补全其他字段。
+            for duplicate in &duplicate_accounts {
+                incoming = merge_legacy_official_account(&incoming, duplicate);
+            }
+            state.official_accounts[existing_index] = incoming.clone();
+            let duplicate_ids = duplicate_accounts
+                .iter()
+                .map(|saved| saved.id.clone())
+                .collect::<Vec<_>>();
+            if matches!(state.active.kind, ActiveKind::Official)
+                && state
+                    .active
+                    .account_id
+                    .as_ref()
+                    .is_some_and(|id| duplicate_ids.contains(id))
+            {
+                state.active.account_id = Some(retained_id.clone());
+            }
+            state.official_accounts.retain(|saved| {
+                saved.id == retained_id || !official_account_identity_matches(saved, &incoming)
+            });
+            // 维护状态由本地 id 关联；把重复项的时间线合并到保留 id，
+            // 既不留下悬挂配置，也不因为去重抹去有效的检查/成功记录。
+            for duplicate_id in duplicate_ids {
+                state.unconfirmed_official_refreshes.remove(&duplicate_id);
+                if let Some(duplicate_refresh) = state.credential_refresh.remove(&duplicate_id) {
+                    let merged_refresh = state
+                        .credential_refresh
+                        .get(&retained_id)
+                        .map(|saved| merge_credential_refresh_state(saved, &duplicate_refresh))
+                        .unwrap_or(duplicate_refresh);
+                    state
+                        .credential_refresh
+                        .insert(retained_id.clone(), merged_refresh);
+                }
+            }
+            if refresh_token_changed
+                && state
+                    .unconfirmed_official_refreshes
+                    .remove(&retained_id)
+                    .is_some()
+            {
+                if let Some(refresh) = state.credential_refresh.get_mut(&retained_id) {
+                    if refresh.status == CredentialRefreshStatus::ReauthenticationRequired {
+                        refresh.status = CredentialRefreshStatus::Unknown;
+                    }
+                }
+            }
+            saved_accounts.push(incoming);
+            continue;
+        }
+
+        if incoming.id.trim().is_empty()
+            || state
+                .official_accounts
+                .iter()
+                .any(|saved| saved.id == incoming.id)
+        {
+            incoming.id = uuid::Uuid::new_v4().to_string();
+        }
+        if incoming.created_at == 0 {
+            incoming.created_at = now;
+        }
+        incoming.updated_at = now;
+        state.official_accounts.push(incoming.clone());
+        saved_accounts.push(incoming);
+    }
+    Ok(saved_accounts)
+}
+
 fn ensure_official_account_capacity(
     existing: &[StoredOfficialAccount],
     incoming: &[StoredOfficialAccount],
+    unresolved: usize,
 ) -> Result<(), AppError> {
     let mut staged = existing.to_vec();
     for account in incoming {
@@ -1248,7 +1788,7 @@ fn ensure_official_account_capacity(
             staged.push(account.clone());
         }
     }
-    if staged.len() > MAX_SAVED_OPENAI_ACCOUNTS {
+    if staged.len().saturating_add(unresolved) > MAX_SAVED_OPENAI_ACCOUNTS {
         return Err(AppError::InvalidConfig(
             "最多可保存 500 个 OpenAI 账号，请先删除不再使用的账号。".into(),
         ));
@@ -1263,11 +1803,9 @@ fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(),
     account.account_id = account.account_id.trim().to_owned();
     account.email = account.email.trim().to_owned();
     if account.name.is_empty() {
-        account.name = if account.email.is_empty() {
-            "OpenAI".into()
-        } else {
-            account.email.clone()
-        };
+        account.name = email_display_name(&account.email)
+            .unwrap_or("OpenAI")
+            .to_owned();
     }
     if account.account_id.is_empty() {
         return Err(AppError::InvalidConfig(
@@ -1303,19 +1841,6 @@ fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(),
     Ok(())
 }
 
-fn preserve_redacted_headers(
-    incoming: &mut std::collections::BTreeMap<String, String>,
-    existing: &std::collections::BTreeMap<String, String>,
-) {
-    for (name, value) in incoming.iter_mut() {
-        if value.is_empty()
-            && let Some(saved) = existing.get(name)
-        {
-            *value = saved.clone();
-        }
-    }
-}
-
 fn persist_files(
     root: &Path,
     app_path: &Path,
@@ -1335,11 +1860,13 @@ fn persist_files(
     );
     if let Err(commit_error) = result {
         if root.join(STATE_TRANSACTION_FILE).exists() {
-            return recover_state_transaction(root).map_err(|recovery_error| {
-                anyhow::anyhow!(
-                    "状态事务提交失败且无法恢复：{commit_error}（恢复错误：{recovery_error}）"
-                )
-            });
+            return recover_state_transaction(root)
+                .map(|_| ())
+                .map_err(|recovery_error| {
+                    anyhow::anyhow!(
+                        "状态事务提交失败且无法恢复：{commit_error}（恢复错误：{recovery_error}）"
+                    )
+                });
         }
         return Err(commit_error);
     }
@@ -1367,10 +1894,7 @@ fn persist_files_with_hook(
         fs::remove_file(&completed)?;
         sync_parent_directory(&completed)?;
     }
-    let app = AppFile {
-        codex: state.codex.clone(),
-        active: state.active.clone(),
-    };
+    let app = AppFile::from(state);
     let mut providers = Vec::with_capacity(state.providers.len());
     let mut credentials = CredentialsFile::default();
     for provider in &state.providers {
@@ -1404,9 +1928,15 @@ fn persist_files_with_hook(
         credentials,
         deletion_tombstones: state.deletion_tombstones.clone(),
     };
-    JsonStore::write_atomic(&root.join(STATE_TRANSACTION_FILE), &transaction)?;
+    let files = transaction_files(root, &transaction)?;
+    let journal = serde_json::to_vec(&transaction)?;
+    JsonStore::write_bytes_with_limit(
+        &root.join(STATE_TRANSACTION_FILE),
+        &journal,
+        MAX_STATE_TRANSACTION_BYTES,
+    )?;
     after_file(0)?;
-    apply_state_transaction(root, &transaction, &mut after_file)?;
+    apply_state_transaction(&files, &mut after_file)?;
     clear_state_transaction(root, &mut after_file)?;
     Ok(())
 }
@@ -1431,44 +1961,63 @@ fn ensure_state_paths(
     Ok(())
 }
 
-fn apply_state_transaction(
+fn transaction_files(
     root: &Path,
     transaction: &StateTransaction,
-    after_file: &mut impl FnMut(usize) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<[(PathBuf, Vec<u8>); 4]> {
     if transaction.version != STATE_TRANSACTION_VERSION {
         anyhow::bail!("不支持的状态事务版本：{}", transaction.version);
     }
-    JsonStore::write_atomic(&root.join("app.json"), &transaction.app)?;
-    after_file(1)?;
-    JsonStore::write_atomic(&root.join("connections.json"), &transaction.connections)?;
-    after_file(2)?;
-    JsonStore::write_atomic(&root.join("credentials.json"), &transaction.credentials)?;
-    after_file(3)?;
-    JsonStore::write_atomic(
-        &root.join("deletion_tombstones.json"),
-        &transaction.deletion_tombstones,
-    )?;
-    after_file(4)?;
+    fn file(root: &Path, name: &str, value: &impl Serialize) -> anyhow::Result<(PathBuf, Vec<u8>)> {
+        let path = root.join(name);
+        let bytes = JsonStore::encode(&path, value)?;
+        Ok((path, bytes))
+    }
+    Ok([
+        file(root, "app.json", &transaction.app)?,
+        file(root, "connections.json", &transaction.connections)?,
+        file(root, "credentials.json", &transaction.credentials)?,
+        file(
+            root,
+            "deletion_tombstones.json",
+            &transaction.deletion_tombstones,
+        )?,
+    ])
+}
+
+fn apply_state_transaction(
+    files: &[(PathBuf, Vec<u8>)],
+    after_file: &mut impl FnMut(usize) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for (index, (path, bytes)) in files.iter().enumerate() {
+        JsonStore::write_atomic_bytes(path, bytes)?;
+        after_file(index + 1)?;
+    }
     Ok(())
 }
 
-fn recover_state_transaction(root: &Path) -> anyhow::Result<()> {
+fn recover_state_transaction(root: &Path) -> anyhow::Result<Option<AppConfig>> {
     let completed = root.join(COMPLETED_STATE_TRANSACTION_FILE);
     if completed.exists() && fs::remove_file(&completed).is_ok() {
         let _ = sync_parent_directory(&completed);
     }
     let journal = root.join(STATE_TRANSACTION_FILE);
-    if !journal.exists() {
-        return Ok(());
+    if !journal.try_exists()? {
+        return Ok(None);
     }
     if fs::metadata(&journal)?.len() > MAX_STATE_TRANSACTION_BYTES {
         anyhow::bail!("状态事务文件超过 129 MB，拒绝恢复");
     }
     let transaction = serde_json::from_slice::<StateTransaction>(&fs::read(&journal)?)
         .map_err(|error| anyhow::anyhow!("状态事务文件损坏：{error}"))?;
-    apply_state_transaction(root, &transaction, &mut |_| Ok(()))?;
-    clear_state_transaction(root, &mut |_| Ok(()))
+    apply_state_transaction(&transaction_files(root, &transaction)?, &mut |_| Ok(()))?;
+    clear_state_transaction(root, &mut |_| Ok(()))?;
+    Ok(Some(state_from_files(
+        transaction.app,
+        transaction.connections,
+        transaction.credentials,
+        transaction.deletion_tombstones,
+    )))
 }
 
 fn clear_state_transaction(
@@ -1513,6 +2062,21 @@ fn load_state_files(root: &Path) -> anyhow::Result<AppConfig> {
         JsonStore::read_or_default(&root.join("connections.json"), ConnectionsFile::default)?;
     let credentials =
         JsonStore::read_or_default(&root.join("credentials.json"), CredentialsFile::default)?;
+    let tombstones = load_deletion_tombstones(&root.join("deletion_tombstones.json"))?;
+    Ok(state_from_files(
+        app_file,
+        connections,
+        credentials,
+        tombstones,
+    ))
+}
+
+fn state_from_files(
+    app_file: AppFile,
+    connections: ConnectionsFile,
+    credentials: CredentialsFile,
+    deletion_tombstones: DeletionTombstones,
+) -> AppConfig {
     let mut providers = connections.providers;
     for provider in &mut providers {
         if let Some(key) = credentials.provider_api_keys.get(&provider.id) {
@@ -1523,14 +2087,16 @@ fn load_state_files(root: &Path) -> anyhow::Result<AppConfig> {
             provider.headers = headers.clone();
         }
     }
-    Ok(AppConfig {
+    AppConfig {
         codex: app_file.codex,
         active: app_file.active,
         providers,
         official_accounts: connections.official_accounts,
         credential_refresh: connections.credential_refresh,
-        deletion_tombstones: load_deletion_tombstones(&root.join("deletion_tombstones.json"))?,
-    })
+        applied_official_import: app_file.applied_official_import,
+        unconfirmed_official_refreshes: app_file.unconfirmed_official_refreshes,
+        deletion_tombstones,
+    }
 }
 
 fn load_deletion_tombstones(path: &Path) -> anyhow::Result<DeletionTombstones> {
@@ -1873,22 +2439,215 @@ fn mark_active_profile(state: &AppConfig, profile: &mut ProviderProfile) {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    Ok(atomic_publish(path, bytes)?.directory_sync()?)
+}
+
+pub(crate) fn atomic_publish(path: &Path, bytes: &[u8]) -> anyhow::Result<FilePublication> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     if fs::read(path).is_ok_and(|current| current == bytes) {
         secure_file(path)?;
-        return Ok(());
+        return Ok(FilePublication::Synced);
     }
-    let temporary = write_temporary(path, bytes)?;
-    replace_temporary(&temporary, path)
+    publish_temporary(&write_temporary(path, bytes)?, path)
 }
 
-pub fn atomic_write_if_unchanged(
+/// The new name is already live in either outcome. A failed directory sync
+/// affects crash durability, not whether callers must account for publication.
+#[derive(Debug)]
+pub(crate) enum FilePublication {
+    Synced,
+    DirectorySyncFailed(std::io::Error),
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn recover_interrupted_writes(
+    codex_home: &Path,
+    may_write: impl FnMut() -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    rollout_exchange::recover_pending(codex_home, may_write)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("未完成写入 {path}（{error}），无法移走该文件：{quarantine_error}")]
+pub(crate) struct UnfinishedFilePublication {
+    path: PathBuf,
+    error: std::io::Error,
+    quarantine_error: std::io::Error,
+}
+
+#[derive(Debug)]
+pub(crate) enum ConditionalWrite {
+    Changed,
+    Written {
+        retained: Option<PathBuf>,
+        publication: FilePublication,
+    },
+}
+
+impl ConditionalWrite {
+    pub(crate) fn written(&self) -> bool {
+        matches!(self, Self::Written { .. })
+    }
+
+    pub(crate) fn confirm_publication(&self, path: &Path) -> bool {
+        match self {
+            Self::Written { publication, .. } => {
+                publication.warn_if_unsynced(path);
+                true
+            }
+            Self::Changed => false,
+        }
+    }
+}
+
+impl FilePublication {
+    fn from_directory_sync(result: std::io::Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Synced,
+            Err(error) => Self::DirectorySyncFailed(error),
+        }
+    }
+
+    fn directory_sync(self) -> std::io::Result<()> {
+        match self {
+            Self::Synced => Ok(()),
+            Self::DirectorySyncFailed(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn warn_if_unsynced(&self, path: &Path) {
+        if let Self::DirectorySyncFailed(error) = self {
+            tracing::warn!(%error, path = %path.display(), "文件已写入，但目录同步失败");
+        }
+    }
+}
+
+/// Install a staged file without replacing an existing destination.
+/// Compatibility copies on macOS have a recovery record until publication completes.
+pub(crate) fn atomic_create_if_absent(
+    path: &Path,
+    source: &Path,
+) -> anyhow::Result<FilePublication> {
+    atomic_create_if_absent_with_sync(path, source, sync_parent_directory)
+}
+
+pub(crate) fn atomic_create_if_absent_with_sync(
+    path: &Path,
+    source: &Path,
+    sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> anyhow::Result<FilePublication> {
+    let temporary = temporary_path(path);
+    let mut output = create_private_file(&temporary)?;
+    let result = (|| -> anyhow::Result<FilePublication> {
+        std::io::copy(&mut fs::File::open(source)?, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        #[cfg(windows)]
+        move_if_absent(&temporary, path)?;
+        #[cfg(target_os = "macos")]
+        rollout_exchange::publish_if_absent(&temporary, path)?;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        fs::hard_link(&temporary, path)?;
+        Ok(FilePublication::from_directory_sync(sync_directory(path)))
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn move_if_absent(source: &Path, target: &Path) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    move_if_absent_windows(source, target)?;
+    #[cfg(not(windows))]
+    {
+        fs::hard_link(source, target)?;
+        fs::remove_file(source).map_err(|error| {
+            anyhow::anyhow!(
+                "无法移走原文件：{error}。文件副本保留在 {}。",
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Undo a first publication without deleting updates made by another writer.
+pub(crate) fn remove_created_file_if_unchanged(
+    path: &Path,
+    unchanged: impl Fn(&Path) -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    let _live = open_windows_without_writers(path)?;
+    anyhow::ensure!(
+        fs::symlink_metadata(path)?.is_file() && unchanged(path)?,
+        "新建文件已被外部修改，已保留当前文件。"
+    );
+    // The live name can change between the comparison and the move. Verify
+    // the actual displaced file in its private name before discarding it.
+    #[cfg(target_os = "macos")]
+    let displaced = rollout_exchange::save_in_private_sibling(path)?;
+    #[cfg(not(target_os = "macos"))]
+    let displaced = {
+        let displaced = temporary_path(path);
+        move_if_absent(path, &displaced)?;
+        displaced
+    };
+    #[cfg(target_os = "macos")]
+    let discarded = {
+        use rollout_exchange::DisplacedFile;
+        match rollout_exchange::discard_closed_file_if(&displaced, &unchanged) {
+            Ok(DisplacedFile::Removed) => Ok(true),
+            Ok(DisplacedFile::Retained) => {
+                rollout_exchange::report_retained_file(path, &displaced);
+                return Ok(());
+            }
+            Ok(DisplacedFile::Changed) => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let discarded = (|| -> anyhow::Result<bool> {
+        #[cfg(windows)]
+        let _displaced = open_windows_without_writers(&displaced)?;
+        if fs::symlink_metadata(&displaced)?.is_file() && unchanged(&displaced)? {
+            fs::remove_file(&displaced)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })();
+    if matches!(discarded, Ok(true)) {
+        #[cfg(target_os = "macos")]
+        rollout_exchange::finish_private_sibling(path, &displaced)?;
+        #[cfg(not(target_os = "macos"))]
+        sync_parent_directory(path)?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    let restore = rollout_exchange::publish_if_absent(&displaced, path)
+        .and_then(|()| Ok(rollout_exchange::finish_private_sibling(path, &displaced)?));
+    #[cfg(not(target_os = "macos"))]
+    let restore = move_if_absent(&displaced, path);
+    if let Err(error) = restore {
+        anyhow::bail!(
+            "还原文件路径失败（{error}）。换出的文件保留在 {}。",
+            displaced.display()
+        );
+    }
+    match discarded {
+        Ok(false) => anyhow::bail!("新建文件已被外部使用或修改，已保留当前文件。"),
+        Err(error) => Err(error),
+        Ok(true) => unreachable!(),
+    }
+}
+
+pub(crate) fn atomic_write_if_unchanged(
     path: &Path,
     expected: &[u8],
     bytes: &[u8],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<ConditionalWrite> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1896,41 +2655,163 @@ pub fn atomic_write_if_unchanged(
         return match fs::read(path) {
             Ok(current) if current == expected => {
                 secure_file(path)?;
-                Ok(true)
+                Ok(ConditionalWrite::Written {
+                    retained: None,
+                    publication: FilePublication::Synced,
+                })
             }
-            Ok(_) | Err(_) => Ok(false),
+            Ok(_) | Err(_) => Ok(ConditionalWrite::Changed),
         };
     }
-    let temporary = write_temporary(path, bytes)?;
-    let unchanged = fs::read(path).is_ok_and(|current| current == expected);
-    if !unchanged {
-        let _ = fs::remove_file(&temporary);
-        return Ok(false);
+    #[cfg(target_os = "macos")]
+    {
+        if !fs::read(path).is_ok_and(|current| current == expected) {
+            return Ok(ConditionalWrite::Changed);
+        }
+        let temporary = write_temporary(path, bytes)?;
+        rollout_exchange::replace(path, &temporary, expected, bytes)
     }
-    replace_temporary(&temporary, path)?;
-    Ok(true)
+    #[cfg(windows)]
+    {
+        let written =
+            conditional_replace_windows(path, expected, bytes, replace_with_backup_windows)?;
+        Ok(if written {
+            ConditionalWrite::Written {
+                retained: None,
+                publication: FilePublication::Synced,
+            }
+        } else {
+            ConditionalWrite::Changed
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    conditional_replace(path, expected, bytes)
 }
 
-fn write_temporary(path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+#[cfg(not(any(windows, target_os = "macos")))]
+fn conditional_replace(
+    path: &Path,
+    expected: &[u8],
+    bytes: &[u8],
+) -> anyhow::Result<ConditionalWrite> {
+    if !fs::read(path).is_ok_and(|current| current == expected) {
+        return Ok(ConditionalWrite::Changed);
+    }
+    let publication = publish_temporary(&write_temporary(path, bytes)?, path)?;
+    Ok(ConditionalWrite::Written {
+        retained: None,
+        publication,
+    })
+}
+
+#[cfg(windows)]
+fn open_windows_without_writers(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_DELETE).0)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn locked_windows_file_if_unchanged(path: &Path, expected: &[u8]) -> Option<fs::File> {
+    use std::io::Read;
+
+    let mut file = open_windows_without_writers(path).ok()?;
+    if file.metadata().ok()?.len() != expected.len() as u64 {
+        return None;
+    }
+    let mut buffer = [0_u8; 64 * 1024];
+    for expected_chunk in expected.chunks(buffer.len()) {
+        let chunk = &mut buffer[..expected_chunk.len()];
+        file.read_exact(chunk).ok()?;
+        if chunk != expected_chunk {
+            return None;
+        }
+    }
+    Some(file)
+}
+
+#[cfg(windows)]
+fn conditional_replace_windows(
+    path: &Path,
+    expected: &[u8],
+    bytes: &[u8],
+    mut replace: impl FnMut(&Path, &Path) -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<bool> {
+    let staged = write_temporary(path, bytes)?;
+    let Some(_original) = locked_windows_file_if_unchanged(path, expected) else {
+        let _ = fs::remove_file(staged);
+        return Ok(false);
+    };
+    let backup = match replace(&staged, path) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let _ = fs::remove_file(staged);
+            return Err(error);
+        }
+    };
+    // The original handle excludes writers, but its path can still be replaced.
+    // Check the file ReplaceFileW actually displaced before deleting its backup.
+    if let Some(_displaced) = locked_windows_file_if_unchanged(&backup, expected) {
+        let _ = fs::remove_file(backup);
+        return Ok(true);
+    }
+
+    let Some(_published) = locked_windows_file_if_unchanged(path, bytes) else {
+        anyhow::bail!(
+            "会话在替换期间发生变化，已保留当前文件。换出的文件保留在 {}。",
+            backup.display()
+        );
+    };
+    let displaced = replace(&backup, path).map_err(|error| {
+        anyhow::anyhow!(
+            "恢复并发写入失败（{error}）。换出的文件备份路径为 {}。",
+            backup.display()
+        )
+    })?;
+    // The restore can race another rename as well. Its backup may contain an
+    // external edit to the candidate. Retain it if it is anything other than ours.
+    if let Some(_candidate) = locked_windows_file_if_unchanged(&displaced, bytes) {
+        let _ = fs::remove_file(displaced);
+        return Ok(false);
+    }
+    anyhow::bail!(
+        "会话已恢复到原路径，另一份并发修改保留在 {}。",
+        displaced.display()
+    )
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("data");
-    let temporary = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()))
+}
+
+fn write_temporary(path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    let temporary = temporary_path(path);
     let mut file = create_private_file(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let staged = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     Ok(temporary)
 }
 
-fn replace_temporary(temporary: &Path, path: &Path) -> anyhow::Result<()> {
+fn publish_temporary(temporary: &Path, path: &Path) -> anyhow::Result<FilePublication> {
     if let Err(error) = replace_file(temporary, path) {
         let _ = fs::remove_file(temporary);
         return Err(error);
     }
-    sync_parent_directory(path)?;
-    Ok(())
+    Ok(FilePublication::from_directory_sync(sync_parent_directory(
+        path,
+    )))
 }
 
 fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
@@ -1968,31 +2849,78 @@ pub(crate) fn secure_file(_path: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows::{
         Win32::Storage::FileSystem::{
             MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
         },
-        core::PCWSTR,
+        core::HSTRING,
     };
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain([0])
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain([0])
-        .collect::<Vec<_>>();
+    let from = HSTRING::from(source.as_os_str());
+    let to = HSTRING::from(target.as_os_str());
     unsafe {
         MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
+            &from,
+            &to,
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn replace_with_backup_windows(source: &Path, target: &Path) -> anyhow::Result<PathBuf> {
+    use windows::{Win32::Storage::FileSystem::ReplaceFileW, core::HSTRING};
+
+    let from = HSTRING::from(source.as_os_str());
+    let to = HSTRING::from(target.as_os_str());
+    replace_existing_windows(target, |backup| {
+        let backup_name = HSTRING::from(backup.as_os_str());
+        unsafe {
+            ReplaceFileW(&to, &from, &backup_name, Default::default(), None, None)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(windows)]
+fn move_if_absent_windows(source: &Path, target: &Path) -> anyhow::Result<()> {
+    use windows::{
+        Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        core::HSTRING,
+    };
+    unsafe {
+        MoveFileExW(
+            &HSTRING::from(source.as_os_str()),
+            &HSTRING::from(target.as_os_str()),
+            MOVEFILE_WRITE_THROUGH,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_existing_windows(
+    target: &Path,
+    replace: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<PathBuf> {
+    let backup = temporary_path(target);
+    match replace(&backup) {
+        Ok(()) => Ok(backup),
+        Err(error) => {
+            // With a backup name 1176 leaves both names intact. For 1177 the
+            // original has already moved to the backup. Recover it only into
+            // a vacant name, even if another process races this call.
+            if backup.try_exists()? {
+                move_if_absent_windows(&backup, target).map_err(|restore| {
+                    anyhow::anyhow!(
+                        "替换会话失败：{error}；恢复失败，原文件保留在 {}：{restore}",
+                        backup.display()
+                    )
+                })?;
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -2006,6 +2934,350 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+    #[cfg(windows)]
+    #[test]
+    fn official_exchange_preflight_replays_the_main_journal_without_an_import_receipt() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_owned()).unwrap();
+        let original = store
+            .save_official_account(&official_account("workspace", "fixture"))
+            .unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&store.connections_path)
+            .unwrap();
+        let mut updated = original.clone();
+        updated.credential.tokens.refresh_token = "next-refresh-token".into();
+        assert!(
+            store
+                .update(|state| {
+                    save_refreshed_official_account_in_state(state, &original.id, updated.clone())
+                })
+                .is_err()
+        );
+        let journal = temp.path().join(STATE_TRANSACTION_FILE);
+        assert!(journal.is_file());
+        assert!(!temp.path().join(PENDING_OFFICIAL_IMPORT_FILE).exists());
+        assert_eq!(
+            store.official_account(&original.id).unwrap().credential,
+            original.credential
+        );
+        drop(locked);
+
+        store.retry_pending_official_import().unwrap();
+        assert_eq!(
+            store.official_account(&original.id).unwrap().credential,
+            updated.credential
+        );
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn a_completed_refresh_survives_failure_before_the_main_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let store = Store::open(root.to_owned()).unwrap();
+        let mut original = official_account("workspace", "fixture");
+        original.remark = "fixture user remark".into();
+        original.quota.fetched_at = Some(42);
+        let original = store.save_official_account(&original).unwrap();
+        store.record_official_refresh_attempt(&original).unwrap();
+        let mut updated = original.clone();
+        updated.credential.tokens.refresh_token = "fixture-next-refresh".into();
+        updated.remark.clear();
+        updated.quota = ProviderAccountQuota::default();
+        let journal = root.join(STATE_TRANSACTION_FILE);
+        fs::create_dir(&journal).unwrap();
+        let error = store
+            .save_refreshed_official_account(&original.id, &updated)
+            .unwrap_err();
+        assert!(error.to_string().contains("新凭据已暂存"));
+        assert!(root.join(PENDING_OFFICIAL_IMPORT_FILE).is_file());
+        assert_eq!(
+            store.official_account(&original.id).unwrap().credential,
+            original.credential
+        );
+        drop(store);
+        fs::remove_dir(&journal).unwrap();
+
+        let reopened = Store::open(root.to_owned()).unwrap();
+        let account = reopened.official_account(&original.id).unwrap();
+        assert_eq!(account.credential, updated.credential);
+        assert_eq!(account.remark, original.remark);
+        assert_eq!(account.quota.fetched_at, Some(42));
+        assert!(!root.join(PENDING_OFFICIAL_IMPORT_FILE).exists());
+        assert!(
+            reopened
+                .read(|state| state.unconfirmed_official_refreshes.is_empty())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn an_unsent_refresh_can_retry_after_marker_directory_sync_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let store = Store::open(root.to_owned()).unwrap();
+        let account = store
+            .save_official_account(&official_account("workspace", "fixture"))
+            .unwrap();
+        let fingerprint = store.record_official_refresh_attempt(&account).unwrap();
+        assert!(
+            store
+                .confirm_refresh_attempt(
+                    FilePublication::DirectorySyncFailed(std::io::Error::other(
+                        "fixture sync failure"
+                    )),
+                    &account.id,
+                    &fingerprint,
+                )
+                .is_err()
+        );
+        drop(store);
+
+        let reopened = Store::open(root.to_owned()).unwrap();
+        assert_eq!(
+            reopened.record_official_refresh_attempt(&account).unwrap(),
+            fingerprint
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_import_receipt_does_not_block_writes_or_replay_stale_credentials() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_owned()).unwrap();
+        let receipt = temp.path().join(PENDING_OFFICIAL_IMPORT_FILE);
+        let journal = temp.path().join(STATE_TRANSACTION_FILE);
+        let rotated = official_account("workspace", "fixture");
+        fs::create_dir(&journal).unwrap();
+        assert!(matches!(
+            store.save_rotated_official_import(rotated.clone(), None),
+            Err(RotatedOfficialImportError::Pending { on_disk: true })
+        ));
+        fs::remove_dir(&journal).unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&receipt)
+            .unwrap();
+
+        store.retry_pending_official_import().unwrap();
+        store
+            .save_last_managed_model(Some("fixture-model".into()))
+            .unwrap();
+        assert!(receipt.is_file());
+
+        // Another rotation can be held only in memory while the old receipt
+        // is locked. Its commit must keep the old receipt's acknowledgement.
+        let mut newer = rotated;
+        newer.credential.tokens.refresh_token = "newer-refresh-token".into();
+        fs::create_dir(&journal).unwrap();
+        assert!(matches!(
+            store.save_rotated_official_import(newer, None),
+            Err(RotatedOfficialImportError::Pending { on_disk: false })
+        ));
+        fs::remove_dir(&journal).unwrap();
+        store.retry_pending_official_import().unwrap();
+        drop(store);
+
+        let reopened = Store::open(temp.path().to_owned()).unwrap();
+        assert_eq!(
+            reopened.last_managed_model().unwrap().as_deref(),
+            Some("fixture-model")
+        );
+        let mut accounts = reopened.snapshot().unwrap().official_accounts;
+        assert_eq!(accounts.len(), 1);
+        let account = accounts.pop().unwrap();
+        assert_eq!(
+            account.credential.tokens.refresh_token,
+            "newer-refresh-token"
+        );
+        reopened.delete_official_account(&account.id).unwrap();
+        drop(reopened);
+        let reopened = Store::open(temp.path().to_owned()).unwrap();
+        assert!(reopened.snapshot().unwrap().official_accounts.is_empty());
+        assert!(receipt.is_file());
+        drop(reopened);
+        drop(locked);
+        let reopened = Store::open(temp.path().to_owned()).unwrap();
+        assert!(reopened.snapshot().unwrap().official_accounts.is_empty());
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn legacy_import_receipt_is_replayed_once_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let receipt = temp.path().join(PENDING_OFFICIAL_IMPORT_FILE);
+        let legacy = official_account("workspace", "legacy");
+        JsonStore::write_atomic(&receipt, &legacy).unwrap();
+        let store = Store::open(temp.path().to_owned()).unwrap();
+        let accounts = store.snapshot().unwrap().official_accounts;
+        assert_eq!(accounts.len(), 1);
+        assert!(!receipt.exists());
+        store.delete_official_account(&accounts[0].id).unwrap();
+        drop(store);
+
+        // An interrupted cleanup can leave this same legacy receipt on disk.
+        JsonStore::write_atomic(&receipt, &legacy).unwrap();
+        let store = Store::open(temp.path().to_owned()).unwrap();
+        assert!(store.snapshot().unwrap().official_accounts.is_empty());
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn deleting_connections_can_free_space_for_a_pending_rotated_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let store = Store::open(root.to_owned()).unwrap();
+        let large_account = |suffix: &str| {
+            let mut account = official_account(suffix, suffix);
+            account.credential.tokens.id_token = "i".repeat(MAX_CREDENTIAL_CHARS);
+            account.credential.tokens.access_token = "a".repeat(MAX_CREDENTIAL_CHARS);
+            account.credential.tokens.refresh_token = "r".repeat(MAX_CREDENTIAL_CHARS);
+            account
+        };
+        let mut accounts = (0..42)
+            .map(|index| large_account(&format!("fixture-{index}")))
+            .collect::<Vec<_>>();
+        accounts.push(official_account("small", "small"));
+        let saved = store.save_official_accounts(&accounts).unwrap();
+        let large_id = saved[0].id.clone();
+        let small_id = saved.last().unwrap().id.clone();
+        let pending = large_account("pending");
+        assert!(matches!(
+            store.save_rotated_official_import(pending.clone(), None),
+            Err(RotatedOfficialImportError::Pending { on_disk: true })
+        ));
+        let receipt = root.join(PENDING_OFFICIAL_IMPORT_FILE);
+        assert!(receipt.is_file());
+        assert!(!root.join(STATE_TRANSACTION_FILE).exists());
+        drop(accounts);
+        drop(saved);
+        drop(store);
+
+        let store = Store::open(root.to_owned()).unwrap();
+        assert!(
+            store
+                .delete_official_accounts(vec![large_id.clone(), "missing".into()])
+                .is_err()
+        );
+        store.delete_official_account(&small_id).unwrap();
+        assert!(store.official_account(&small_id).is_err());
+        assert!(receipt.is_file());
+        store.delete_official_account(&large_id).unwrap();
+        assert!(!receipt.exists());
+        drop(store);
+
+        let reopened = Store::open(root.to_owned()).unwrap();
+        assert!(reopened.official_account(&large_id).is_err());
+        assert!(reopened.official_account(&small_id).is_err());
+        let stored = reopened
+            .read(|state| {
+                state
+                    .official_accounts
+                    .iter()
+                    .find(|account| account.email == pending.email)
+                    .map(|account| account.credential.clone())
+            })
+            .unwrap();
+        assert_eq!(stored, Some(pending.credential));
+    }
+
+    #[test]
+    fn deleting_the_pending_identity_cancels_its_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let store = Store::open(root.to_owned()).unwrap();
+        let original = store
+            .save_official_account(&official_account("fixture", "fixture"))
+            .unwrap();
+        let mut rotated = original.clone();
+        rotated.credential.tokens.refresh_token = "fixture-rotated".into();
+        let journal = root.join(STATE_TRANSACTION_FILE);
+        fs::create_dir(&journal).unwrap();
+        assert!(matches!(
+            store.save_rotated_official_import(rotated, None),
+            Err(RotatedOfficialImportError::Pending { on_disk: true })
+        ));
+        fs::remove_dir(&journal).unwrap();
+        let receipt = root.join(PENDING_OFFICIAL_IMPORT_FILE);
+        let left_behind = fs::read(&receipt).unwrap();
+
+        store.delete_official_account(&original.id).unwrap();
+        assert!(!receipt.exists());
+        drop(store);
+        fs::write(&receipt, left_behind).unwrap();
+        let reopened = Store::open(root.to_owned()).unwrap();
+        assert!(reopened.official_account(&original.id).is_err());
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn concurrent_first_publication_keeps_one_complete_file() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("history.sqlite");
+        let inputs = [vec![0x35; 128 * 1024], vec![0xa9; 256 * 1024]];
+        let sources = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let path = root.path().join(format!("recovered-{i}"));
+                fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let start = std::sync::Barrier::new(2);
+        let winners = std::thread::scope(|scope| {
+            sources
+                .iter()
+                .map(|source| {
+                    scope.spawn(|| {
+                        start.wait();
+                        atomic_create_if_absent(&target, source).is_ok()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(winners.iter().filter(|won| **won).count(), 1);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            inputs[winners.iter().position(|won| *won).unwrap()]
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn rolling_back_first_publication_preserves_a_concurrent_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let published = temp.path().join("history.sqlite");
+        let renamed = temp.path().join("renamed.sqlite");
+        fs::write(&published, b"published history").unwrap();
+        let first_check = std::cell::Cell::new(true);
+        let error = remove_created_file_if_unchanged(&published, |path| {
+            let unchanged = fs::read(path)? == b"published history";
+            if first_check.replace(false) {
+                fs::rename(path, &renamed)?;
+                fs::write(path, b"external history")?;
+            }
+            Ok(unchanged)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("已保留当前文件"));
+        assert_eq!(fs::read(&published).unwrap(), b"external history");
+        assert_eq!(fs::read(&renamed).unwrap(), b"published history");
+    }
+
     #[test]
     fn rejects_oversized_app_data_before_parsing() {
         let temp = tempfile::tempdir().unwrap();
@@ -2016,6 +3288,82 @@ mod tests {
         let error = Store::open(temp.path().to_path_buf()).err().unwrap();
 
         assert!(error.to_string().contains("超过 32 MB"));
+    }
+
+    #[test]
+    fn oversized_component_is_rejected_before_journaling_or_publishing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        let store = Store::open(root.clone()).unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let error = store
+            .update(|state| {
+                state.codex.home = "changed".into();
+                state
+                    .deletion_tombstones
+                    .provider_ids
+                    .insert("x".repeat(MAX_APP_DATA_BYTES as usize));
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("超过 32 MB"));
+        assert!(!root.join(STATE_TRANSACTION_FILE).exists());
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+        assert!(
+            Store::open(root)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .deletion_tombstones
+                .provider_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn large_journal_recovers_when_each_component_fits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let store = Store::open(root.to_owned()).unwrap();
+        let mut state = store.snapshot().unwrap();
+        let size = MAX_APP_DATA_BYTES as usize / 2;
+        state.codex.home = "x".repeat(size);
+        state
+            .deletion_tombstones
+            .provider_ids
+            .insert("y".repeat(size));
+        let error = persist_files_with_hook(
+            root,
+            &store.path,
+            &store.connections_path,
+            &store.credentials_path,
+            &store.tombstones_path,
+            &state,
+            |stage| {
+                if stage == 0 {
+                    anyhow::bail!("injected interruption")
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected interruption");
+        assert!(
+            fs::metadata(root.join(STATE_TRANSACTION_FILE))
+                .unwrap()
+                .len()
+                > MAX_APP_DATA_BYTES
+        );
+        drop(state);
+        let reopened = Store::open(root.to_owned()).unwrap();
+        assert_eq!(reopened.codex_home_setting().unwrap().len(), size);
+        assert_eq!(
+            reopened
+                .read(|state| state.deletion_tombstones.provider_ids.len())
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -2149,6 +3497,7 @@ mod tests {
                     kind: ActiveKind::Official,
                     provider_id: None,
                     account_id: Some("active-record".into()),
+                    ..ActiveState::default()
                 };
                 state.credential_refresh.insert(
                     "stale-record".into(),
@@ -2490,7 +3839,7 @@ mod tests {
 
         let written = atomic_write_if_unchanged(&path, b"before", b"replacement").unwrap();
 
-        assert!(!written);
+        assert!(!written.written());
         assert_eq!(fs::read(path).unwrap(), b"concurrent append");
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
     }
@@ -2627,6 +3976,7 @@ mod tests {
                     kind: ActiveKind::Official,
                     provider_id: None,
                     account_id: Some(active_id.clone()),
+                    ..ActiveState::default()
                 };
                 Ok(())
             })
@@ -3213,6 +4563,7 @@ mod tests {
                     kind: ActiveKind::Provider,
                     provider_id: Some("provider-1".into()),
                     account_id: None,
+                    ..ActiveState::default()
                 };
                 Ok(())
             })
@@ -3359,6 +4710,7 @@ mod tests {
             kind: ActiveKind::Provider,
             provider_id: Some("deleted".into()),
             account_id: None,
+            ..ActiveState::default()
         };
 
         assert!(store.restore_active_state(&missing).is_err());
@@ -3423,6 +4775,39 @@ mod tests {
         let saved = store.provider("editable").unwrap();
         assert_eq!(saved.name, "改名后的服务");
         assert_eq!(saved.api_key.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn saved_credentials_follow_only_the_same_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_owned()).unwrap();
+        let mut profile = provider("origin");
+        profile
+            .headers
+            .insert("x-tenant".into(), "old-tenant".into());
+        store.connections_save_provider(profile).unwrap();
+        let mut edit = store.provider_overview().unwrap().providers.remove(0);
+        edit.base_url = "https://EXAMPLE.test:443/new-path".into();
+        let saved = store.connections_save_provider(edit).unwrap();
+        assert_eq!(saved.headers["x-tenant"], "old-tenant");
+        assert_eq!(saved.api_key.as_deref(), Some("secret"));
+        let mut edit = saved.redacted();
+        for other in ["https://example.test:8443/v1", "https://other.test/v1"] {
+            edit.base_url = other.into();
+            assert!(store.connections_save_provider(edit.clone()).is_err());
+            assert_eq!(
+                store.provider("origin").unwrap().headers["x-tenant"],
+                "old-tenant"
+            );
+        }
+        edit.api_key = Some("new-fixture-key".into());
+        edit.headers.insert("x-new".into(), "new-tenant".into());
+        let saved = store.connections_save_provider(edit).unwrap();
+        assert_eq!(saved.api_key.as_deref(), Some("new-fixture-key"));
+        assert_eq!(
+            saved.headers,
+            BTreeMap::from([("x-new".into(), "new-tenant".into())])
+        );
     }
 
     #[test]
@@ -3491,6 +4876,7 @@ mod tests {
 
         let mut edited = store.provider_overview().unwrap().providers[0].clone();
         edited.base_url = "https://new.example.test/v1".into();
+        edited.api_key = Some("new-fixture-key".into());
         edited.selected_models = Some(vec!["new-api-model".into(), "stale-model".into()]);
         let saved = store.connections_save_provider(edited).unwrap();
 
@@ -3533,6 +4919,7 @@ mod tests {
 
         let mut edited = store.provider_overview().unwrap().providers[0].clone();
         edited.base_url = "https://new.example.test/v1".into();
+        edited.api_key = Some("new-fixture-key".into());
         let saved = store.connections_save_provider(edited).unwrap();
 
         // /models 同步数据被清空，但自定义模型保留。
@@ -3703,6 +5090,7 @@ mod tests {
 
         let mut edited = store.provider_overview().unwrap().providers[0].clone();
         edited.base_url = "https://new.example.test/v1".into();
+        edited.api_key = Some("new-fixture-key".into());
         store.connections_save_provider(edited).unwrap();
         release_stale_response.wait();
         let updated = stale_update.join().unwrap();
@@ -3795,6 +5183,140 @@ mod tests {
         assert_eq!(state.providers[0].id, "persisted");
         assert_eq!(state.active.provider_id.as_deref(), Some("persisted"));
         assert_eq!(state.active.account_id, None);
+    }
+
+    #[test]
+    fn recovered_rotated_credential_survives_the_next_unrelated_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().into()).unwrap();
+        let mut account = store
+            .save_official_account(&official_account("fixture", "owner"))
+            .unwrap();
+        let connections = temp.path().join("connections.json");
+        let prior = temp.path().join("prior.json");
+        fs::rename(&connections, &prior).unwrap();
+        fs::create_dir(&connections).unwrap();
+        account.credential.tokens.refresh_token = "fixture-rotated".into();
+        assert!(store.save_official_account(&account).is_err());
+        assert!(temp.path().join(STATE_TRANSACTION_FILE).is_file());
+
+        fs::remove_dir(&connections).unwrap();
+        fs::rename(prior, &connections).unwrap();
+        // Even a rejected edit observes and publishes the recovered generation.
+        let rejected = store.update::<()>(|state| {
+            assert_eq!(
+                state.official_accounts[0].credential.tokens.refresh_token,
+                "fixture-rotated"
+            );
+            Err(AppError::StaleOperation)
+        });
+        assert!(rejected.is_err());
+        assert_eq!(
+            store
+                .official_account(&account.id)
+                .unwrap()
+                .credential
+                .tokens
+                .refresh_token,
+            "fixture-rotated"
+        );
+        store.save_last_debug_port(31005).unwrap();
+        drop(store);
+        let reopened = Store::open(temp.path().into()).unwrap();
+        assert_eq!(
+            reopened
+                .official_account(&account.id)
+                .unwrap()
+                .credential
+                .tokens
+                .refresh_token,
+            "fixture-rotated"
+        );
+        assert_eq!(reopened.last_debug_port().unwrap(), Some(31005));
+        assert!(!temp.path().join(STATE_TRANSACTION_FILE).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_replacement_restores_only_a_missing_original() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("rollout.jsonl");
+        fs::write(&live, b"original").unwrap();
+        let failure = replace_existing_windows(&live, |_| {
+            Err(std::io::Error::from_raw_os_error(1176).into())
+        });
+        assert!(failure.is_err());
+        assert_eq!(fs::read(&live).unwrap(), b"original");
+        let failure = replace_existing_windows(&live, |backup| {
+            fs::rename(&live, backup)?;
+            Err(std::io::Error::from_raw_os_error(1177).into())
+        });
+        assert!(failure.is_err());
+        assert_eq!(fs::read(&live).unwrap(), b"original");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+        let mut saved_backup = PathBuf::new();
+        let failure = replace_existing_windows(&live, |backup| {
+            saved_backup = backup.to_owned();
+            fs::rename(&live, backup)?;
+            fs::write(&live, b"externally recreated")?;
+            Err(std::io::Error::from_raw_os_error(1177).into())
+        })
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains(&saved_backup.display().to_string())
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"externally recreated");
+        assert_eq!(fs::read(&saved_backup).unwrap(), b"original");
+        // A normal replacement must clean up its private backup.
+        assert!(
+            atomic_write_if_unchanged(&live, b"externally recreated", b"updated")
+                .unwrap()
+                .written()
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"updated");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_preserves_a_file_recreated_after_the_comparison() {
+        for edit_during_restore in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let live = temp.path().join("rollout.jsonl");
+            let previous = temp.path().join("previous.jsonl");
+            let candidate = temp.path().join("candidate.jsonl");
+            fs::write(&live, b"original").unwrap();
+            let mut calls = 0;
+            let result =
+                conditional_replace_windows(&live, b"original", b"candidate", |source, target| {
+                    calls += 1;
+                    if calls == 1 {
+                        fs::rename(target, &previous)?;
+                        fs::write(target, b"external edit")?;
+                    } else if edit_during_restore {
+                        fs::rename(target, &candidate)?;
+                        fs::write(target, b"another external edit")?;
+                    }
+                    replace_with_backup_windows(source, target)
+                });
+            assert_eq!(calls, 2);
+            assert_eq!(fs::read(&previous).unwrap(), b"original");
+            assert_eq!(fs::read(&live).unwrap(), b"external edit");
+            if edit_during_restore {
+                let error = result.unwrap_err().to_string();
+                let backup = fs::read_dir(temp.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| fs::read(path).unwrap() == b"another external edit")
+                    .unwrap();
+                assert!(error.contains(&backup.display().to_string()));
+            } else {
+                assert!(!result.unwrap());
+                assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+            }
+        }
     }
 
     #[test]

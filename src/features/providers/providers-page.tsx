@@ -74,14 +74,14 @@ import { resetCreditCountText } from "./reset-credits"
 export function ProvidersPage({
   connections,
   selectedId,
-  onSelectedIdChange,
+  onAccountsSaved,
   onRefresh,
 }: {
   refreshRevision: number
   onRefresh: () => void
   connections?: ProviderOverview
   selectedId?: string
-  onSelectedIdChange: (id: string) => void
+  onAccountsSaved: (accounts: OfficialAccountView[]) => void
 }) {
   const [editorOpen, setEditorOpen] = useState(false)
   const [loginOpen, setLoginOpen] = useState(false)
@@ -106,22 +106,7 @@ export function ProvidersPage({
       (item) => item.id === selectedId
     )
     if (provider) return { kind: "provider" as const, value: provider }
-    const fallback =
-      connections?.officialAccounts.find((item) => item.active) ??
-      connections?.providers.find((item) => item.active) ??
-      connections?.officialAccounts[0] ??
-      connections?.providers[0]
-    if (!fallback) return undefined
-    return "email" in fallback
-      ? { kind: "account" as const, value: fallback }
-      : { kind: "provider" as const, value: fallback }
   }, [connections, selectedId])
-
-  useEffect(() => {
-    if (selected && selectedId !== selected.value.id) {
-      onSelectedIdChange(selected.value.id)
-    }
-  }, [onSelectedIdChange, selected, selectedId])
 
   const startLogin = async () => {
     if (!begin("login")) return
@@ -151,7 +136,7 @@ export function ProvidersPage({
         })
         setAuthorization(undefined)
         setLoginOpen(false)
-        onSelectedIdChange(result.account.id)
+        onAccountsSaved([result.account])
         onRefresh()
         return true
       }
@@ -162,7 +147,7 @@ export function ProvidersPage({
       }
       return false
     },
-    [onRefresh, onSelectedIdChange]
+    [onAccountsSaved, onRefresh]
   )
 
   const checkLogin = async () => {
@@ -238,15 +223,24 @@ export function ProvidersPage({
   const importCookie = async (
     name: string | undefined,
     accountId: string | undefined,
-    content: string
+    content: string,
+    nameOffset: number
   ) => {
     if (!begin("import")) return
+    setLoginError(undefined)
     try {
       const imported = await call("connections_import_cookie", {
         name,
+        ...(name && nameOffset ? { nameOffset } : {}),
         accountId,
         content,
       })
+      if (imported.partial) {
+        if (imported.accounts.length) onAccountsSaved(imported.accounts)
+        if (imported.savedCount > 0) onRefresh()
+        setLoginError(imported.partial.message)
+        return imported.partial.retryFrom
+      }
       const firstAccount = imported.accounts[0]
       const formatLabel =
         imported.detectedFormats.join("、") || "Cookie 登录数据"
@@ -260,7 +254,7 @@ export function ProvidersPage({
       })
       setAuthorization(undefined)
       setLoginOpen(false)
-      if (firstAccount) onSelectedIdChange(firstAccount.id)
+      onAccountsSaved(imported.accounts)
       onRefresh()
     } catch (reason) {
       setLoginError(errorMessage(reason))
@@ -336,9 +330,7 @@ export function ProvidersPage({
             setLoginOpen(false)
             onRefresh()
           }}
-          onImport={(name, accountId, content) =>
-            void importCookie(name, accountId, content)
-          }
+          onImport={importCookie}
         />
       )}
       <ResetCreditsDialog
@@ -353,7 +345,7 @@ export function ProvidersPage({
     </>
   )
 
-  if (!connections) {
+  if (!connections || (selectedId && !selected)) {
     return <ProvidersLoading />
   }
 

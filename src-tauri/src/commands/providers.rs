@@ -1,11 +1,11 @@
 use crate::{
     activation::{
         compensate_activation_failure, ensure_codex_stopped, record_written_model,
-        sync_active_codex_configuration, sync_active_openai_credential,
+        repair_and_publish_provider, sync_active_codex_configuration,
+        sync_active_openai_credential,
     },
     chat_proxy::ChatProxyRegistry,
     codex::{self, AppliedConfigPatch, ConfigManager},
-    commands::sessions::repair_home_after_activation_with_paths,
     local_usage::UsageLedger,
     models::*,
     models_dev, provider_http,
@@ -28,6 +28,9 @@ fn require_api_key(provider: &ProviderProfile) -> Result<&str, AppError> {
 pub(crate) async fn connections_list(
     store: State<'_, Store>,
 ) -> Result<ProviderOverview, AppError> {
+    if let Err(error) = store.retry_pending_official_import() {
+        tracing::warn!(%error, "待保存的 OpenAI 登录凭据尚未恢复");
+    }
     store.provider_overview()
 }
 
@@ -61,22 +64,21 @@ pub(crate) async fn connections_save_provider(
                 .is_some_and(|key| !key.trim().is_empty());
         // 若正在使用此服务，同步配置时（对 Chat 类型）会自动启动/重启本机转换代理。
         // 地址/Key/空缓存需要先完成 `/models` 刷新，不能把旧模型写给新服务。
-        if was_active
-            && !needs_model_refresh
-            && let Err(error) = sync_active_codex_configuration(&store, &manager, &proxy).await
-        {
-            let Some(previous) = previous.as_ref() else {
-                return Err(error);
-            };
-            return Err(restore_active_provider_save(
-                &store,
-                &manager,
-                &proxy,
-                &saved_revision,
-                previous,
-                error,
-            )
-            .await);
+        if was_active && !needs_model_refresh {
+            if let Err(error) = sync_active_codex_configuration(&store, &manager, &proxy).await {
+                let Some(previous) = previous.as_ref() else {
+                    return Err(error);
+                };
+                return Err(restore_active_provider_save(
+                    &store,
+                    &manager,
+                    &proxy,
+                    &saved_revision,
+                    previous,
+                    error,
+                )
+                .await);
+            }
         }
         (
             previous,
@@ -365,34 +367,113 @@ pub(crate) async fn connections_refresh_models(
     proxy: State<'_, ChatProxyRegistry>,
 ) -> Result<Vec<String>, AppError> {
     let _model_transaction = activation.2.lock().await;
-    let active = store.read(|state| state.active.clone())?;
-    let provider_id = active
-        .provider_id
-        .filter(|_| matches!(active.kind, ActiveKind::Provider))
-        .ok_or_else(|| {
-            AppError::InvalidConfig("当前不是第三方 API 服务，无需刷新模型列表。".into())
-        })?;
-    let (provider, starting_revision, was_active) =
-        store.provider_model_refresh_snapshot(&provider_id)?;
-    ensure_codex_stopped(&store)?;
-    let synced = sync_provider_models(
-        &client.current()?,
+    refresh_active_models(
         &store,
-        &provider,
-        was_active.then_some(&starting_revision),
-    )
-    .await?;
-    finish_provider_model_refresh(
-        &store,
-        &manager,
+        || client.current(),
         &activation,
         &proxy,
-        was_active,
-        &provider,
-        &synced.revision,
+        Some(&manager),
     )
-    .await?;
-    Ok(synced.models)
+    .await?
+    .ok_or_else(|| AppError::InvalidConfig("当前不是第三方 API 服务，无需刷新模型列表。".into()))
+}
+
+pub(crate) async fn run_model_refresh(app: tauri::AppHandle) {
+    use tauri::{Emitter, Manager};
+    let mut interval = model_refresh_interval();
+    loop {
+        interval.tick().await;
+        let activation = app.state::<ActivationLock>();
+        let Ok(_guard) = activation.2.try_lock() else {
+            continue;
+        };
+        match refresh_active_models(
+            &app.state::<Store>(),
+            || app.state::<ApiClient>().current(),
+            &activation,
+            &app.state::<ChatProxyRegistry>(),
+            None,
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                let _ = app.emit("provider-models-refreshed", ());
+            }
+            Ok(None) => {}
+            Err(_) => tracing::warn!(operation = "background_model_refresh", outcome = "error"),
+        }
+    }
+}
+
+fn model_refresh_interval() -> tokio::time::Interval {
+    let period = std::time::Duration::from_secs(10 * 60);
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn refresh_active_models(
+    store: &Store,
+    client: impl FnOnce() -> Result<reqwest::Client, AppError>,
+    activation: &ActivationLock,
+    proxy: &ChatProxyRegistry,
+    manual: Option<&ConfigManager>,
+) -> Result<Option<Vec<String>>, AppError> {
+    let (_, Some(provider)) = store.active_provider_and_home()? else {
+        return Ok(None);
+    };
+    if manual.is_none() && (!provider.enabled || require_api_key(&provider).is_err()) {
+        return Ok(None);
+    }
+    if let Err(error) = ensure_codex_stopped(store) {
+        if manual.is_none() && matches!(&error, AppError::InvalidConfig(_)) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let starting_revision = ProviderSnapshotRevision::from_provider(&provider);
+    let synced =
+        sync_provider_models(&client()?, store, &provider, Some(&starting_revision)).await?;
+    if let Some(manager) = manual {
+        finish_provider_model_refresh(
+            store,
+            manager,
+            activation,
+            proxy,
+            true,
+            &provider,
+            &synced.revision,
+        )
+        .await?;
+    } else {
+        let changed = synced.revision != starting_revision;
+        let _guard = activation.0.lock().await;
+        let (home, active) = store.active_provider_and_home()?;
+        let Some(current) = active.filter(|active| active.id == provider.id) else {
+            return Ok(None);
+        };
+        if ProviderSnapshotRevision::from_provider(&current) != synced.revision {
+            return Err(AppError::StaleOperation);
+        }
+        let url = match current.api_type {
+            ProviderApiType::Responses => current.base_url.clone(),
+            ProviderApiType::Chat => proxy.base_url(),
+        };
+        match codex::refresh_background_model_files(store, &home, &current, &url, changed) {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) if changed => {
+                return Err(rollback_model_refresh(
+                    store,
+                    &provider,
+                    &synced.revision,
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(synced.models))
 }
 
 #[allow(clippy::too_many_arguments)] // Keep the refresh transaction dependencies explicit.
@@ -437,18 +518,30 @@ async fn sync_active_provider_configuration(
     let _guard = activation.0.lock().await;
     if store.is_active_provider(provider_id)? {
         if let Err(error) = sync_active_codex_configuration(store, manager, proxy).await {
-            return match store
-                .restore_provider_snapshot_if_revision_matches(refreshed_revision, previous)
-            {
-                Ok(true) => Err(error),
-                Ok(false) => Err(AppError::StaleOperation),
-                Err(rollback) => Err(AppError::Internal(format!(
-                    "{error}；模型缓存回滚失败，请重新刷新当前服务：{rollback}"
-                ))),
-            };
+            return Err(rollback_model_refresh(
+                store,
+                previous,
+                refreshed_revision,
+                error,
+            ));
         }
     }
     Ok(())
+}
+
+fn rollback_model_refresh(
+    store: &Store,
+    previous: &ProviderProfile,
+    revision: &ProviderSnapshotRevision,
+    error: AppError,
+) -> AppError {
+    match store.restore_provider_snapshot_if_revision_matches(revision, previous) {
+        Ok(true) => error,
+        Ok(false) => AppError::StaleOperation,
+        Err(rollback) => AppError::Internal(format!(
+            "{error}；模型缓存回滚失败，请重新刷新当前服务：{rollback}"
+        )),
+    }
 }
 
 /// 抓取服务 `/models` 接口的可用模型，并用 models.dev（catalog.json）**精确
@@ -527,6 +620,25 @@ async fn sync_provider_models(
                 .map(|window| (detail.id.clone(), window))
         })
         .collect::<BTreeMap<_, _>>();
+    let meta = merge_provider_model_metadata(&details, dev_meta_result.as_ref().ok());
+    let Some(revision) = store.update_provider_models_if_source_matches(
+        &provider.id,
+        &expected_source,
+        expected_revision,
+        models.clone(),
+        windows,
+        meta,
+    )?
+    else {
+        return Err(AppError::StaleOperation);
+    };
+    Ok(SyncedProviderModels { models, revision })
+}
+
+fn merge_provider_model_metadata(
+    details: &[provider_http::FetchedModelDetail],
+    dev_meta: Option<&BTreeMap<String, ProviderModelsDevMeta>>,
+) -> BTreeMap<String, ProviderModelsDevMeta> {
     // 先并入 /models 返回的简介（服务商自己的数据优先），再补 models.dev 元数据。
     let mut meta = details
         .iter()
@@ -534,6 +646,7 @@ async fn sync_provider_models(
             detail.description.is_some()
                 || detail.reasoning_levels.is_some()
                 || detail.default_reasoning_level.is_some()
+                || detail.service_tiers.is_some()
         })
         .map(|detail| {
             (
@@ -544,14 +657,16 @@ async fn sync_provider_models(
                     description: detail.description.clone(),
                     supported_reasoning_levels: detail.reasoning_levels.clone(),
                     default_reasoning_level: detail.default_reasoning_level.clone(),
+                    service_tiers: detail.service_tiers.clone(),
                 },
             )
         })
         .collect::<BTreeMap<_, _>>();
-    if let Ok(dev_meta) = dev_meta_result {
+    if let Some(dev_meta) = dev_meta {
         // 按 /models 返回的原始 id 解析 models.dev 元数据（兼容纯 id / 厂商前缀 / 大小写）。
-        for id in &models {
-            let Some(info) = models_dev::lookup_model(&dev_meta, id) else {
+        for detail in details {
+            let id = &detail.id;
+            let Some(info) = models_dev::lookup_model(dev_meta, id) else {
                 continue;
             };
             let entry = meta.entry(id.clone()).or_default();
@@ -566,18 +681,7 @@ async fn sync_provider_models(
             }
         }
     }
-    let Some(revision) = store.update_provider_models_if_source_matches(
-        &provider.id,
-        &expected_source,
-        expected_revision,
-        models.clone(),
-        windows,
-        meta,
-    )?
-    else {
-        return Err(AppError::StaleOperation);
-    };
-    Ok(SyncedProviderModels { models, revision })
+    meta
 }
 
 #[tauri::command]
@@ -601,21 +705,9 @@ async fn preview_activation_in_transaction(
     // 后续 apply 的用户态快照检查仍会错误通过。
     let _model_transaction = activation.2.lock().await;
     let _activation = activation.0.lock().await;
-    let (home_setting, active_provider_id) = store.read(|state| {
-        (
-            state.codex.home.clone(),
-            state
-                .active
-                .provider_id
-                .clone()
-                .filter(|_| matches!(state.active.kind, ActiveKind::Provider)),
-        )
-    })?;
-    let home = codex::home(&home_setting);
-    let provider_id = active_provider_id
-        .as_deref()
+    let (home, provider) = store.active_provider_and_home()?;
+    let provider = provider
         .ok_or_else(|| AppError::InvalidConfig("请先添加并启用一个第三方 API 服务。".into()))?;
-    let provider = store.provider(provider_id)?;
     let target = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
     manager.preview_custom(&home, &provider, &target)
 }
@@ -625,6 +717,7 @@ pub(crate) async fn settings_apply_activation(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
     operation_id: String,
 ) -> Result<(), AppError> {
     let activation_operation = activation.begin_operation();
@@ -634,11 +727,24 @@ pub(crate) async fn settings_apply_activation(
         return Err(AppError::StaleOperation);
     }
     ensure_codex_stopped(&store)?;
+    let (home, provider) = store.active_provider_and_home()?;
+    let provider = provider.ok_or(AppError::StaleOperation)?;
+    manager.check_preview_provider(&operation_id, &home, &provider)?;
     let previous_managed_model = store.last_managed_model()?;
     let applied = manager.apply_checked(&operation_id, || ensure_codex_stopped(&store))?;
     // 写入成功后记录 config.toml 当前的服务模型，供切换到 OpenAI 时精确清除。
-    let home = codex::home(&store.codex_home_setting()?);
-    if let Err(error) = record_written_model(&store, &home) {
+    let finish = async {
+        record_written_model(&store, &home)?;
+        if provider.api_type == crate::models::ProviderApiType::Chat {
+            repair_and_publish_provider(&store, &proxy, &provider, home).await?;
+        } else {
+            store.confirm_chat_route(&provider.id, None)?;
+            proxy.publish(None).await;
+        }
+        Ok::<_, AppError>(())
+    }
+    .await;
+    if let Err(error) = finish {
         let files = manager.rollback_applied(applied);
         let managed_model = store.save_last_managed_model(previous_managed_model);
         return match (files, managed_model) {
@@ -719,6 +825,7 @@ pub(crate) async fn connections_activate(
             &crate::activation_for_provider(&provider, chrono::Utc::now().timestamp_millis()),
         )?;
         let result = async {
+            let previous_active = store.read(|state| state.active.clone())?;
             let rollback = apply_provider_configuration_and_record(
                 &store,
                 &manager,
@@ -727,7 +834,6 @@ pub(crate) async fn connections_activate(
                 &preview.operation_id,
             )
             .await?;
-            let previous_active = store.read(|state| state.active.clone())?;
             if let Err(error) = store.activate(&id) {
                 return Err(rollback_provider_activation(
                     &store, &manager, &proxy, rollback, error,
@@ -736,19 +842,8 @@ pub(crate) async fn connections_activate(
             }
             // 转换代理保持运行：Codex 会缓存配置里的地址，端口必须在本机会话内
             // 保持稳定，切回其他服务再切回来时才能继续使用同一端口。
-            let (repair, affected_paths) = repair_home_after_activation_with_paths(
-                &store,
-                home.clone(),
-                codex::MANAGED_PROVIDER_ID.into(),
-            )
-            .await;
-            // 会话归属修复必须整体完成才算切换成功：任一会话未修复都回滚激活
-            // 状态与 Codex 配置，绝不返回部分成功。修复失败时会话文件已由修复
-            // 路径整体回滚，因此恢复原激活状态后回滚配置即可回到切换前的连接。
-            if !repair.repair_complete {
-                let rollback_error = AppError::Internal(
-                    crate::activation::repair_incomplete_message(&repair, "连接未切换"),
-                );
+            let finish = repair_and_publish_provider(&store, &proxy, &provider, home.clone()).await;
+            if let Err(rollback_error) = finish {
                 if let Err(restore) = store.restore_active_state(&previous_active) {
                     return Err(rollback_provider_activation(
                         &store,
@@ -770,7 +865,7 @@ pub(crate) async fn connections_activate(
                 )
                 .await);
             }
-            Ok::<_, AppError>((repair, affected_paths))
+            finish
         }
         .await;
         match result {
@@ -825,6 +920,336 @@ mod tests {
             base_url: base_url.into(),
             proxy_api_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn background_refresh_updates_only_the_active_catalog_and_skips_unchanged_models() {
+        use futures_util::FutureExt;
+        let mut timer = model_refresh_interval();
+        assert_eq!(timer.period(), std::time::Duration::from_secs(600));
+        assert!(timer.tick().now_or_never().is_none());
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let lock = ActivationLock::default();
+        let proxy = ChatProxyRegistry::default();
+        assert!(
+            refresh_active_models(&store, || panic!("no active source"), &lock, &proxy, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let router = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move || {
+                let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        return Err(axum::http::StatusCode::BAD_GATEWAY);
+                    }
+                    let model = if n >= 5 {
+                        "replacement"
+                    } else {
+                        "catalog-fixture"
+                    };
+                    Ok(axum::Json(serde_json::json!({"data":[{"id":model}]})))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("models.dev", address)
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        store
+            .connections_save_provider(provider(
+                "scheduled",
+                &format!("http://{address}/v1"),
+                "old",
+            ))
+            .unwrap();
+        store.activate("scheduled").unwrap();
+        let config = home.join("config.toml");
+        std::fs::write(&config, "# user configuration").unwrap();
+        assert!(
+            refresh_active_models(&store, || Ok(http.clone()), &lock, &proxy, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            refresh_active_models(&store, || Ok(http.clone()), &lock, &proxy, None)
+                .await
+                .unwrap(),
+            Some(vec!["catalog-fixture".to_owned()])
+        );
+        assert!(home.join("model-catalogs/codex-tools.json").is_file());
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "# user configuration"
+        );
+        assert!(!home.join("auth.json").exists());
+        assert!(
+            refresh_active_models(&store, || Ok(http.clone()), &lock, &proxy, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Earlier versions refreshed the catalog but left a retired default on disk.
+        let original = format!(
+            "model_provider = 'custom'\nmodel = 'old' # keep this comment\nmodel_catalog_json = 'model-catalogs/codex-tools.json'\n[model_providers.custom]\nname = 'Provider'\nbase_url = 'http://{address}/v1'\n"
+        );
+        std::fs::write(&config, &original).unwrap();
+        std::fs::write(home.join("auth.json"), b"private-auth-fixture").unwrap();
+        store.save_last_managed_model(Some("old".into())).unwrap();
+        assert!(
+            refresh_active_models(&store, || Ok(http.clone()), &lock, &proxy, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let repaired = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(repaired, original.replace("'old'", "\"catalog-fixture\""));
+        assert_eq!(
+            store.last_managed_model().unwrap().as_deref(),
+            Some("catalog-fixture")
+        );
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            b"private-auth-fixture"
+        );
+        store
+            .save_last_managed_model(Some("retired".into()))
+            .unwrap();
+        let manual = repaired.replace("\"catalog-fixture\"", "'my-own-choice'");
+        std::fs::write(&config, &manual).unwrap();
+        assert!(
+            refresh_active_models(&store, || Ok(http.clone()), &lock, &proxy, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), manual);
+        std::fs::write(&config, &repaired).unwrap();
+        store
+            .save_last_managed_model(Some("catalog-fixture".into()))
+            .unwrap();
+        assert_eq!(
+            refresh_active_models(&store, || Ok(http.clone()), &lock, &proxy, None)
+                .await
+                .unwrap(),
+            Some(vec!["replacement".into()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            repaired.replace("\"catalog-fixture\"", "\"replacement\"")
+        );
+        assert_eq!(
+            store.last_managed_model().unwrap().as_deref(),
+            Some("replacement")
+        );
+        let catalog: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(home.join("model-catalogs/codex-tools.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "replacement");
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            b"private-auth-fixture"
+        );
+        store
+            .update(|state| {
+                state.providers[0].enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            refresh_active_models(&store, || panic!("disabled source"), &lock, &proxy, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fast_mode_provider_declarations_survive_storage_and_catalog() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data": [{
+                    "id": "m",
+                    "service_tiers": [{
+                        "id": "priority", "name": "Fast", "description": "Provider tier"
+                    }],
+                    "default_service_tier": "priority"
+                }]}))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("data");
+        let store = Store::open(store_path.clone()).unwrap();
+        let saved = store
+            .connections_save_provider(provider("p", &format!("http://{address}/v1"), "m"))
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let details = provider_http::fetch_model_details(&client, &saved)
+            .await
+            .unwrap();
+        server.abort();
+        let meta = merge_provider_model_metadata(&details, None);
+        assert!(
+            store
+                .update_provider_models_if_source_matches(
+                    &saved.id,
+                    &ProviderSourceFingerprint::from_provider(&saved),
+                    Some(&ProviderSnapshotRevision::from_provider(&saved)),
+                    vec!["m".into()],
+                    BTreeMap::new(),
+                    meta,
+                )
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
+        let reopened = Store::open(store_path).unwrap();
+        let persisted = reopened.provider(&saved.id).unwrap();
+        let catalog = crate::model_unlock::build_model_catalog_with_windows_for_provider(
+            &persisted,
+            temp.path(),
+        );
+        let json = serde_json::to_value(catalog).unwrap();
+        assert_eq!(
+            json[0]["service_tiers"],
+            serde_json::json!([{
+                "id": "priority", "name": "Fast", "description": "Provider tier"
+            }])
+        );
+        assert_eq!(
+            json[0]["additional_speed_tiers"],
+            serde_json::json!(["fast"])
+        );
+        assert_eq!(json[0]["default_service_tier"], serde_json::Value::Null);
+
+        // A successful refresh that omits the declaration must remove old support,
+        // even when the enrichment source offers a tier for the same model.
+        let mut withdrawn = details;
+        withdrawn[0].service_tiers = None;
+        let dev_meta = BTreeMap::from([(
+            "m".into(),
+            serde_json::from_value(serde_json::json!({
+                "name": "Model M",
+                "serviceTiers": [{"id": "fast", "name": "Fast", "description": ""}]
+            }))
+            .unwrap(),
+        )]);
+        let meta = merge_provider_model_metadata(&withdrawn, Some(&dev_meta));
+        assert!(
+            reopened
+                .update_provider_models_if_source_matches(
+                    &persisted.id,
+                    &ProviderSourceFingerprint::from_provider(&persisted),
+                    Some(&ProviderSnapshotRevision::from_provider(&persisted)),
+                    vec!["m".into()],
+                    BTreeMap::new(),
+                    meta,
+                )
+                .unwrap()
+                .is_some()
+        );
+        let refreshed = reopened.provider(&persisted.id).unwrap();
+        assert_eq!(
+            refreshed.models_dev_meta["m"].name.as_deref(),
+            Some("Model M")
+        );
+        assert!(refreshed.models_dev_meta["m"].service_tiers.is_none());
+        let catalog = crate::model_unlock::build_model_catalog_with_windows_for_provider(
+            &refreshed,
+            temp.path(),
+        );
+        assert!(catalog[0].service_tiers.is_empty());
+        assert!(catalog[0].additional_speed_tiers.is_empty());
+    }
+
+    #[test]
+    fn reasoning_sync_metadata_survives_storage_and_models_dev_enrichment() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let saved = store
+            .connections_save_provider(provider("p", "https://example.test/v1", "m"))
+            .unwrap();
+        let details = vec![provider_http::FetchedModelDetail {
+            id: "m".into(),
+            context_window: None,
+            description: None,
+            reasoning_levels: Some(vec!["low".into(), "max".into()]),
+            default_reasoning_level: Some("max".into()),
+            service_tiers: None,
+        }];
+        let dev_meta = BTreeMap::from([(
+            "m".into(),
+            ProviderModelsDevMeta {
+                name: Some("Model M".into()),
+                context_window: Some(256_000),
+                supported_reasoning_levels: Some(vec!["ultra".into()]),
+                ..Default::default()
+            },
+        )]);
+        let meta = merge_provider_model_metadata(&details, Some(&dev_meta));
+        assert!(
+            store
+                .update_provider_models_if_source_matches(
+                    &saved.id,
+                    &ProviderSourceFingerprint::from_provider(&saved),
+                    Some(&ProviderSnapshotRevision::from_provider(&saved)),
+                    vec!["m".into()],
+                    BTreeMap::new(),
+                    meta,
+                )
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
+        let reopened = Store::open(temp.path().join("data")).unwrap();
+        let persisted = reopened.provider(&saved.id).unwrap();
+        let meta = &persisted.models_dev_meta["m"];
+        assert_eq!(meta.name.as_deref(), Some("Model M"));
+        assert_eq!(
+            meta.supported_reasoning_levels.as_ref().unwrap(),
+            &["low", "max"]
+        );
+        assert_eq!(meta.default_reasoning_level.as_deref(), Some("max"));
+        let catalog = crate::model_unlock::build_model_catalog_with_windows_for_provider(
+            &persisted,
+            temp.path(),
+        );
+        let json = serde_json::to_value(&catalog).unwrap();
+        assert_eq!(json[0]["supported_reasoning_levels"][1]["effort"], "max");
+        assert_eq!(
+            json[0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(json[0]["default_reasoning_level"], "max");
     }
 
     #[test]
@@ -1269,58 +1694,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_refresh_with_no_selected_model_overlap_rolls_back_instead_of_selecting_all() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("codex-home");
-        std::fs::create_dir_all(&home).unwrap();
-        let store = Store::open(temp.path().join("data")).unwrap();
-        store
-            .update(|state| {
-                state.codex.home = home.display().to_string();
-                Ok(())
-            })
+    async fn manual_and_background_refresh_recover_retired_and_legacy_empty_selections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data":[{"id":"new-zeta"},{"id":"new-alpha"}]}))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("models.dev", address)
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
             .unwrap();
-        let mut initial = provider("provider", "https://provider.example.test/v1", "old-model");
-        initial.selected_models = Some(vec!["old-model".into()]);
-        let saved = store.connections_save_provider(initial).unwrap();
-        store.activate(&saved.id).unwrap();
-        let manager = ConfigManager::default();
-        let proxy = ChatProxyRegistry::default();
-        sync_active_codex_configuration(&store, &manager, &proxy)
-            .await
-            .unwrap();
-        let (previous, starting_revision, was_active) =
-            store.provider_model_refresh_snapshot(&saved.id).unwrap();
-        assert!(was_active);
-        let source = ProviderSourceFingerprint::from_provider(&previous);
-        let refreshed_revision = store
-            .update_provider_models_if_source_matches(
-                &saved.id,
-                &source,
-                Some(&starting_revision),
-                vec!["new-model".into()],
-                BTreeMap::new(),
-                BTreeMap::new(),
+
+        for (manual, legacy_empty) in [(false, false), (false, true), (true, false), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            std::fs::create_dir_all(&home).unwrap();
+            let store = Store::open(temp.path().join("data")).unwrap();
+            store
+                .update(|state| {
+                    state.codex.home = home.display().to_string();
+                    Ok(())
+                })
+                .unwrap();
+            let mut initial = provider("provider", &format!("http://{address}/v1"), "old-model");
+            initial.selected_models = Some(vec!["old-model".into()]);
+            let saved = store.connections_save_provider(initial).unwrap();
+            store.activate(&saved.id).unwrap();
+            let manager = ConfigManager::default();
+            let proxy = ChatProxyRegistry::default();
+            sync_active_codex_configuration(&store, &manager, &proxy)
+                .await
+                .unwrap();
+            if legacy_empty {
+                // Older versions could persist this selection even though the
+                // installed TOML still points at the previously selected model.
+                store
+                    .update(|state| {
+                        state.providers[0].selected_models = Some(Vec::new());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            drop(store);
+            let store = Store::open(temp.path().join("data")).unwrap();
+
+            let models = refresh_active_models(
+                &store,
+                || Ok(client.clone()),
+                &ActivationLock::default(),
+                &proxy,
+                manual.then_some(&manager),
             )
+            .await
             .unwrap()
             .unwrap();
-
-        let error = sync_active_provider_configuration(
-            &store,
-            &manager,
-            &ActivationLock::default(),
-            &proxy,
-            &saved.id,
-            &previous,
-            &refreshed_revision,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.to_string().contains("模型"));
-        let restored = store.provider(&saved.id).unwrap();
-        assert_eq!(restored.available_models, vec!["old-model"]);
-        assert_eq!(restored.selected_models, Some(vec!["old-model".into()]));
+            assert_eq!(models, ["new-alpha", "new-zeta"]);
+            let reopened = Store::open(temp.path().join("data")).unwrap();
+            let refreshed = reopened.provider(&saved.id).unwrap();
+            assert_eq!(refreshed.available_models, models);
+            assert_eq!(refreshed.selected_models, Some(vec!["new-alpha".into()]));
+            assert_eq!(
+                reopened.last_managed_model().unwrap().as_deref(),
+                Some("new-alpha")
+            );
+            let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+            assert!(config.contains(r#"model = "new-alpha""#), "{config}");
+            let catalog: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(home.join("model-catalogs/codex-tools.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(catalog["models"].as_array().unwrap().len(), 1);
+            assert_eq!(catalog["models"][0]["slug"], "new-alpha");
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -1550,6 +2002,15 @@ mod tests {
         drop(model_transaction);
 
         let preview = preview.await.unwrap().unwrap();
+        let (_, current) = store.active_provider_and_home().unwrap();
+        manager
+            .check_preview_provider(&preview.operation_id, &home, &current.unwrap())
+            .unwrap();
+        assert!(
+            manager
+                .check_preview_provider(&preview.operation_id, &home, &saved)
+                .is_err()
+        );
         manager.apply(&preview.operation_id).unwrap();
         let written = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(written.contains("https://new.example.test/v1"));

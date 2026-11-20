@@ -44,6 +44,10 @@ jobs:
         with:
           workspaces: src-tauri
       - run: bun install --frozen-lockfile
+      - name: Check minimum Rust version
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          cargo +1.85.0 check --locked --all-targets --manifest-path src-tauri/Cargo.toml
       - run: bun run verify
       - run: bun run ${{ matrix.script }}
       - name: Verify macOS bundle signature

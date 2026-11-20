@@ -1,4 +1,5 @@
 import type { Command } from "@/lib/ipc"
+import { sameHttpOrigin } from "@/lib/utils"
 import type {
   AccountQuota,
   ConfigPatchPreview,
@@ -702,7 +703,12 @@ export async function mockCall(
         (candidate) => candidate.id === creditId
       )
       if (!account || !credit || credit.status !== "available") {
-        throw new Error("重置卡不可用或不属于该账号。")
+        throw new Error("重置卡不可用或不属于该账号。", {
+          cause: {
+            stage: "not_submitted",
+            message: "重置卡不可用或不属于该账号。",
+          },
+        })
       }
       credit.status = "redeemed"
       const previous = account.quota.resetCredits?.availableCount
@@ -859,6 +865,11 @@ export async function mockCall(
       )
       const existing =
         existingIndex >= 0 ? mockProviders[existingIndex] : undefined
+      const changedOrigin =
+        existing && !sameHttpOrigin(existing.baseUrl, provider.baseUrl)
+      if (changedOrigin && existing.hasApiKey && !provider.apiKey?.trim()) {
+        throw new Error("服务地址已更换，请填写新地址的 API Key。")
+      }
       const hasApiKey =
         Boolean(provider.apiKey?.trim()) || Boolean(existing?.hasApiKey)
       const shouldRefreshModels =
@@ -879,7 +890,13 @@ export async function mockCall(
         id: provider.id || `provider-${Date.now()}`,
         name: provider.name,
         baseUrl: provider.baseUrl,
-        headers: { ...provider.headers },
+        headers: changedOrigin
+          ? Object.fromEntries(
+              Object.entries(provider.headers).filter(
+                ([, value]) => value !== ""
+              )
+            )
+          : { ...provider.headers },
         timeoutSecs: provider.timeoutSecs,
         enabled: provider.enabled,
         active: existing?.active ?? false,
@@ -927,7 +944,11 @@ export async function mockCall(
         updatedAt: Date.now(),
       }
       mockAccounts.push(account)
-      return { accounts: [account], detectedFormats: ["Cookie 登录数据"] }
+      return {
+        accounts: [account],
+        savedCount: 1,
+        detectedFormats: ["Cookie 登录数据"],
+      }
     }
     case "connections_login_start":
       return {
@@ -942,6 +963,7 @@ export async function mockCall(
     case "usage_get_official_pricing":
     case "usage_refresh_official_pricing":
       return {
+        usageRepriced: false,
         status: "cached",
         sourceUrl: "https://openai.com/api/pricing",
         fetchedAtMs: now,

@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Read,
     path::Path,
     time::{Duration, Instant},
 };
@@ -47,9 +48,8 @@ const WAIT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// 未匹配到任何元数据时使用的上下文窗口：取最保守、最兼容的 128K，
 /// 避免高估模型上下文导致溢出。
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
-// /models often omits effort metadata. Keep the existing compatibility ladder and
-// expose its top end in Codex; an explicit empty ladder from the provider wins.
-const DEFAULT_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const DEFAULT_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+const MAX_MODEL_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 /// Codex CLI 的 `model_catalog_json` 要求 `base_instructions` 为字符串。
 /// 保持通用、不绑定具体模型（不写“based on GPT-5”），以适配软件更新。
 const CODEX_BASE_INSTRUCTIONS: &str =
@@ -72,7 +72,10 @@ pub(crate) fn model_catalog(store: &Store) -> Result<Vec<CodexModelInfo>, AppErr
         return Ok(Vec::new());
     };
     let provider = store.provider(&provider_id)?;
-    Ok(build_provider_catalog(&provider))
+    let home = crate::codex::home(&store.codex_home_setting()?);
+    Ok(build_model_catalog_with_windows_for_provider(
+        &provider, &home,
+    ))
 }
 
 /// 所有会写模型目录或注入页面的入口都通过这个上下文统一采用
@@ -103,11 +106,43 @@ async fn model_catalog_write_context<'a>(
 /// 用单个服务的模型记录构建目录（只含该服务实际存在的模型）。
 pub(crate) fn build_model_catalog_with_windows_for_provider(
     provider: &ProviderProfile,
+    codex_home: &Path,
 ) -> Vec<CodexModelInfo> {
-    build_provider_catalog(provider)
+    let cached_levels = read_cached_reasoning_levels(codex_home).unwrap_or_default();
+    build_provider_catalog(provider, &cached_levels)
 }
 
-fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
+/// 只读取模型能力提示，不将官方缓存中的模型加入服务商目录，也不持久化回服务商元数据。
+fn read_cached_reasoning_levels(codex_home: &Path) -> Option<BTreeMap<String, Vec<String>>> {
+    let file = fs::File::open(codex_home.join("models_cache.json")).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_MODEL_CACHE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MODEL_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_MODEL_CACHE_BYTES {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let mut cached_levels = BTreeMap::new();
+    for model in value.get("models")?.as_array()? {
+        let Some(slug) = model.get("slug").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(levels) = crate::provider_http::parse_model_reasoning_levels(model) {
+            cached_levels.entry(slug.to_owned()).or_insert(levels);
+        }
+    }
+    Some(cached_levels)
+}
+
+fn build_provider_catalog(
+    provider: &ProviderProfile,
+    cached_levels: &BTreeMap<String, Vec<String>>,
+) -> Vec<CodexModelInfo> {
     let mut by_slug = BTreeMap::new();
     // 有效模型 = /models 同步的 available_models ∪ 用户手动添加的 custom_models。
     // 展示名/上下文窗口/简介用 models.dev(catalog.json) 精确匹配补充；自定义模型
@@ -144,39 +179,45 @@ fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
             .and_then(|meta| meta.name.clone())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| slug.to_string());
-        let mut reasoning_levels = meta
+        let reasoning_levels = meta
             .and_then(|meta| meta.supported_reasoning_levels.as_ref())
+            .or_else(|| cached_levels.get(slug))
             .cloned()
-            .unwrap_or_else(default_reasoning_levels);
-        // `max` is the upstream API effort. Codex exposes its Ultra mode as a
-        // separate picker entry and converts it to a valid request effort.
-        if reasoning_levels.iter().any(|effort| effort == "max")
-            && !reasoning_levels.iter().any(|effort| effort == "ultra")
-        {
-            reasoning_levels.push("ultra".into());
-        }
+            .unwrap_or_else(|| {
+                DEFAULT_REASONING_LEVELS
+                    .iter()
+                    .map(|level| (*level).into())
+                    .collect()
+            });
         let default_reasoning_level = meta
             .and_then(|meta| meta.default_reasoning_level.as_ref())
             .filter(|effort| reasoning_levels.contains(effort))
-            .cloned()
             .or_else(|| {
                 reasoning_levels
                     .iter()
                     .find(|effort| effort.as_str() == "low")
-                    .cloned()
             })
-            .or_else(|| reasoning_levels.first().cloned());
-        by_slug.insert(
-            slug.to_string(),
-            catalog_entry(
-                slug,
-                &display_name,
-                context_window,
-                meta.and_then(|meta| meta.description.clone()),
-                reasoning_levels,
-                default_reasoning_level,
-            ),
+            .or_else(|| reasoning_levels.first())
+            .cloned();
+        let mut entry = catalog_entry(
+            slug,
+            &display_name,
+            context_window,
+            meta.and_then(|meta| meta.description.clone()),
+            reasoning_levels,
+            default_reasoning_level,
         );
+        // Chat 转换代理不支持速度档位；Responses 只采用服务商的声明，
+        // 不从官方缓存、模型名称或 models.dev 推断，也不采用上游默认速度。
+        if matches!(provider.api_type, crate::models::ProviderApiType::Responses) {
+            entry.service_tiers = meta
+                .and_then(|meta| meta.service_tiers.clone())
+                .unwrap_or_default();
+            if !entry.service_tiers.is_empty() {
+                entry.additional_speed_tiers = vec!["fast".into()];
+            }
+        }
+        by_slug.insert(slug.to_string(), entry);
     }
     by_slug.into_values().collect()
 }
@@ -227,15 +268,8 @@ pub(crate) fn write_model_catalog(
     let mut json = serde_json::to_vec_pretty(&json!({ "models": catalog }))
         .map_err(|error| AppError::Internal(error.to_string()))?;
     json.push(b'\n');
-    crate::storage::atomic_write(&path, &json).map_err(AppError::from)?;
+    crate::storage::atomic_publish(&path, &json)?.warn_if_unsynced(&path);
     Ok(format!("{MODEL_CATALOG_DIR}/{MODEL_CATALOG_FILE}"))
-}
-
-fn default_reasoning_levels() -> Vec<String> {
-    DEFAULT_REASONING_LEVELS
-        .iter()
-        .map(|effort| (*effort).to_string())
-        .collect()
 }
 
 /// 查询解锁状态：Codex 是否安装/运行、是否有可注入的调试端口、
@@ -345,8 +379,13 @@ async fn unlock_on(
 pub(crate) async fn launch_with_debug(
     store: &Store,
     activation: &ActivationLock,
+    proxy: &crate::chat_proxy::ChatProxyRegistry,
+    manager: &crate::codex::ConfigManager,
 ) -> Result<ModelUnlockResult, AppError> {
     let context = model_catalog_write_context(store, activation).await?;
+    #[cfg(target_os = "macos")]
+    crate::activation::recover_interrupted_writes(store).await?;
+    proxy.restore_active(store, manager).await?;
     let active_kind = context.active_kind;
     ensure_active_official_account_usable(store, active_kind)?;
     let catalog = context.catalog;
@@ -490,31 +529,39 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
     for (var i = 0; i < entries.length; i++) if (entries[i] && entries[i].slug === slug) return entries[i];
     return null;
   }
-  function descriptor(slug, entries) {
+  function descriptor(slug, entries, includeSpeedTiers) {
     var meta = metaFor(slug, entries) || {};
     var levels = meta.supported_reasoning_levels || meta.supportedReasoningLevels;
     var supported;
     if (Array.isArray(levels)) {
       supported = levels.map(function (l) { return { reasoningEffort: l.effort, description: l.description || l.effort }; });
     } else {
-      supported = ["low", "medium", "high"].map(function (e) { return { reasoningEffort: e, description: e + " effort" }; });
+      supported = ["low", "medium", "high", "xhigh"].map(function (e) { return { reasoningEffort: e, description: e + " effort" }; });
     }
-    var defaultEffort = meta.default_reasoning_level;
-    if (!defaultEffort && supported.length) defaultEffort = supported[0].reasoningEffort;
-    if (!defaultEffort && !Array.isArray(levels)) defaultEffort = "low";
-    return {
+    var defaultEffort = meta.default_reasoning_level || meta.defaultReasoningLevel;
+    if (!supported.some(function (level) { return level.reasoningEffort === defaultEffort; })) {
+      var fallback = supported.find(function (level) { return level.reasoningEffort === "low"; }) || supported[0];
+      defaultEffort = fallback && fallback.reasoningEffort;
+    }
+    var model = {
       id: slug, model: slug, slug: slug, name: slug,
       displayName: meta.display_name || meta.displayName || slug,
-      description: meta.description || meta.description || "Codex Tools 解锁模型",
+      description: meta.description || "",
       hidden: false, isDefault: false,
       defaultReasoningEffort: defaultEffort,
       supportedReasoningEfforts: supported,
       input_modalities: ["text", "image"], supports_personality: false,
-      service_tiers: [], default_service_tier: null, additional_speed_tiers: [],
       model_specialty: null
     };
+    if (includeSpeedTiers) {
+      model.serviceTiers = meta.service_tiers || [];
+      model.additionalSpeedTiers = meta.additional_speed_tiers || [];
+      // 能力声明不改变用户选定的速度，也不自动采用服务商的默认付费档位。
+      model.defaultServiceTier = null;
+    }
+    return model;
   }
-  function patchArray(list) {
+  function patchArray(list, includeSpeedTiers) {
     if (!Array.isArray(list)) return false;
     var models = currentModels();
     if (!models.names.length) return false;
@@ -525,22 +572,33 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
       if (!item || typeof item !== "object") continue;
       if (typeof item.model === "string" && item.model) seen[item.model] = true;
       if (models.names.indexOf(item.model) !== -1) {
-        if (item.hidden !== false) { item.hidden = false; changed = true; }
+        var next = Object.assign({}, item);
+        var itemChanged = false;
+        if (item.hidden !== false) { next.hidden = false; itemChanged = true; }
         var meta = metaFor(item.model, models.entries);
-        if (meta && meta.display_name && item.displayName !== meta.display_name) { item.displayName = meta.display_name; changed = true; }
-        var providerDescriptor = descriptor(item.model, models.entries);
+        if (meta && meta.display_name && item.displayName !== meta.display_name) { next.displayName = meta.display_name; itemChanged = true; }
+        var providerDescriptor = descriptor(item.model, models.entries, includeSpeedTiers);
         if (JSON.stringify(item.supportedReasoningEfforts) !== JSON.stringify(providerDescriptor.supportedReasoningEfforts)) {
-          item.supportedReasoningEfforts = providerDescriptor.supportedReasoningEfforts;
-          changed = true;
+          next.supportedReasoningEfforts = providerDescriptor.supportedReasoningEfforts;
+          itemChanged = true;
         }
         if (item.defaultReasoningEffort !== providerDescriptor.defaultReasoningEffort) {
-          item.defaultReasoningEffort = providerDescriptor.defaultReasoningEffort;
-          changed = true;
+          next.defaultReasoningEffort = providerDescriptor.defaultReasoningEffort;
+          itemChanged = true;
         }
+        if (includeSpeedTiers) {
+          for (var speedKey of ["serviceTiers", "additionalSpeedTiers", "defaultServiceTier"]) {
+            if (JSON.stringify(item[speedKey]) !== JSON.stringify(providerDescriptor[speedKey])) {
+              next[speedKey] = providerDescriptor[speedKey];
+              itemChanged = true;
+            }
+          }
+        }
+        if (itemChanged) { list[i] = next; changed = true; }
       }
     }
     for (var j = 0; j < models.names.length; j++) {
-      if (!seen[models.names[j]]) { list.push(descriptor(models.names[j], models.entries)); changed = true; }
+      if (!seen[models.names[j]]) { list.push(descriptor(models.names[j], models.entries, includeSpeedTiers)); changed = true; }
     }
     return changed;
   }
@@ -556,10 +614,10 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
     if (value.pages && value.pages[0] && patchArray(value.pages[0].data)) changed = true;
     var models = currentModels();
     if (Array.isArray(value.availableModels)) {
-      models.names.forEach(function (n) { if (value.availableModels.indexOf(n) === -1) value.availableModels.push(n); changed = true; });
+      models.names.forEach(function (n) { if (value.availableModels.indexOf(n) === -1) { value.availableModels.push(n); changed = true; } });
     }
     if (Array.isArray(value.available_models)) {
-      models.names.forEach(function (n) { if (value.available_models.indexOf(n) === -1) value.available_models.push(n); changed = true; });
+      models.names.forEach(function (n) { if (value.available_models.indexOf(n) === -1) { value.available_models.push(n); changed = true; } });
     }
     for (var listKey of ["hiddenModels", "hidden_models"]) {
       if (Array.isArray(value[listKey])) {
@@ -631,108 +689,233 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
       });
     } catch (e) {}
   }
-  // ---- React Query observer 补丁（绕过 atom 缓存） ----
-  function findQueryClientFromFiber() {
+  // ---- 只修补本机 API 模型查询的最终选择结果；不改官方功能开关或用户偏好 ----
+  var runtimeKey = "__CODEX_TOOLS_MODEL_UNLOCK_RUNTIME__";
+  var runtime = window[runtimeKey];
+  if (runtime && (runtime.version !== 4 || runtime.disposed)) {
+    if (typeof runtime.dispose === "function") runtime.dispose();
+    runtime = null;
+  }
+  if (!runtime) {
+    runtime = {
+      version: 4, clients: new Map(), observers: new Map(),
+      selectors: new WeakMap(), signature: null, disposed: false
+    };
+    window[runtimeKey] = runtime;
+    runtime.dispose = function () {
+      runtime.disposed = true;
+      window.clearInterval(window.__CODEX_TOOLS_MODEL_TIMER__);
+      runtime.clients.forEach(function (unsubscribe) { if (unsubscribe) unsubscribe(); });
+      runtime.observers.forEach(function (_, observer) { restoreObserver(observer); });
+      runtime.clients.clear();
+      runtime.observers.clear();
+    };
+  }
+  var signature = JSON.stringify(window.__CODEX_TOOLS_MODEL_CATALOG__ || null);
+  if (signature !== runtime.signature) {
+    runtime.signature = signature;
+    runtime.selectors = new WeakMap();
+  }
+  function isProviderModelQuery(key) {
+    return Array.isArray(key) && key[0] === "models" && key[1] === "list"
+      && key[2] === "local" && key[3] === "apikey"
+      && key.some(function (part) {
+        return typeof part === "string" && /(?:^|[\\/])model-catalogs[\\/]codex-tools\.json$/.test(part);
+      });
+  }
+  function findQueryClientsFromFiber() {
     var root = document.getElementById("root");
-    if (!root) return null;
+    if (!root) return [];
     var key = Object.keys(root).find(function (k) { return k.indexOf("__reactContainer") === 0; });
-    if (!key) return null;
-    var seen = new Set();
-    var found = null;
-    function visit(fiber, depth) {
-      if (!fiber || seen.has(fiber) || depth > 40 || found) return;
-      seen.add(fiber);
-      for (var fi = 0; fi < 2; fi++) {
-        var val = fi === 0 ? fiber.memoizedProps : fiber.memoizedState;
-        if (!val || typeof val !== "object") continue;
-        var candidates = [val, val.value, val.client];
-        for (var ci = 0; ci < candidates.length; ci++) {
-          var c = candidates[ci];
-          if (c && typeof c.getQueryCache === "function" && typeof c.setQueryData === "function") { found = c; return; }
+    var fiberRoot = window.__codexRoot && window.__codexRoot._internalRoot;
+    var first = fiberRoot && fiberRoot.current || key && root[key];
+    if (!first) return [];
+    if (first.stateNode && first.stateNode.current) first = first.stateNode.current;
+    var fibers = new Set(), values = new Set(), clients = new Set();
+    function inspect(value, depth) {
+      if (!value || typeof value !== "object" || depth > 5 || values.has(value) || values.size >= 4096) return;
+      values.add(value);
+      try {
+        if (typeof value.getQueryCache === "function" && typeof value.setQueryData === "function") {
+          clients.add(value);
+          return;
         }
-      }
-      visit(fiber.child, depth + 1);
-      visit(fiber.sibling, depth + 1);
+        if (Object.prototype.toString.call(value) === "[object Map]") {
+          value.forEach(function (node) { inspect(node, depth + 1); });
+          return;
+        }
+        for (var field of ["value", "client", "queryClient", "scope", "node", "current", "memoizedState"]) {
+          inspect(value[field], depth + 1);
+        }
+      } catch (e) {}
     }
-    visit(root[key], 0);
-    return found;
-  }
-  function patchModelObservers(queryClient) {
-    if (!queryClient) return 0;
-    var patched = 0;
-    var queries = [];
-    try { queries = queryClient.getQueryCache().getAll(); } catch (e) { return 0; }
-    for (var qi = 0; qi < queries.length; qi++) {
-      var q = queries[qi];
-      var keyText = JSON.stringify(q.queryKey || []);
-      if (keyText.indexOf("models") === -1 || keyText.indexOf("list") === -1) continue;
-      var observers = q.observers || [];
-      for (var oi = 0; oi < observers.length; oi++) {
-        var obs = observers[oi];
-        if (!obs || !obs.options || typeof obs.options.select !== "function") continue;
-        if (obs.__CODEX_TOOLS_SELECT_PATCHED__) continue;
-        var originalSelect = obs.options.select;
-        obs.options.select = function (data) {
-          var base = originalSelect(data);
-          if (!base || typeof base !== "object") return base;
-          var models = currentModels();
-          var existing = {};
-          var list = base.models;
-          if (Array.isArray(list)) for (var i = 0; i < list.length; i++) { var m = list[i]; if (m && m.model) existing[m.model] = true; }
-          var added = [];
-          for (var j = 0; j < models.names.length; j++) {
-            if (!existing[models.names[j]]) added.push(descriptor(models.names[j], models.entries));
-          }
-          if (!added.length) return base;
-          return Object.assign({}, base, { models: (list || []).concat(added) });
-        };
-        obs.__CODEX_TOOLS_SELECT_PATCHED__ = true;
-        patched++;
+    var pending = [{ fiber: first, depth: 0 }];
+    while (pending.length && fibers.size < 10000) {
+      var item = pending.pop(), fiber = item.fiber;
+      if (!fiber || fibers.has(fiber) || item.depth > 80) continue;
+      fibers.add(fiber);
+      inspect(fiber.memoizedProps, 0);
+      for (var hook = fiber.memoizedState, hi = 0; hook && hi < 100; hook = hook.next, hi++) {
+        inspect(hook, 0);
       }
+      var dependency = fiber.dependencies && fiber.dependencies.firstContext;
+      for (var di = 0; dependency && di < 100; dependency = dependency.next, di++) {
+        inspect(dependency.memoizedValue, 0);
+      }
+      pending.push({ fiber: fiber.sibling, depth: item.depth });
+      pending.push({ fiber: fiber.child, depth: item.depth + 1 });
     }
-    return patched;
+    return Array.from(clients);
   }
-  function refreshQueries(queryClient) {
-    if (!queryClient) return;
+  function patchSelectedModels(base) {
+    if (!base || !Array.isArray(base.models) || !currentModels().names.length) return base;
+    var list = base.models.slice();
+    var changed = patchArray(list, true);
+    var next = Object.assign({}, base, { models: list });
+    for (var pair of [["max", "hasModelSupportingMaxReasoningEffort"], ["ultra", "hasModelSupportingUltraReasoningEffort"]]) {
+      if (!Object.prototype.hasOwnProperty.call(base, pair[1])) continue;
+      var effort = pair[0];
+      var supported = list.some(function (model) {
+        return (model.supportedReasoningEfforts || []).some(function (level) { return level.reasoningEffort === effort; });
+      });
+      if (next[pair[1]] !== supported) { next[pair[1]] = supported; changed = true; }
+    }
+    if (base.defaultModel) {
+      var defaultModel = list.find(function (model) { return model.model === base.defaultModel.model; });
+      if (defaultModel && defaultModel !== base.defaultModel) { next.defaultModel = defaultModel; changed = true; }
+    }
+    return changed ? next : base;
+  }
+  function wrapModelSelect(originalSelect) {
+    originalSelect = originalSelect.__CODEX_TOOLS_ORIGINAL_SELECT__ || originalSelect;
+    if (runtime.selectors.has(originalSelect)) return runtime.selectors.get(originalSelect);
+    var wrapped = function () {
+      return patchSelectedModels(originalSelect.apply(this, arguments));
+    };
+    wrapped.__CODEX_TOOLS_SELECT_PATCHED__ = 4;
+    wrapped.__CODEX_TOOLS_ORIGINAL_SELECT__ = originalSelect;
+    runtime.selectors.set(originalSelect, wrapped);
+    return wrapped;
+  }
+  function modelOptions(options) {
+    if (!options || typeof options.select !== "function") return options;
+    var select = isProviderModelQuery(options.queryKey)
+      ? wrapModelSelect(options.select)
+      : options.select.__CODEX_TOOLS_ORIGINAL_SELECT__ || options.select;
+    return select === options.select ? options : Object.assign({}, options, { select: select });
+  }
+  function restoreObserver(observer) {
+    var saved = runtime.observers.get(observer);
+    if (!saved) return;
+    runtime.observers.delete(observer);
+    observer.setOptions = saved.setOptions;
+    if (saved.getOptimisticResult) observer.getOptimisticResult = saved.getOptimisticResult;
+    var options = observer.options;
+    if (options && options.select && options.select.__CODEX_TOOLS_ORIGINAL_SELECT__) {
+      options = Object.assign({}, options, { select: options.select.__CODEX_TOOLS_ORIGINAL_SELECT__ });
+      if (saved.setOptions) saved.setOptions.call(observer, options);
+      else observer.options = options;
+    }
+  }
+  function patchObserver(observer) {
+    if (!observer || !observer.options || !isProviderModelQuery(observer.options.queryKey)) return;
+    if (!runtime.observers.has(observer)) {
+      var saved = { setOptions: observer.setOptions, getOptimisticResult: observer.getOptimisticResult };
+      runtime.observers.set(observer, saved);
+      if (saved.setOptions) observer.setOptions = function (options) {
+        var args = Array.prototype.slice.call(arguments);
+        args[0] = modelOptions(options);
+        return saved.setOptions.apply(this, args);
+      };
+      if (saved.getOptimisticResult) observer.getOptimisticResult = function (options) {
+        var args = Array.prototype.slice.call(arguments);
+        args[0] = modelOptions(options);
+        return saved.getOptimisticResult.apply(this, args);
+      };
+    }
+    var options = modelOptions(observer.options);
+    if (options === observer.options) return;
+    if (typeof observer.setOptions === "function") observer.setOptions(options);
+    else {
+      observer.options = options;
+      if (typeof observer.updateResult === "function") observer.updateResult();
+    }
+  }
+  function patchQuery(query) {
+    if (!query || !isProviderModelQuery(query.queryKey)) return;
+    (query.observers || []).forEach(patchObserver);
+  }
+  function attachQueryClient(client) {
     try {
-      var queries = queryClient.getQueryCache().getAll();
-      for (var i = 0; i < queries.length; i++) {
-        var keyText = JSON.stringify(queries[i].queryKey || []);
-        if (keyText.indexOf("models") === -1 || keyText.indexOf("list") === -1) continue;
-        var data = queries[i].state && queries[i].state.data;
-        if (data && typeof data === "object") {
-          queryClient.setQueryData(queries[i].queryKey, function (old) { return Object.assign({}, old, { __ct: Date.now() }); });
+      var cache = client.getQueryCache();
+      if (!runtime.clients.has(client)) {
+        runtime.clients.set(client, null);
+        if (typeof cache.subscribe === "function") {
+          runtime.clients.set(client, cache.subscribe(function (event) {
+            if (runtime.disposed || !event) return;
+            if (event.type === "observerRemoved" && event.observer
+                && typeof event.observer.hasListeners === "function" && !event.observer.hasListeners()) {
+              restoreObserver(event.observer);
+            } else if (event.type === "observerAdded" || event.type === "observerOptionsUpdated") {
+              patchQuery(event.query);
+            }
+          }));
         }
       }
+      cache.getAll().forEach(patchQuery);
     } catch (e) {}
   }
+  runtime.status = function () {
+    var count = 0;
+    runtime.observers.forEach(function (_, observer) {
+      if (isProviderModelQuery(observer.options && observer.options.queryKey)) count++;
+    });
+    return { queryClients: runtime.clients.size, patchedObservers: count };
+  };
   // ---- 安装 ----
   installStatsigRootSetter();
   patchStatsigRoot(window.__STATSIG__ || globalThis.__STATSIG__);
-  // Response.json 补丁
-  if (typeof Response !== "undefined" && Response.prototype && !Response.prototype.json.__CODEX_TOOLS_PATCHED__) {
-    var originalJson = Response.prototype.json;
+  // Only known catalog URLs may change a JSON response. A running older installation
+  // did not expose its original json method, so read the untouched body in that case.
+  if (typeof Response !== "undefined" && Response.prototype && Response.prototype.json.__CODEX_TOOLS_PATCHED__ !== 3) {
+    var previousJson = Response.prototype.json;
+    var originalJson = previousJson.__CODEX_TOOLS_PATCHED__ === 2
+      ? async function () { return JSON.parse(await this.text()); }
+      : previousJson;
     var wrapped = async function () {
       var payload = await originalJson.apply(this, arguments);
-      try { patchContainer(payload); } catch (e) {}
+      if (!this.url || this.ok === false || !payload || payload.error) return payload;
+      try {
+        var url = new URL(this.url);
+        if ((url.protocol === "https:" || url.protocol === "http:")
+            && /^\/(?:v1\/models|backend-api\/(?:codex\/)?models)\/?$/.test(url.pathname)) {
+          patchContainer(payload);
+        }
+      } catch (e) {}
       return payload;
     };
-    wrapped.__CODEX_TOOLS_PATCHED__ = true;
+    wrapped.__CODEX_TOOLS_PATCHED__ = 3;
     Response.prototype.json = wrapped;
   }
   // 周期重试：等 Statsig SDK 初始化、React Query 就绪
+  if (window.__CODEX_TOOLS_MODEL_TIMER__) window.clearInterval(window.__CODEX_TOOLS_MODEL_TIMER__);
+  findQueryClientsFromFiber().forEach(attachQueryClient);
   var startedAt = Date.now();
   var timer = window.setInterval(function () {
     patchStatsigRoot(window.__STATSIG__ || globalThis.__STATSIG__);
-    var qc = findQueryClientFromFiber();
-    var count = patchModelObservers(qc);
-    if (count > 0) refreshQueries(qc);
+    if (!runtime.clients.size) findQueryClientsFromFiber().forEach(attachQueryClient);
+    else runtime.clients.forEach(function (_, client) { attachQueryClient(client); });
     if (Date.now() - startedAt > 6000) window.clearInterval(timer);
   }, 100);
+  window.__CODEX_TOOLS_MODEL_TIMER__ = timer;
   var models = currentModels();
   window.__CODEX_TOOLS_MODEL_UNLOCKED__ = true;
-  return { status: models.names.length ? "ok" : "no_models", models: models.names.length };
+  return { status: models.names.length ? "ok" : "no_models", models: models.names.length, diagnostics: runtime.status() };
 })()"#;
+
+#[cfg(test)]
+#[path = "model_unlock_fast_mode_test.rs"]
+mod fast_mode_cli_test;
 
 #[cfg(test)]
 mod tests {
@@ -782,6 +965,195 @@ mod tests {
         provider
     }
 
+    fn test_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
+        let temp = tempfile::tempdir().unwrap();
+        build_model_catalog_with_windows_for_provider(provider, temp.path())
+    }
+
+    fn efforts(model: &CodexModelInfo) -> Vec<&str> {
+        model
+            .supported_reasoning_levels
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|level| level.effort.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn fast_mode_requires_responses_and_never_uses_official_cached_tiers() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("models_cache.json"),
+            json!({"models": [{
+                "slug": "gpt-6-astra",
+                "service_tiers": [{"id": "priority", "name": "Fast", "description": ""}],
+                "additional_speed_tiers": ["fast"]
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut p = provider("p", "gpt-6-astra");
+        let undeclared = build_model_catalog_with_windows_for_provider(&p, temp.path());
+        assert!(undeclared[0].service_tiers.is_empty());
+        assert!(undeclared[0].additional_speed_tiers.is_empty());
+        p.models_dev_meta.insert(
+            "gpt-6-astra".into(),
+            serde_json::from_value(json!({
+                "serviceTiers": [{"id": "priority", "name": "Fast", "description": ""}]
+            }))
+            .unwrap(),
+        );
+        let declared = build_model_catalog_with_windows_for_provider(&p, temp.path());
+        assert_eq!(declared[0].service_tiers[0].id, "priority");
+        assert_eq!(declared[0].additional_speed_tiers, ["fast"]);
+        assert!(declared[0].default_service_tier.is_none());
+        p.api_type = ProviderApiType::Chat;
+        let chat = build_model_catalog_with_windows_for_provider(&p, temp.path());
+        assert!(chat[0].service_tiers.is_empty());
+        assert!(chat[0].additional_speed_tiers.is_empty());
+    }
+
+    fn write_cache(home: &Path) {
+        fs::write(
+            home.join("models_cache.json"),
+            json!({
+                "models": [
+                    {"slug": "gpt-6-astra", "default_reasoning_level": "ultra",
+                     "supported_reasoning_levels": [
+                         {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
+                         {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}
+                     ]},
+                    {"slug": "max-only", "supported_reasoning_levels": ["low", "max"]},
+                    {"slug": "cache-only", "supported_reasoning_levels": ["ultra"]}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reasoning_cache_matches_exact_ids_without_adding_models_or_upgrading_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        write_cache(temp.path());
+        let p = provider_with_models(
+            "p",
+            "",
+            &[
+                "gpt-6-astra",
+                "max-only",
+                "unknown",
+                "Gpt-6-astra",
+                "vendor/gpt-6-astra",
+            ],
+        );
+        let catalog = build_model_catalog_with_windows_for_provider(&p, temp.path());
+        assert_eq!(catalog.len(), 5);
+        for model in &catalog {
+            let expected: &[&str] = match model.slug.as_str() {
+                "gpt-6-astra" => &["low", "medium", "high", "xhigh", "max", "ultra"],
+                "max-only" => &["low", "max"],
+                _ => DEFAULT_REASONING_LEVELS,
+            };
+            assert_eq!(efforts(model), expected);
+            assert_eq!(model.default_reasoning_level.as_deref(), Some("low"));
+        }
+    }
+
+    #[test]
+    fn reasoning_provider_declarations_override_cache_including_empty_lists() {
+        let temp = tempfile::tempdir().unwrap();
+        write_cache(temp.path());
+        let mut p = provider("p", "gpt-6-astra");
+        for (levels, declared_default, expected_default) in [
+            (vec!["low", "max"], Some("max"), Some("max")),
+            (vec!["low", "max"], Some("ultra"), Some("low")),
+            (vec!["high", "max"], None, Some("high")),
+            (vec![], Some("ultra"), None),
+        ] {
+            p.models_dev_meta.insert(
+                "gpt-6-astra".into(),
+                crate::models::ProviderModelsDevMeta {
+                    supported_reasoning_levels: Some(levels.iter().map(|s| (*s).into()).collect()),
+                    default_reasoning_level: declared_default.map(str::to_owned),
+                    ..Default::default()
+                },
+            );
+            let catalog = build_model_catalog_with_windows_for_provider(&p, temp.path());
+            assert_eq!(efforts(&catalog[0]), levels);
+            assert_eq!(
+                catalog[0].default_reasoning_level.as_deref(),
+                expected_default
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_default_only_declaration_uses_the_effective_cached_levels() {
+        let temp = tempfile::tempdir().unwrap();
+        write_cache(temp.path());
+        let mut p = provider("p", "gpt-6-astra");
+        p.models_dev_meta.insert(
+            "gpt-6-astra".into(),
+            crate::models::ProviderModelsDevMeta {
+                default_reasoning_level: Some("max".into()),
+                ..Default::default()
+            },
+        );
+        let catalog = build_model_catalog_with_windows_for_provider(&p, temp.path());
+        assert_eq!(efforts(&catalog[0]).last(), Some(&"ultra"));
+        assert_eq!(catalog[0].default_reasoning_level.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn reasoning_cache_failures_preserve_the_four_level_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let p = provider("p", "gpt-6-astra");
+        let path = temp.path().join("models_cache.json");
+        let check = || {
+            let catalog = build_model_catalog_with_windows_for_provider(&p, temp.path());
+            assert_eq!(efforts(&catalog[0]), DEFAULT_REASONING_LEVELS);
+        };
+        check();
+        for invalid in [
+            "{",
+            r#"{"models":{}}"#,
+            r#"{"models":[{"slug":"gpt-6-astra","supported_reasoning_levels":["future-invalid"]}]}"#,
+        ] {
+            fs::write(&path, invalid).unwrap();
+            check();
+        }
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_MODEL_CACHE_BYTES + 1)
+            .unwrap();
+        check();
+    }
+
+    #[test]
+    fn reasoning_catalog_uses_configured_home_and_does_not_modify_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        write_cache(temp.path());
+        let cache_path = temp.path().join("models_cache.json");
+        let before = fs::read(&cache_path).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = temp.path().to_string_lossy().into_owned();
+                Ok(())
+            })
+            .unwrap();
+        store
+            .connections_save_provider(provider("p", "gpt-6-astra"))
+            .unwrap();
+        store.activate("p").unwrap();
+        let catalog = model_catalog(&store).unwrap();
+        assert_eq!(efforts(&catalog[0]).last(), Some(&"ultra"));
+        assert_eq!(fs::read(&cache_path).unwrap(), before);
+        assert!(store.provider("p").unwrap().models_dev_meta.is_empty());
+    }
+
     #[test]
     fn debug_launch_preflight_rejects_an_active_deactivated_workspace() {
         let temp = tempfile::tempdir().unwrap();
@@ -827,8 +1199,7 @@ mod tests {
 
     #[test]
     fn built_catalog_is_valid_for_codex_cli_schema() {
-        let catalog =
-            build_model_catalog_with_windows_for_provider(&provider("provider", "deepseek-v4-pro"));
+        let catalog = test_catalog(&provider("provider", "deepseek-v4-pro"));
         // 只含当前服务商 `/models` 返回的模型，不含任何内置模型。
         assert_eq!(catalog.len(), 1);
         let deepseek = &catalog[0];
@@ -863,10 +1234,7 @@ mod tests {
     #[test]
     fn write_model_catalog_persists_file_and_returns_relative_path() {
         let temp = tempfile::tempdir().unwrap();
-        let catalog = build_model_catalog_with_windows_for_provider(&provider(
-            "provider",
-            "deepseek-v4-flash",
-        ));
+        let catalog = test_catalog(&provider("provider", "deepseek-v4-flash"));
 
         let relative = write_model_catalog(temp.path(), &catalog).unwrap();
 
@@ -906,12 +1274,11 @@ mod tests {
                 name: Some("DeepSeek V4 Pro".into()),
                 context_window: Some(1_000_000),
                 description: Some("百万 token 上下文旗舰模型".into()),
-                supported_reasoning_levels: None,
-                default_reasoning_level: None,
+                ..Default::default()
             },
         )]);
 
-        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        let catalog = test_catalog(&provider);
         let by_slug: BTreeMap<_, _> = catalog
             .iter()
             .map(|model| (model.slug.as_str(), model))
@@ -948,7 +1315,7 @@ mod tests {
         let mut provider = provider_with_models("provider", "", &["deepseek-v4-pro"]);
         provider.model_context_windows = BTreeMap::from([("5".into(), 200_000u64)]);
 
-        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        let catalog = test_catalog(&provider);
         let slugs: Vec<_> = catalog.iter().map(|model| model.slug.as_str()).collect();
         assert_eq!(slugs, vec!["deepseek-v4-pro"]);
     }
@@ -959,7 +1326,7 @@ mod tests {
             provider_with_models("provider", "deepseek-v4-pro", &["deepseek-v4-pro"]);
         provider.model_context_windows = BTreeMap::from([("deepseek-v4-pro".into(), 1_000_000u64)]);
 
-        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        let catalog = test_catalog(&provider);
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].context_window, Some(1_000_000));
     }
@@ -978,7 +1345,7 @@ mod tests {
         )]);
         provider.context_window_override = Some(1_000_000);
 
-        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        let catalog = test_catalog(&provider);
         assert_eq!(catalog.len(), 2);
         for model in catalog {
             assert_eq!(model.context_window, Some(1_000_000));
@@ -991,7 +1358,7 @@ mod tests {
         let mut provider = provider("provider", "legacy-manual-model");
         provider.available_models.clear();
 
-        assert!(build_model_catalog_with_windows_for_provider(&provider).is_empty());
+        assert!(test_catalog(&provider).is_empty());
     }
 
     #[test]
@@ -1000,7 +1367,7 @@ mod tests {
             provider_with_models("provider", "model-a", &["model-a", "model-b", "model-c"]);
         // 未设置选择时使用全部可用模型。
         let slugs = |provider: &ProviderProfile| {
-            build_model_catalog_with_windows_for_provider(provider)
+            test_catalog(provider)
                 .into_iter()
                 .map(|model| model.slug)
                 .collect::<Vec<_>>()
@@ -1029,7 +1396,7 @@ mod tests {
         let mut provider = provider_with_models("provider", "model-a", &["model-a", "model-b"]);
         provider.custom_models = vec!["custom-1".into(), "custom-2".into()];
 
-        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        let catalog = test_catalog(&provider);
         let slugs: Vec<_> = catalog.iter().map(|model| model.slug.as_str()).collect();
         // 目录按 slug 排序（内部 BTreeMap）。
         assert_eq!(slugs, vec!["custom-1", "custom-2", "model-a", "model-b"]);
@@ -1050,14 +1417,14 @@ mod tests {
         provider.selected_models =
             Some(vec!["custom-1".into(), "custom-2".into(), "model-b".into()]);
 
-        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        let catalog = test_catalog(&provider);
         let slugs: Vec<_> = catalog.iter().map(|model| model.slug.as_str()).collect();
         // custom-2 不在有效集合内，被过滤；custom-1 是自定义模型，被保留。
         assert_eq!(slugs, vec!["custom-1", "model-b"]);
 
         // 显式空选择表示不写入任何模型（含自定义）。
         provider.selected_models = Some(Vec::new());
-        assert!(build_model_catalog_with_windows_for_provider(&provider).is_empty());
+        assert!(test_catalog(&provider).is_empty());
     }
 
     #[test]
@@ -1152,6 +1519,7 @@ mod tests {
                     kind: ActiveKind::Official,
                     provider_id: None,
                     account_id: None,
+                    ..ActiveState::default()
                 };
                 Ok(())
             })

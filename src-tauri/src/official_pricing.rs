@@ -6,10 +6,13 @@ use std::collections::BTreeMap;
 
 pub(crate) const SOURCE_URL: &str = "https://developers.openai.com/api/docs/pricing.md";
 pub(crate) const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
+pub(crate) const PARSER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OfficialPricingCatalog {
+    #[serde(default)]
+    pub parser_version: u32,
     pub version: i64,
     pub content_sha256: String,
     pub source_url: String,
@@ -34,6 +37,8 @@ pub(crate) struct TokenRates {
     pub input: Option<i64>,
     pub cached_input: Option<i64>,
     pub cache_write: Option<i64>,
+    #[serde(default, rename = "cacheWrite12h")]
+    pub cache_write_12h: Option<i64>,
     pub output: Option<i64>,
 }
 
@@ -48,7 +53,35 @@ pub(crate) fn parse_markdown(document: &str) -> Result<ParsedCatalog, String> {
     let mut table = None::<Vec<Vec<String>>>;
     let mut row = None::<Vec<String>>;
     let mut cell = None::<String>;
-    let parser = Parser::new_ext(document, Options::ENABLE_TABLES);
+    // The published Markdown can put a new table header immediately after the last row.
+    let mut section = String::new();
+    let mut in_standard = false;
+    for line in document.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            if in_standard {
+                break;
+            }
+            in_standard = trimmed
+                .trim_start_matches('#')
+                .trim()
+                .eq_ignore_ascii_case("Standard pricing data");
+            continue;
+        }
+        if in_standard {
+            if trimmed
+                .trim_start_matches('|')
+                .split('|')
+                .next()
+                .is_some_and(|cell| cell.trim().eq_ignore_ascii_case("Model"))
+            {
+                section.push('\n');
+            }
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    let parser = Parser::new_ext(&section, Options::ENABLE_TABLES);
 
     for event in parser {
         match event {
@@ -79,59 +112,72 @@ pub(crate) fn parse_markdown(document: &str) -> Result<ParsedCatalog, String> {
         }
     }
 
-    let Some(table) = tables.into_iter().find(|table| is_standard_table(table)) else {
-        return Err("官方价格文档中没有找到 Standard pricing data 表。".into());
-    };
-    let header = &table[0];
-    let index = |name: &str| {
-        header
-            .iter()
-            .position(|value| value.eq_ignore_ascii_case(name))
-    };
-    let model_index = index("Model").ok_or("官方价格表缺少 Model 列。")?;
-    let short_input = index("Short context input").ok_or("官方价格表缺少输入价格列。")?;
-    let short_cached = index("Short context cached input");
-    let short_write = index("Short context cache writes");
-    let short_output = index("Short context output").ok_or("官方价格表缺少输出价格列。")?;
-    let long_input = index("Long context input");
-    let long_cached = index("Long context cached input");
-    let long_write = index("Long context cache writes");
-    let long_output = index("Long context output");
-
     let mut models = BTreeMap::new();
-    for values in table.iter().skip(1) {
-        let Some(model) = values.get(model_index).map(|value| normalize_model(value)) else {
+    for table in tables {
+        let header = &table[0];
+        let index = |name: &str| {
+            header
+                .iter()
+                .position(|value| value.eq_ignore_ascii_case(name))
+        };
+        let model_index = match index("Model") {
+            Some(column) => column,
+            None => continue,
+        };
+        let Some(short_input) = index("Short context input").or_else(|| index("Input")) else {
             continue;
         };
-        if model.is_empty() || model == "model" {
-            continue;
-        }
-        let short = TokenRates {
-            input: parse_price(values.get(short_input))?,
-            cached_input: parse_optional_column(values, short_cached)?,
-            cache_write: parse_optional_column(values, short_write)?,
-            output: parse_price(values.get(short_output))?,
+        let short_cached = index("Short context cached input").or_else(|| index("Cached input"));
+        let short_write =
+            index("Short context cache writes").or_else(|| index("Short context 30m write"));
+        let short_write_12h = index("Short context 12h write");
+        let short_output = match index("Short context output").or_else(|| index("Output")) {
+            Some(column) => column,
+            None => continue,
         };
-        let long = match long_input {
-            Some(long_input) if values.get(long_input).is_some_and(|value| !is_dash(value)) => {
-                Some(TokenRates {
-                    input: parse_price(values.get(long_input))?,
-                    cached_input: parse_optional_column(values, long_cached)?,
-                    cache_write: parse_optional_column(values, long_write)?,
-                    output: parse_optional_column(values, long_output)?,
-                })
+        let long_input = index("Long context input");
+        let long_cached = index("Long context cached input");
+        let long_write =
+            index("Long context cache writes").or_else(|| index("Long context 30m write"));
+        let long_write_12h = index("Long context 12h write");
+        let long_output = index("Long context output");
+
+        for values in table.iter().skip(1) {
+            let Some(model) = values.get(model_index).map(|value| normalize_model(value)) else {
+                continue;
+            };
+            if model.is_empty() || model == "model" {
+                continue;
             }
-            _ => None,
-        };
-        models.insert(
-            model.clone(),
-            OfficialModelRate {
-                model,
-                short,
-                long,
-                long_context_threshold: Some(272_000),
-            },
-        );
+            let short = TokenRates {
+                input: parse_price(values.get(short_input))?,
+                cached_input: parse_optional_column(values, short_cached)?,
+                cache_write: parse_optional_column(values, short_write)?,
+                cache_write_12h: parse_optional_column(values, short_write_12h)?,
+                output: parse_price(values.get(short_output))?,
+            };
+            let long = match long_input {
+                Some(long_input) if values.get(long_input).is_some_and(|value| !is_dash(value)) => {
+                    Some(TokenRates {
+                        input: parse_price(values.get(long_input))?,
+                        cached_input: parse_optional_column(values, long_cached)?,
+                        cache_write: parse_optional_column(values, long_write)?,
+                        cache_write_12h: parse_optional_column(values, long_write_12h)?,
+                        output: parse_optional_column(values, long_output)?,
+                    })
+                }
+                _ => None,
+            };
+            models.insert(
+                model.clone(),
+                OfficialModelRate {
+                    model,
+                    short,
+                    long,
+                    long_context_threshold: long_input.map(|_| 272_000),
+                },
+            );
+        }
     }
     if models.is_empty() {
         return Err("官方价格表没有有效模型。".into());
@@ -150,6 +196,7 @@ pub(crate) fn build_catalog(
 ) -> Result<OfficialPricingCatalog, String> {
     let parsed = parse_markdown(document)?;
     Ok(OfficialPricingCatalog {
+        parser_version: PARSER_VERSION,
         version: fetched_at_ms,
         content_sha256: parsed.content_sha256,
         source_url: SOURCE_URL.into(),
@@ -240,21 +287,6 @@ fn cost(tokens: u64, price: Option<i64>) -> Result<i64, String> {
         .map_err(|_| "官方价格计算超出数据库范围。".into())
 }
 
-fn is_standard_table(table: &[Vec<String>]) -> bool {
-    let Some(header) = table.first() else {
-        return false;
-    };
-    header
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case("Model"))
-        && header
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case("Short context input"))
-        && header
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case("Short context output"))
-}
-
 fn parse_optional_column(values: &[String], index: Option<usize>) -> Result<Option<i64>, String> {
     match index {
         Some(index) => parse_price(values.get(index)),
@@ -325,6 +357,22 @@ mod tests {
         let catalog = build_catalog(FIXTURE, 123, None, None).unwrap();
         assert!(catalog.models.contains_key("gpt-live-test-2030"));
         assert!(!catalog.models.contains_key("should-not-match"));
+    }
+
+    #[test]
+    fn adjacent_standard_tables_use_their_own_headers_and_default_cache_duration() {
+        let document = "### Batch pricing data\n| Model | Input | Output |\n| --- | --- | --- |\n| ignored | $1 | $2 |\n\n### Standard pricing data\n| Model | Short context input | Short context output | Short context 30m write | Short context 12h write | Long context input | Long context 30m write |\n| --- | --- | --- | --- | --- | --- | --- |\n| wide | $2 | $10 | $2.50 | $5 | $4 | $5 |\n| Model | Input | Output | Cached input |\n| --- | --- | --- | --- |\n| compact | $1 | $4 | $0.10 |\n\n### Priority pricing data\n| Model | Input | Output |\n| --- | --- | --- |\n| compact | $3 | $8 |";
+        let parsed = parse_markdown(document).unwrap();
+        assert_eq!(parsed.models.len(), 2);
+        assert_eq!(parsed.models["wide"].short.cache_write, Some(2_500_000));
+        assert_eq!(parsed.models["wide"].short.cache_write_12h, Some(5_000_000));
+        assert_eq!(
+            parsed.models["wide"].long.as_ref().unwrap().cache_write,
+            Some(5_000_000)
+        );
+        assert_eq!(parsed.models["compact"].short.input, Some(1_000_000));
+        assert_eq!(parsed.models["compact"].short.cached_input, Some(100_000));
+        assert!(parsed.models["compact"].long.is_none());
     }
 
     #[test]
