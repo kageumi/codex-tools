@@ -1,11 +1,11 @@
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
-const MAX_JSON_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_JSON_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct JsonStore;
 
@@ -21,24 +21,50 @@ impl JsonStore {
     where
         T: DeserializeOwned,
     {
-        if !path.exists() {
-            return Ok(default());
-        }
-        let metadata = fs::metadata(path)?;
-        if metadata.len() > MAX_JSON_BYTES {
-            anyhow::bail!("JSON 数据文件超过 32 MB：{}", path.display());
-        }
-        let bytes = fs::read(path)?;
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(default()),
+            Err(error) => return Err(error.into()),
+        };
+        Self::check_size(path, file.metadata()?.len(), MAX_JSON_BYTES)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_JSON_BYTES + 1).read_to_end(&mut bytes)?;
+        Self::check_size(path, bytes.len() as u64, MAX_JSON_BYTES)?;
         serde_json::from_slice(&bytes)
             .map_err(|error| anyhow::anyhow!("JSON 数据文件损坏（{}）：{error}", path.display()))
     }
 
     pub(crate) fn write_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+        Self::write_atomic_bytes(path, &serde_json::to_vec_pretty(value)?)
+    }
+
+    pub(crate) fn encode<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<Vec<u8>> {
         let bytes = serde_json::to_vec_pretty(value)?;
-        Self::write_atomic_bytes(path, &bytes)
+        Self::check_size(path, bytes.len() as u64, MAX_JSON_BYTES)?;
+        Ok(bytes)
     }
 
     pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        Self::write_bytes_with_limit(path, bytes, MAX_JSON_BYTES)
+    }
+
+    fn check_size(path: &Path, size: u64, limit: u64) -> anyhow::Result<()> {
+        if size > limit {
+            anyhow::bail!(
+                "JSON 数据文件超过 {} MB：{}",
+                limit / (1024 * 1024),
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_bytes_with_limit(
+        path: &Path,
+        bytes: &[u8],
+        limit: u64,
+    ) -> anyhow::Result<()> {
+        Self::check_size(path, bytes.len() as u64, limit)?;
         let same_length =
             fs::metadata(path).is_ok_and(|metadata| metadata.len() == bytes.len() as u64);
         if same_length && fs::read(path).is_ok_and(|current| current == bytes) {
@@ -141,10 +167,25 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn read_and_write_accept_the_same_exact_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data.json");
+        let text = "a".repeat(MAX_JSON_BYTES as usize - 2);
+        JsonStore::write_atomic(&path, &text).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_JSON_BYTES);
+        assert!(JsonStore::write_atomic(&path, &(text.clone() + "b")).is_err());
+        assert_eq!(
+            JsonStore::read_or_default(&path, String::new).unwrap(),
+            text
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn identical_write_keeps_existing_file() {
         use std::os::unix::fs::MetadataExt;

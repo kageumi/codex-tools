@@ -89,9 +89,18 @@ function harness(
   } = {}
 ) {
   class TestResponse {
+    ok = true
     payload: ModelData
-    constructor(payload: ModelData) {
+    url: string
+    constructor(
+      payload: ModelData,
+      url = "https://provider.example/v1/models"
+    ) {
+      this.url = url
       this.payload = payload
+    }
+    async text() {
+      return JSON.stringify(this.payload)
     }
     async json() {
       return this.payload
@@ -175,6 +184,7 @@ function harness(
   const context = createContext({
     window,
     Response: TestResponse,
+    URL,
     document: {
       getElementById: () => ({
         __reactContainerTest: {
@@ -221,6 +231,48 @@ function harness(
 }
 
 describe("model unlock reasoning levels", () => {
+  it.each([
+    "",
+    "https://provider.example/v1/files?next=/v1/models",
+    "https://provider.example/v1/models/other",
+  ])("leaves unrelated JSON untouched at %s", async (url) => {
+    const { TestResponse } = harness()
+    const payload = {
+      models: [stale()],
+      data: [{ id: "invoice" }],
+      result: { data: [] },
+      hiddenModels: ["gpt-6-astra"],
+    }
+    const expected = structuredClone(payload)
+    expect(await new TestResponse(payload, url).json()).toEqual(expected)
+  })
+
+  it("replaces a legacy global JSON hook when a window is already open", async () => {
+    const h = harness()
+    h.TestResponse.prototype.json = Object.assign(
+      async () => ({ models: [stale()] }),
+      { __CODEX_TOOLS_PATCHED__: 2 }
+    )
+    h.install()
+    expect(
+      await new h.TestResponse(
+        { models: [] },
+        "https://provider.example/v1/files"
+      ).json()
+    ).toEqual({ models: [] })
+  })
+
+  it("preserves error payloads returned by model endpoints", async () => {
+    const { TestResponse } = harness()
+    const payload = { models: [], data: [{ id: "error-details" }] }
+    const response = new TestResponse(payload)
+    response.ok = false
+    expect(await response.json()).toEqual({
+      models: [],
+      data: [{ id: "error-details" }],
+    })
+  })
+
   it("adds new models with all declared levels", async () => {
     const { TestResponse } = harness()
     const data = await new TestResponse({ models: [] }).json()
@@ -548,7 +600,7 @@ describe("model unlock fast mode", () => {
     }
   )
 
-  it("never patches speed tiers through the unscoped Response.json hook", async () => {
+  it("never patches speed tiers through the model-list Response.json hook", async () => {
     const h = harness([
       {
         ...entry(),

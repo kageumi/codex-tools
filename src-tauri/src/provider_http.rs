@@ -254,9 +254,7 @@ pub(crate) fn parse_model_reasoning_levels(item: &serde_json::Value) -> Option<V
                     .and_then(serde_json::Value::as_str)
             })
             .and_then(normalize_reasoning_effort);
-        if let Some(effort) = effort
-            && !levels.contains(&effort)
-        {
+        if let Some(effort) = effort.filter(|effort| !levels.contains(effort)) {
             levels.push(effort);
         }
     }

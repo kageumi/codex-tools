@@ -1,37 +1,49 @@
 use crate::{
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
-    commands::sessions::{repair_home_after_activation, repair_home_after_activation_with_paths},
-    models::{ActiveKind, AppError, RepairResult, StoredOfficialAccount},
+    commands::sessions::{
+        repair_home_after_activation, repair_home_after_activation_with_commit,
+        repair_home_after_activation_with_paths,
+    },
+    models::{ActiveKind, AppError, ProviderProfile, RepairResult, StoredOfficialAccount},
     provider_sync,
     state::ActivationLock,
     storage::Store,
 };
-use std::fs;
+use std::{fs, path::PathBuf};
 
 const CODEX_RUNNING_WARNING: &str =
     "请先退出 Codex，再更改账号、连接或会话归属，以免当前会话丢失或认证状态被覆盖。";
 
 pub(crate) fn ensure_codex_stopped(store: &Store) -> Result<(), AppError> {
     let configured = store.codex_app_setting()?;
-    ensure_codex_stopped_with(configured.as_deref(), |configured| {
-        #[cfg(test)]
-        {
-            let _ = configured;
-            false
-        }
-        #[cfg(not(test))]
-        {
-            crate::platform::codex_app_running(configured)
-        }
-    })
+    ensure_codex_stopped_if(codex_running_check(configured.as_deref())())
 }
 
-fn ensure_codex_stopped_with(
-    configured: Option<&str>,
-    running: impl FnOnce(Option<&str>) -> bool,
-) -> Result<(), AppError> {
-    if running(configured) {
+pub(crate) fn codex_running_check(configured: Option<&str>) -> impl Fn() -> bool + use<> {
+    #[cfg(test)]
+    {
+        let _ = configured;
+        || false
+    }
+    #[cfg(not(test))]
+    crate::platform::codex_running_check(configured)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn recover_interrupted_writes(store: &Store) -> Result<(), AppError> {
+    let home = codex::home(&store.codex_home_setting()?);
+    let configured = store.codex_app_setting()?;
+    tokio::task::spawn_blocking(move || {
+        let running = codex_running_check(configured.as_deref());
+        crate::storage::recover_interrupted_writes(&home, || Ok(!running())).map_err(AppError::from)
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+pub(crate) fn ensure_codex_stopped_if(running: bool) -> Result<(), AppError> {
+    if running {
         return Err(AppError::InvalidConfig(CODEX_RUNNING_WARNING.into()));
     }
     Ok(())
@@ -51,6 +63,7 @@ pub(crate) fn sync_active_openai_credential(
     let Some(record_id) = record_id else {
         return Ok(false);
     };
+    store.retry_pending_official_import()?;
     let mut credential = match codex::read_official_account(home) {
         Ok(Some(credential)) => credential,
         Ok(None) | Err(AppError::InvalidConfig(_)) => return Ok(false),
@@ -170,9 +183,13 @@ pub(crate) async fn sync_active_codex_configuration(
                 };
             }
             store.save_last_managed_model(None)?;
+            proxy.publish(None).await;
             return Ok(());
         }
-        ActiveKind::None => return Ok(()),
+        ActiveKind::None => {
+            proxy.publish(None).await;
+            return Ok(());
+        }
         ActiveKind::Provider => {}
     }
 
@@ -206,9 +223,7 @@ pub(crate) async fn sync_active_codex_configuration(
             ))),
         };
     }
-    if let Err(error) =
-        ensure_active_session_repair(store, home, codex::MANAGED_PROVIDER_ID.into()).await
-    {
+    if let Err(error) = repair_and_publish_provider(store, proxy, &provider, home).await {
         let files = manager.rollback_applied(applied);
         let managed_model = store.save_last_managed_model(previous_managed_model);
         return match (files, managed_model) {
@@ -226,7 +241,33 @@ pub(crate) async fn sync_active_codex_configuration(
     Ok(())
 }
 
-async fn ensure_active_session_repair(
+pub(crate) async fn repair_and_publish_provider(
+    store: &Store,
+    proxy: &ChatProxyRegistry,
+    provider: &ProviderProfile,
+    home: PathBuf,
+) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
+    let binding = proxy.binding_for_provider(provider).await?;
+    let provider_id = provider.id.clone();
+    let confirmation_store = store.clone();
+    let (repair, affected_paths) = repair_home_after_activation_with_commit(
+        store,
+        home,
+        codex::MANAGED_PROVIDER_ID.into(),
+        move || confirmation_store.confirm_chat_route(&provider_id, binding),
+    )
+    .await;
+    if !repair.repair_complete {
+        return Err(AppError::Internal(repair_incomplete_message(
+            &repair,
+            "无法应用连接配置",
+        )));
+    }
+    proxy.publish(Some(provider)).await;
+    Ok((repair, affected_paths))
+}
+
+pub(crate) async fn ensure_active_session_repair(
     store: &Store,
     home: std::path::PathBuf,
     target_provider: String,
@@ -369,6 +410,7 @@ pub(crate) async fn activate_openai_record_with_paths(
     .await;
     match result {
         Ok((mut repair, affected_paths)) => {
+            proxy.publish(None).await;
             crate::confirm_pending(ledger, &pending_id, &mut repair);
             Ok((repair, affected_paths))
         }
@@ -428,13 +470,13 @@ mod tests {
 
     #[test]
     fn codex_mutation_gate_rejects_a_running_app() {
-        let error = ensure_codex_stopped_with(Some("Codex.exe"), |_| true).unwrap_err();
+        let error = ensure_codex_stopped_if(true).unwrap_err();
         assert!(error.to_string().contains("请先退出 Codex"));
     }
 
     #[test]
     fn codex_mutation_gate_allows_a_stopped_app() {
-        ensure_codex_stopped_with(None, |_| false).unwrap();
+        ensure_codex_stopped_if(false).unwrap();
     }
 
     #[tokio::test]

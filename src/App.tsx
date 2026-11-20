@@ -26,6 +26,8 @@ import {
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import { useTheme } from "next-themes"
+import { isTauri } from "@tauri-apps/api/core"
+import { listen } from "@tauri-apps/api/event"
 
 import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -64,8 +66,10 @@ import {
 } from "@/components/ui/tooltip"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
+import { createRequestGate } from "@/lib/request-gate"
 import type {
   Dashboard,
+  OfficialAccountView,
   Page,
   ProviderOverview,
   SettingsSection,
@@ -171,8 +175,10 @@ export default function App() {
   const [contextMounted, setContextMounted] = useState(false)
   const [refreshRevision, setRefreshRevision] = useState(0)
   const [dashboard, setDashboard] = useState<Dashboard>()
-  const [connections, setConnections] = useState<ProviderOverview>()
-  const [selectedConnection, setSelectedConnection] = useState<string>()
+  const [{ connections, selectedConnection }, setConnectionState] = useState<{
+    connections?: ProviderOverview
+    selectedConnection?: string
+  }>({})
   const [usageDays, setUsageDays] = useState(7)
   const [usageGroupBy, setUsageGroupBy] = useState<UsageGroupBy>("model")
   const [sessionQuery, setSessionQuery] = useState("")
@@ -182,38 +188,39 @@ export default function App() {
   const [launching, setLaunching] = useState(false)
   const [stateLoading, setStateLoading] = useState(true)
   const [stateError, setStateError] = useState<string>()
+  const [sharedReadGate] = useState(createRequestGate)
   const loadedStateRevision = useRef<number | undefined>(undefined)
   const sharedStateActive = usesSharedConnectionState(page)
 
   useEffect(() => {
     if (!sharedStateActive) return
     if (loadedStateRevision.current === refreshRevision) return
-    let cancelled = false
+    const request = sharedReadGate.begin()
     void Promise.allSettled([call("dashboard_get"), call("connections_list")])
       .then(([dashboardResult, connectionsResult]) => {
-        if (cancelled) return
+        if (!sharedReadGate.isCurrent(request)) return
         if (dashboardResult.status === "fulfilled") {
           setDashboard(dashboardResult.value)
         }
         if (connectionsResult.status === "fulfilled") {
           const nextConnections = connectionsResult.value
-          setConnections(nextConnections)
-          setSelectedConnection((current) => {
-            const allConnections = [
-              ...nextConnections.officialAccounts,
-              ...nextConnections.providers,
-            ]
-            if (current && allConnections.some((item) => item.id === current)) {
-              return current
-            }
-            return (
-              nextConnections.officialAccounts.find((account) => account.active)
-                ?.id ??
-              nextConnections.providers.find((provider) => provider.active)
-                ?.id ??
-              allConnections[0]?.id
+          const allConnections = [
+            ...nextConnections.officialAccounts,
+            ...nextConnections.providers,
+          ]
+          const defaultSelection =
+            nextConnections.officialAccounts.find((account) => account.active)
+              ?.id ??
+            nextConnections.providers.find((provider) => provider.active)?.id ??
+            allConnections[0]?.id
+          setConnectionState(({ selectedConnection }) => ({
+            connections: nextConnections,
+            selectedConnection: allConnections.some(
+              (item) => item.id === selectedConnection
             )
-          })
+              ? selectedConnection
+              : defaultSelection,
+          }))
         }
         const errors = [dashboardResult, connectionsResult]
           .filter(
@@ -234,19 +241,56 @@ export default function App() {
         }
       })
       .finally(() => {
-        if (!cancelled) setStateLoading(false)
+        if (sharedReadGate.isCurrent(request)) setStateLoading(false)
+        sharedReadGate.finish(request)
       })
-    return () => {
-      cancelled = true
-    }
-  }, [refreshRevision, sharedStateActive])
+    return () => sharedReadGate.finish(request)
+  }, [refreshRevision, sharedReadGate, sharedStateActive])
 
   const refresh = useCallback(() => {
+    sharedReadGate.invalidate()
     if (usesSharedConnectionState(pageRef.current)) {
       setStateLoading(true)
     }
     setRefreshRevision((value) => value + 1)
+  }, [sharedReadGate])
+
+  const selectSavedAccounts = useCallback((saved: OfficialAccountView[]) => {
+    const first = saved[0]
+    if (!first) return
+    setConnectionState(({ connections }) => {
+      const byId = new Map(
+        connections?.officialAccounts.map((account) => [account.id, account])
+      )
+      const selected = saved.find((account) => !byId.has(account.id)) ?? first
+      for (const account of saved) byId.set(account.id, account)
+      return {
+        connections: {
+          providers: connections?.providers ?? [],
+          officialAccounts: [...byId.values()],
+        },
+        selectedConnection: selected.id,
+      }
+    })
   }, [])
+
+  const selectConnection = useCallback((id: string) => {
+    setConnectionState((current) => ({ ...current, selectedConnection: id }))
+  }, [])
+
+  useEffect(() => {
+    if (!isTauri()) return
+    let active = true
+    const subscription = listen("provider-models-refreshed", () => {
+      if (!active) return
+      loadedStateRevision.current = undefined
+      if (usesSharedConnectionState(pageRef.current)) refresh()
+    }).catch(() => undefined)
+    return () => {
+      active = false
+      void subscription.then((unsubscribe) => unsubscribe?.())
+    }
+  }, [refresh])
 
   const launch = useCallback(async () => {
     setLaunching(true)
@@ -466,7 +510,7 @@ export default function App() {
                     {...sharedProps}
                     connections={connections}
                     selectedId={selectedConnection}
-                    onSelectedIdChange={setSelectedConnection}
+                    onAccountsSaved={selectSavedAccounts}
                   />
                 )}
                 {page === "usage" &&
@@ -505,7 +549,7 @@ export default function App() {
               page={page}
               connections={connections}
               selectedConnection={selectedConnection}
-              onSelectedConnectionChange={setSelectedConnection}
+              onSelectedConnectionChange={selectConnection}
               usageDays={usageDays}
               onUsageDaysChange={setUsageDays}
               usageGroupBy={usageGroupBy}

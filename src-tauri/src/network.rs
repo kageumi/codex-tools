@@ -109,8 +109,9 @@ fn cached_proxy_snapshot() -> ProxySnapshot {
             .get_or_init(|| Mutex::new(None))
             .lock()
             .expect("网络客户端缓存锁已损坏");
-        if let Some((fetched_at, snapshot)) = cache.as_ref()
-            && fetched_at.elapsed() < PROXY_SNAPSHOT_CACHE_TTL
+        if let Some((_, snapshot)) = cache
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < PROXY_SNAPSHOT_CACHE_TTL)
         {
             return snapshot.clone();
         }
@@ -120,8 +121,9 @@ fn cached_proxy_snapshot() -> ProxySnapshot {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("网络客户端缓存锁已损坏");
-    if let Some((fetched_at, cached)) = cache.as_ref()
-        && fetched_at.elapsed() < PROXY_SNAPSHOT_CACHE_TTL
+    if let Some((_, cached)) = cache
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < PROXY_SNAPSHOT_CACHE_TTL)
     {
         return cached.clone();
     }
@@ -170,6 +172,7 @@ impl ClientCache {
         timeout: Option<Duration>,
     ) -> Result<Client, reqwest::Error> {
         let builder = client_builder_for(snapshot)?
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -437,10 +440,12 @@ fn parse_scutil_proxy(text: &str) -> Option<SystemProxy> {
             in_exceptions = false;
             continue;
         }
-        if in_exceptions && let Some((_, entry)) = line.split_once(':') {
-            let entry = entry.trim();
-            if !entry.is_empty() {
-                settings.bypass.push(entry.to_owned());
+        if in_exceptions {
+            if let Some((_, entry)) = line.split_once(':') {
+                let entry = entry.trim();
+                if !entry.is_empty() {
+                    settings.bypass.push(entry.to_owned());
+                }
             }
         }
     }
@@ -568,6 +573,31 @@ mod tests {
         assert!(no_proxy(&["<local>".into()]).is_some());
         assert!(no_proxy(&["".into()]).is_none());
         assert!(no_proxy(&["  ".into()]).is_none());
+    }
+
+    #[tokio::test]
+    async fn standalone_client_returns_the_first_redirect() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/start",
+                axum::routing::get(|| async { axum::response::Redirect::temporary("/end") }),
+            )
+            .route("/end", axum::routing::get(|| async { "end" }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = ClientCache::build_standalone(&ProxySnapshot::default(), None).unwrap();
+        let response = client
+            .get(format!("http://{address}/start"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.abort();
     }
 
     #[test]

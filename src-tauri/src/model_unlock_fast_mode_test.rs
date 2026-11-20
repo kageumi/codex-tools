@@ -45,10 +45,10 @@ impl AppServer {
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if let Ok(message) = serde_json::from_str(&line)
-                    && sender.send(message).is_err()
-                {
-                    break;
+                if let Ok(message) = serde_json::from_str(&line) {
+                    if sender.send(message).is_err() {
+                        break;
+                    }
                 }
             }
         });

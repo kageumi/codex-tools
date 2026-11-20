@@ -38,6 +38,10 @@ fn codex_bin_override() -> Option<OsString> {
 }
 
 fn codex_cli_executable() -> OsString {
+    resolve_codex_cli(|| codex_app_path(None))
+}
+
+fn resolve_codex_cli(app_path: impl FnOnce() -> Option<PathBuf>) -> OsString {
     if let Some(configured) = codex_bin_override() {
         return configured;
     }
@@ -46,7 +50,7 @@ fn codex_cli_executable() -> OsString {
         return path.into_os_string();
     }
 
-    if let Some(path) = codex_app_path(None).and_then(|path| codex_cli_from_app_path(&path)) {
+    if let Some(path) = app_path().and_then(|path| codex_cli_from_app_path(&path)) {
         return path.into_os_string();
     }
 
@@ -280,11 +284,19 @@ pub fn codex_app_found(configured: Option<&str>) -> bool {
 /// Codex 桌面应用或 CLI 当前是否在运行，用于降低认证、配置和会话文件
 /// 与 Codex 并发改写的风险。
 pub fn codex_app_running(configured: Option<&str>) -> bool {
+    codex_running_check(configured)()
+}
+
+pub(crate) fn codex_running_check(configured: Option<&str>) -> impl Fn() -> bool + use<> {
+    let app_path = codex_app_path(configured);
+    let cli_path = resolve_codex_cli(|| app_path.clone());
+    move || codex_paths_running(app_path.as_deref(), Path::new(&cli_path))
+}
+
+fn codex_paths_running(app_path: Option<&Path>, cli_path: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
-        let app_path = codex_app_path(configured);
-        let cli_path = codex_cli_executable();
-        if app_path.as_deref().is_some_and(path_running) || path_running(Path::new(&cli_path)) {
+        if app_path.is_some_and(path_running) || path_running(cli_path) {
             return true;
         }
         ["Codex", "ChatGPT", "codex"]
@@ -293,20 +305,14 @@ pub fn codex_app_running(configured: Option<&str>) -> bool {
     }
     #[cfg(windows)]
     {
-        let app_path = codex_app_path(configured);
-        let cli_path = codex_cli_executable();
         let mut names: Vec<&str> = Vec::with_capacity(5);
         if let Some(name) = app_path
-            .as_deref()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
         {
             names.push(name);
         }
-        if let Some(name) = Path::new(&cli_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-        {
+        if let Some(name) = cli_path.file_name().and_then(|name| name.to_str()) {
             names.push(name);
         }
         names.extend(["Codex.exe", "codex.exe", "ChatGPT.exe"]);
@@ -315,6 +321,7 @@ pub fn codex_app_running(configured: Option<&str>) -> bool {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let _ = (app_path, cli_path);
         false
     }
 }

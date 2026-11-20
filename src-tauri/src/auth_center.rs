@@ -1,11 +1,11 @@
 use crate::models::{
     AppError, CodexAuthCredential, CodexAuthTokens, MAX_ACCOUNT_ID_CHARS, MAX_CREDENTIAL_CHARS,
     MAX_DISPLAY_NAME_CHARS, OfficialAccountSource, OpenAiDeviceAuthorization, ProviderAccountQuota,
-    StoredOfficialAccount, ensure_char_limit, official_account_identity_matches, token_identity,
-    token_local_identity,
+    StoredOfficialAccount, email_display_name, ensure_char_limit,
+    official_account_identity_matches, token_identity, token_local_identity,
 };
 use crate::proxy_import::ImportedProxyCredential;
-use crate::storage::Store;
+use crate::storage::{Store, unconfirmed_official_refresh_error};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -59,6 +59,12 @@ pub(crate) enum DevicePollResult {
     Pending,
     Expired,
     Complete(Box<StoredOfficialAccount>),
+}
+
+#[derive(Debug)]
+pub(crate) enum ImportExchangeError {
+    Rejected(AppError),
+    MayHaveRotated,
 }
 
 pub struct AuthCenter {
@@ -287,10 +293,23 @@ impl AuthCenter {
         account_id: &str,
         force: bool,
     ) -> Result<AccountRefreshResult, AppError> {
+        self.refresh_account_with_client(store, account_id, force, || self.client(), TOKEN_URL)
+            .await
+    }
+
+    async fn refresh_account_with_client(
+        &self,
+        store: &Store,
+        account_id: &str,
+        force: bool,
+        client: impl FnOnce() -> Result<reqwest::Client, AppError>,
+        url: &str,
+    ) -> Result<AccountRefreshResult, AppError> {
         // Refresh tokens can rotate and are single-use. Keep the store reload,
         // exchange, and durable save in one shared critical section so a waiter
         // never consumes a stale snapshot after another refresh has completed.
         let _guard = self.refresh_lock.lock().await;
+        store.retry_pending_official_import()?;
         let account = store.official_account(account_id)?;
         if refresh_decision(&account, force, chrono::Utc::now().timestamp())?
             == AccountRefreshDecision::KeepCurrent
@@ -300,9 +319,12 @@ impl AuthCenter {
                 refreshed: false,
             });
         }
-        let http = self.client()?;
-        let response = http
-            .post(TOKEN_URL)
+        let http = client()?;
+        // Persist the exact credential before sending. Cancellation or a
+        // restart after sending must have the same guard as a broken response.
+        let attempt = store.record_official_refresh_attempt(&account)?;
+        let response = match http
+            .post(url)
             .json(&json!({
                 "client_id": CODEX_CLIENT_ID,
                 "grant_type": "refresh_token",
@@ -310,7 +332,14 @@ impl AuthCenter {
             }))
             .send()
             .await
-            .map_err(safe_network_error)?;
+        {
+            Ok(response) => response,
+            Err(error) if error.is_connect() || error.is_builder() => {
+                store.clear_official_refresh_attempt(account_id, &attempt)?;
+                return Err(safe_network_error(error));
+            }
+            Err(_) => return Err(unconfirmed_official_refresh_error()),
+        };
 
         if matches!(
             response.status(),
@@ -320,22 +349,18 @@ impl AuthCenter {
                 "OpenAI 授权已过期，请重新登录。".into(),
             ));
         }
-        if response.status() == StatusCode::TOO_MANY_REQUESTS || response.status().is_server_error()
-        {
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            store.clear_official_refresh_attempt(account_id, &attempt)?;
             return Err(AppError::Internal(
                 "OpenAI 登录更新暂时不可用，将在稍后自动重试。".into(),
             ));
         }
         if !response.status().is_success() {
-            return Err(AppError::Internal(
-                "OpenAI 登录更新暂时不可用，将在稍后自动重试。".into(),
-            ));
+            return Err(unconfirmed_official_refresh_error());
         }
         let refreshed: TokenResponse = read_json_bounded(response, "登录凭据更新结果")
             .await
-            .map_err(|_| {
-                AppError::Internal("OpenAI 登录更新暂时不可用，将在稍后自动重试。".into())
-            })?;
+            .map_err(|_| unconfirmed_official_refresh_error())?;
         let tokens = merge_refreshed_tokens(refreshed, &account)?;
         let refreshed = account_from_tokens(tokens, Some(&account))?;
         Ok(AccountRefreshResult {
@@ -344,85 +369,80 @@ impl AuthCenter {
         })
     }
 
-    pub async fn connections_import_cookie(
+    pub(crate) async fn exchange_imported_credential(
         &self,
         imported: ImportedProxyCredential,
         requested_name: Option<String>,
-    ) -> Result<StoredOfficialAccount, AppError> {
-        if let Some(name) = requested_name.as_deref() {
-            ensure_char_limit(
-                name.trim(),
-                MAX_DISPLAY_NAME_CHARS,
-                "账号名称不能超过 100 个字符。",
-            )?;
-        }
-        if let Some(account_id) = imported.account_id.as_deref() {
-            ensure_char_limit(
-                account_id.trim(),
-                MAX_ACCOUNT_ID_CHARS,
-                "OpenAI 账号标识不能超过 512 个字符。",
-            )?;
-        }
-        for token in [
-            imported.access_token.as_deref(),
-            imported.id_token.as_deref(),
-            imported.refresh_token.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            ensure_char_limit(
-                token,
-                MAX_CREDENTIAL_CHARS,
-                "Cookie 登录数据中的单个 Token 过长，请检查导入内容。",
-            )?;
-        }
-        if imported.access_token.is_none() {
-            // A refresh-token-only import consumes the same rotating credential
-            // as normal login refreshes. Serialize the exchange so no other
-            // auth path can consume that token at the same time.
-            let _guard = self.refresh_lock.lock().await;
-            let refresh_token = imported.refresh_token.clone().ok_or_else(|| {
-                AppError::InvalidConfig(
-                    "Cookie 登录数据缺少 Access Token 或 Refresh Token。".into(),
-                )
+    ) -> Result<StoredOfficialAccount, ImportExchangeError> {
+        // A refresh-token-only import consumes the same rotating credential
+        // as normal login refreshes. Serialize the exchange so no other
+        // auth path can consume that token at the same time.
+        let _guard = self.refresh_lock.lock().await;
+        let refresh_token = imported.refresh_token.as_ref().ok_or_else(|| {
+            ImportExchangeError::Rejected(AppError::InvalidConfig(
+                "Cookie 登录数据缺少 Access Token 或 Refresh Token。".into(),
+            ))
+        })?;
+        let http = self.client().map_err(ImportExchangeError::Rejected)?;
+        let response = http
+            .post(TOKEN_URL)
+            .json(&json!({
+                "client_id": CODEX_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_connect() || error.is_builder() {
+                    ImportExchangeError::Rejected(safe_network_error(error))
+                } else {
+                    ImportExchangeError::MayHaveRotated
+                }
             })?;
-            let http = self.client()?;
-            let response = http
-                .post(TOKEN_URL)
-                .json(&json!({
-                    "client_id": CODEX_CLIENT_ID,
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                }))
-                .send()
-                .await
-                .map_err(safe_network_error)?;
-            let response =
-                require_success(response, "无法使用 Cookie 中的 Refresh Token 获取登录凭据")?;
-            let refreshed: TokenResponse =
-                read_json_bounded(response, "Cookie 登录数据交换结果").await?;
-            let expires_at = refreshed
-                .expires_in
-                .filter(|seconds| *seconds > 0)
-                .map(|seconds| chrono::Utc::now().timestamp().saturating_add(seconds))
-                .or(imported.expires_at);
-            let refreshed_import = ImportedProxyCredential {
-                access_token: Some(required_token(refreshed.access_token, "access_token")?),
-                id_token: non_empty(refreshed.id_token),
-                refresh_token: non_empty(refreshed.refresh_token)
-                    .or_else(|| imported.refresh_token.clone()),
-                account_id: imported.account_id,
-                email: imported.email,
-                suggested_name: imported.suggested_name,
-                expires_at,
-                source_format: imported.source_format,
-                is_personal_access_token: imported.is_personal_access_token,
-            };
-            return account_from_imported_tokens(refreshed_import, requested_name);
-        }
+        Self::account_from_exchange_response(response, imported, requested_name).await
+    }
 
-        account_from_imported_tokens(imported, requested_name)
+    pub(crate) async fn account_from_exchange_response(
+        response: reqwest::Response,
+        imported: ImportedProxyCredential,
+        requested_name: Option<String>,
+    ) -> Result<StoredOfficialAccount, ImportExchangeError> {
+        let rejected =
+            response.status().is_client_error() && response.status() != StatusCode::REQUEST_TIMEOUT;
+        let response = require_success(response, "无法使用 Cookie 中的 Refresh Token 获取登录凭据")
+            .map_err(|error| {
+                if rejected {
+                    ImportExchangeError::Rejected(error)
+                } else {
+                    ImportExchangeError::MayHaveRotated
+                }
+            })?;
+        let refreshed: TokenResponse = read_json_bounded(response, "Cookie 登录数据交换结果")
+            .await
+            .map_err(|_| ImportExchangeError::MayHaveRotated)?;
+        let expires_at = refreshed
+            .expires_in
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| chrono::Utc::now().timestamp().saturating_add(seconds))
+            .or(imported.expires_at);
+        let refreshed_import = ImportedProxyCredential {
+            access_token: Some(
+                required_token(refreshed.access_token, "access_token")
+                    .map_err(|_| ImportExchangeError::MayHaveRotated)?,
+            ),
+            id_token: non_empty(refreshed.id_token),
+            refresh_token: non_empty(refreshed.refresh_token)
+                .or_else(|| imported.refresh_token.clone()),
+            account_id: imported.account_id,
+            email: imported.email,
+            suggested_name: imported.suggested_name,
+            expires_at,
+            source_format: imported.source_format,
+            is_personal_access_token: imported.is_personal_access_token,
+        };
+        account_from_imported_tokens(refreshed_import, requested_name)
+            .map_err(|_| ImportExchangeError::MayHaveRotated)
     }
 
     fn client(&self) -> Result<reqwest::Client, AppError> {
@@ -530,8 +550,7 @@ fn merge_refreshed_tokens(
 ) -> Result<CompleteTokens, AppError> {
     let id_token =
         non_empty(response.id_token).unwrap_or_else(|| previous.credential.tokens.id_token.clone());
-    let access_token = non_empty(response.access_token)
-        .unwrap_or_else(|| previous.credential.tokens.access_token.clone());
+    let access_token = required_token(response.access_token, "access_token")?;
     let refresh_token = non_empty(response.refresh_token)
         .unwrap_or_else(|| previous.credential.tokens.refresh_token.clone());
     if id_token.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
@@ -642,11 +661,10 @@ fn account_from_tokens(
 
     let refreshed = StoredOfficialAccount {
         id: previous.map_or_else(String::new, |account| account.id.clone()),
-        name: if email.is_empty() {
-            previous.map_or_else(|| "OpenAI 账号".into(), |account| account.name.clone())
-        } else {
-            email.clone()
-        },
+        name: email_display_name(&email)
+            .map(str::to_owned)
+            .or_else(|| previous.map(|account| account.name.clone()))
+            .unwrap_or_else(|| "OpenAI 账号".into()),
         remark: previous.map_or_else(String::new, |account| account.remark.clone()),
         account_id,
         email,
@@ -667,7 +685,49 @@ fn account_from_tokens(
     Ok(refreshed)
 }
 
-fn account_from_imported_tokens(
+pub(crate) fn validate_import_fields(
+    imported: &ImportedProxyCredential,
+    requested_name: Option<&str>,
+) -> Result<(), AppError> {
+    if let Some(name) = requested_name.or(imported.suggested_name.as_deref()) {
+        ensure_char_limit(
+            name.trim(),
+            MAX_DISPLAY_NAME_CHARS,
+            "账号名称不能超过 100 个字符。",
+        )?;
+    }
+    if let Some(account_id) = imported.account_id.as_deref() {
+        ensure_char_limit(
+            account_id.trim(),
+            MAX_ACCOUNT_ID_CHARS,
+            "OpenAI 账号标识不能超过 512 个字符。",
+        )?;
+    }
+    for token in [
+        imported.access_token.as_deref(),
+        imported.id_token.as_deref(),
+        imported.refresh_token.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ensure_char_limit(
+            token,
+            MAX_CREDENTIAL_CHARS,
+            "Cookie 登录数据中的单个 Token 过长，请检查导入内容。",
+        )?;
+    }
+    if let Some(email) = imported.email.as_deref() {
+        ensure_char_limit(
+            email.trim(),
+            crate::storage::MAX_EMAIL_CHARS,
+            "账号邮箱不能超过 320 个字符。",
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn account_from_imported_tokens(
     imported: ImportedProxyCredential,
     requested_name: Option<String>,
 ) -> Result<StoredOfficialAccount, AppError> {
@@ -744,7 +804,7 @@ fn apply_imported_profile(
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .or_else(|| imported.suggested_name.clone())
-        .or_else(|| (!account.email.is_empty()).then(|| account.email.clone()))
+        .or_else(|| email_display_name(&account.email).map(str::to_owned))
         .unwrap_or_else(|| "Cookie 账号".into());
 }
 
@@ -835,6 +895,11 @@ mod tests {
     use super::*;
     use crate::models::QuotaStatus;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use futures_util::FutureExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn jwt(claims: Value) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
@@ -869,6 +934,227 @@ mod tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    async fn serve_refresh_fixture(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (url, server)
+    }
+
+    fn refresh_fixture_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn interrupted_refresh_never_resends_the_same_token_after_reopen() {
+        use axum::{body::Body, response::IntoResponse};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fixture-data");
+        let store = Store::open(root.clone()).unwrap();
+        let saved = store
+            .save_official_account(&refresh_test_account(
+                OfficialAccountSource::OpenAiOauth,
+                "fixture-old-refresh",
+                None,
+            ))
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (url, server) = serve_refresh_fixture(axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let request = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if request == 0 {
+                        let prefix = futures_util::stream::once(async {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                b"{\"access_token\":",
+                            ))
+                        });
+                        let broken = futures_util::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                        });
+                        (StatusCode::OK, Body::from_stream(prefix.chain(broken))).into_response()
+                    } else {
+                        axum::Json(json!({
+                            "access_token": jwt(json!({"chatgpt_account_id": "acct-1"})),
+                            "refresh_token": "fixture-completed-refresh",
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        ))
+        .await;
+        let client = refresh_fixture_client();
+        let center = AuthCenter::default();
+        let error = center
+            .refresh_account_with_client(&store, &saved.id, true, || Ok(client.clone()), &url)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, AppError::InvalidConfig(_)));
+        assert!(error.to_string().contains("重新进行官方授权"));
+        drop(store);
+
+        let store = Store::open(root).unwrap();
+        let retry = center
+            .refresh_account_with_client(&store, &saved.id, true, || Ok(client.clone()), &url)
+            .await;
+        assert!(matches!(retry, Err(AppError::InvalidConfig(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut authorized_again = saved;
+        authorized_again.credential.tokens.refresh_token = "fixture-new-authorization".into();
+        let authorized_again = store.save_official_account(&authorized_again).unwrap();
+        let result = center
+            .refresh_account_with_client(
+                &store,
+                &authorized_again.id,
+                true,
+                || Ok(client.clone()),
+                &url,
+            )
+            .await
+            .unwrap();
+        assert!(result.refreshed);
+        assert_eq!(
+            result.account.credential.tokens.refresh_token,
+            "fixture-completed-refresh"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_submitted_refresh_keeps_the_restart_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fixture-data");
+        let store = Store::open(root.clone()).unwrap();
+        let saved = store
+            .save_official_account(&refresh_test_account(
+                OfficialAccountSource::OpenAiOauth,
+                "fixture-cancelled-refresh",
+                None,
+            ))
+            .unwrap();
+        let submitted = Arc::new(tokio::sync::Notify::new());
+        let notify = submitted.clone();
+        let (url, server) = serve_refresh_fixture(axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                notify.notify_one();
+                std::future::pending::<StatusCode>()
+            }),
+        ))
+        .await;
+        let pending = tokio::spawn({
+            let id = saved.id.clone();
+            let url = url.clone();
+            async move {
+                AuthCenter::default()
+                    .refresh_account_with_client(
+                        &store,
+                        &id,
+                        true,
+                        || Ok(refresh_fixture_client()),
+                        &url,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), submitted.notified())
+            .await
+            .unwrap();
+        pending.abort();
+        assert!(pending.await.err().unwrap().is_cancelled());
+
+        let store = Store::open(root).unwrap();
+        let retry = AuthCenter::default()
+            .refresh_account_with_client(
+                &store,
+                &saved.id,
+                true,
+                || Ok(refresh_fixture_client()),
+                &url,
+            )
+            .await;
+        assert!(matches!(retry, Err(AppError::InvalidConfig(_))));
+        assert!(submitted.notified().now_or_never().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_rejected_by_rate_limiting_can_be_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fixture-data");
+        let store = Store::open(root.clone()).unwrap();
+        let saved = store
+            .save_official_account(&refresh_test_account(
+                OfficialAccountSource::OpenAiOauth,
+                "fixture-rate-limited-refresh",
+                None,
+            ))
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (url, server) = serve_refresh_fixture(axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let request = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if request == 0 {
+                        (StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({})))
+                    } else {
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "access_token": jwt(json!({"chatgpt_account_id": "acct-1"})),
+                                "refresh_token": "fixture-renewed-refresh",
+                            })),
+                        )
+                    }
+                }
+            }),
+        ))
+        .await;
+        let center = AuthCenter::default();
+        let request = center
+            .refresh_account_with_client(
+                &store,
+                &saved.id,
+                true,
+                || Ok(refresh_fixture_client()),
+                &url,
+            )
+            .await;
+        assert!(matches!(request, Err(AppError::Internal(_))));
+        drop(store);
+        let reopened = Store::open(root).unwrap();
+        assert!(
+            center
+                .refresh_account_with_client(
+                    &reopened,
+                    &saved.id,
+                    true,
+                    || Ok(refresh_fixture_client()),
+                    &url,
+                )
+                .await
+                .unwrap()
+                .refreshed
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 
     #[test]

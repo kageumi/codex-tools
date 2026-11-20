@@ -1,7 +1,5 @@
-#[cfg(not(test))]
-use crate::platform;
 use crate::{
-    activation::ensure_codex_stopped,
+    activation::{codex_running_check, ensure_codex_stopped_if},
     codex,
     models::{
         AppError, PageResult, RepairResult, RepairScan, SessionAction, SessionDeletePreview,
@@ -20,26 +18,14 @@ const MAX_SESSION_QUERY_CHARS: usize = 256;
 /// 不能缓存此判断：Codex 可能在 rollout 与 SQLite 两次写入之间重新启动，或
 /// 激活操作已切换到其他连接。修复引擎会在每一次实际写入之前调用它。
 fn may_write_now(
-    configured_app: &Option<String>,
+    running: &impl Fn() -> bool,
     home: &std::path::Path,
     expected: &str,
 ) -> Result<bool, AppError> {
-    if codex_app_is_running(configured_app.as_deref()) {
+    if running() {
         return Ok(false);
     }
     Ok(provider_sync::configured_provider(home) == expected)
-}
-
-fn codex_app_is_running(configured: Option<&str>) -> bool {
-    #[cfg(test)]
-    {
-        let _ = configured;
-        false
-    }
-    #[cfg(not(test))]
-    {
-        platform::codex_app_running(configured)
-    }
 }
 
 pub(crate) async fn scan_home(home: PathBuf) -> Result<RepairScan, AppError> {
@@ -54,14 +40,15 @@ pub(crate) async fn repair_home_with_paths(
     target_provider: String,
 ) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
     let configured_app = store.codex_app_setting()?;
-    ensure_codex_stopped(store)?;
+    let running = codex_running_check(configured_app.as_deref());
+    ensure_codex_stopped_if(running())?;
     let expected_configured_provider = provider_sync::configured_provider(&home);
     tokio::task::spawn_blocking(move || {
         provider_sync::repair_with_guard_with_paths_for_app(
             &home,
             &target_provider,
             configured_app.as_deref(),
-            || may_write_now(&configured_app, &home, &expected_configured_provider),
+            || may_write_now(&running, &home, &expected_configured_provider),
         )
     })
     .await
@@ -83,6 +70,15 @@ pub(crate) async fn repair_home_after_activation_with_paths(
     home: PathBuf,
     target_provider: String,
 ) -> (RepairResult, Vec<PathBuf>) {
+    repair_home_after_activation_with_commit(store, home, target_provider, || Ok(())).await
+}
+
+pub(crate) async fn repair_home_after_activation_with_commit(
+    store: &Store,
+    home: PathBuf,
+    target_provider: String,
+    finish: impl FnOnce() -> Result<(), AppError> + Send + 'static,
+) -> (RepairResult, Vec<PathBuf>) {
     let configured_app = match store.codex_app_setting() {
         Ok(configured_app) => configured_app,
         Err(error) => {
@@ -96,7 +92,8 @@ pub(crate) async fn repair_home_after_activation_with_paths(
             );
         }
     };
-    if let Err(error) = ensure_codex_stopped(store) {
+    let running = codex_running_check(configured_app.as_deref());
+    if let Err(error) = ensure_codex_stopped_if(running()) {
         return (
             RepairResult {
                 target_provider,
@@ -109,12 +106,13 @@ pub(crate) async fn repair_home_after_activation_with_paths(
     let expected_configured_provider = provider_sync::configured_provider(&home);
     let repair_target = target_provider.clone();
     let result = tokio::task::spawn_blocking(move || {
-        provider_sync::repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app(
+        provider_sync::repair_after_connection_switch_with_commit(
             &home,
             &repair_target,
             None,
             configured_app.as_deref(),
-            || may_write_now(&configured_app, &home, &expected_configured_provider),
+            || may_write_now(&running, &home, &expected_configured_provider),
+            finish,
         )
     })
     .await
@@ -486,6 +484,19 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use std::fs;
+
+    #[test]
+    fn repair_guard_rechecks_the_process_and_current_provider_at_each_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let running = std::cell::Cell::new(false);
+        let check = || running.get();
+        assert!(may_write_now(&check, temp.path(), "openai").unwrap());
+        running.set(true);
+        assert!(!may_write_now(&check, temp.path(), "openai").unwrap());
+        running.set(false);
+        fs::write(temp.path().join("config.toml"), "model_provider='custom'").unwrap();
+        assert!(!may_write_now(&check, temp.path(), "openai").unwrap());
+    }
 
     #[tokio::test]
     async fn post_activation_switch_preserves_rollout_and_thread_history_projection() {

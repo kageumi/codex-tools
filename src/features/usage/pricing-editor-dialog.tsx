@@ -66,15 +66,17 @@ export function PricingEditor({
   const [billingMode, setBillingMode] = useState<
     Extract<BillingMode, "token" | "unpriced">
   >(editingRule?.billingMode === "token" ? "token" : "unpriced")
-  const [input, setInput] = useState(editingRule?.inputUsdPerMillion ?? "2.50")
+  const [input, setInput] = useState(
+    editingRule ? (editingRule.inputUsdPerMillion ?? "") : "2.50"
+  )
   const [cachedRead, setCachedRead] = useState(
-    editingRule?.cachedReadUsdPerMillion ?? "0.25"
+    editingRule ? (editingRule.cachedReadUsdPerMillion ?? "") : "0.25"
   )
   const [cacheWrite, setCacheWrite] = useState(
-    editingRule?.cacheWriteUsdPerMillion ?? "3.00"
+    editingRule ? (editingRule.cacheWriteUsdPerMillion ?? "") : "3.00"
   )
   const [output, setOutput] = useState(
-    editingRule?.outputUsdPerMillion ?? "10.00"
+    editingRule ? (editingRule.outputUsdPerMillion ?? "") : "10.00"
   )
   const [cacheWriteIncluded, setCacheWriteIncluded] = useState(
     editingRule?.cacheWriteIncludedInInput ?? true
@@ -114,10 +116,14 @@ export function PricingEditor({
       modelPattern: normalizedPattern,
       matchKind: "exact",
       billingMode,
-      inputUsdPerMillion: billingMode === "token" ? input : undefined,
-      cachedReadUsdPerMillion: billingMode === "token" ? cachedRead : undefined,
-      cacheWriteUsdPerMillion: billingMode === "token" ? cacheWrite : undefined,
-      outputUsdPerMillion: billingMode === "token" ? output : undefined,
+      inputUsdPerMillion:
+        billingMode === "token" ? input.trim() || undefined : undefined,
+      cachedReadUsdPerMillion:
+        billingMode === "token" ? cachedRead.trim() || undefined : undefined,
+      cacheWriteUsdPerMillion:
+        billingMode === "token" ? cacheWrite.trim() || undefined : undefined,
+      outputUsdPerMillion:
+        billingMode === "token" ? output.trim() || undefined : undefined,
       cacheWriteIncludedInInput: cacheWriteIncluded,
       effectiveFromMs,
       createdAtMs: editingRule?.createdAtMs ?? existing?.createdAtMs ?? now,

@@ -368,6 +368,13 @@ impl From<ProviderSaveInput> for ProviderProfile {
 
 impl ProviderProfile {
     pub fn normalize_and_validate(&mut self) -> Result<(), AppError> {
+        self.validate_with_saved_credentials(None)
+    }
+
+    pub(crate) fn validate_with_saved_credentials(
+        &mut self,
+        saved: Option<&Self>,
+    ) -> Result<(), AppError> {
         self.name = self.name.trim().to_owned();
         self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
         if self.name.is_empty() || self.base_url.is_empty() {
@@ -422,6 +429,37 @@ impl ProviderProfile {
             return Err(AppError::InvalidConfig(
                 "上下文窗口必须是 1 到 9,007,199,254,740,991 之间的整数 token。".into(),
             ));
+        }
+        if let Some(saved) = saved {
+            let same_origin = self.base_url == saved.base_url
+                || reqwest::Url::parse(&saved.base_url)
+                    .is_ok_and(|prior| prior.origin() == url.origin());
+            let key_blank = self
+                .api_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty());
+            if same_origin {
+                if key_blank {
+                    self.api_key.clone_from(&saved.api_key);
+                }
+                for (name, value) in &mut self.headers {
+                    if let Some(previous) = saved.headers.get(name).filter(|_| value.is_empty()) {
+                        value.clone_from(previous);
+                    }
+                }
+            } else {
+                if key_blank
+                    && saved
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|key| !key.trim().is_empty())
+                {
+                    return Err(AppError::InvalidConfig(
+                        "服务地址已更换，请填写新地址的 API Key。".into(),
+                    ));
+                }
+                self.headers.retain(|_, value| !value.is_empty());
+            }
         }
         validate_headers(&self.headers)?;
         self.custom_models = Self::normalize_custom_models(
@@ -687,6 +725,24 @@ pub struct ActiveState {
     pub kind: ActiveKind,
     pub provider_id: Option<String>,
     pub account_id: Option<String>,
+    /// Set only after this Chat configuration and its session repair have committed.
+    #[serde(default, skip_serializing_if = "ChatRouteBinding::is_legacy")]
+    pub(crate) chat_route_binding: ChatRouteBinding,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ChatRouteBinding {
+    #[default]
+    Legacy,
+    Pending,
+    Confirmed(String),
+}
+
+impl ChatRouteBinding {
+    pub(crate) fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
 }
 
 /// Token payload written to Codex's `auth.json` when an official account is
@@ -899,6 +955,11 @@ pub struct AppConfig {
     /// 独立保存维护元数据，避免把脱敏状态写入任一敏感凭据对象。
     #[serde(default)]
     pub credential_refresh: BTreeMap<String, CredentialRefreshState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) applied_official_import: Option<String>,
+    /// Fingerprints of refresh tokens sent without a confirmed local result.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) unconfirmed_official_refreshes: BTreeMap<String, String>,
     /// 已删除连接的非敏感稳定标识；由独立 tombstone 文件持久化，避免旧版
     /// connections.json 覆盖后把用户主动删除的连接重新导入。
     #[serde(default)]
@@ -1136,6 +1197,7 @@ pub struct UsageTrendPoint {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialPricingCatalogView {
+    pub usage_repriced: bool,
     pub status: String,
     pub source_url: String,
     pub version: Option<i64>,
@@ -1162,6 +1224,8 @@ pub struct TokenRatesView {
     pub input: Option<i64>,
     pub cached_input: Option<i64>,
     pub cache_write: Option<i64>,
+    #[serde(rename = "cacheWrite12h")]
+    pub cache_write_12h: Option<i64>,
     pub output: Option<i64>,
 }
 
@@ -1679,6 +1743,11 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), AppError> 
             .map_err(|_| AppError::InvalidConfig(format!("自定义请求头的值无效：{name}。")))?;
     }
     Ok(())
+}
+
+pub(crate) fn email_display_name(email: &str) -> Option<&str> {
+    let email = email.trim();
+    (!email.is_empty() && email.chars().nth(MAX_DISPLAY_NAME_CHARS).is_none()).then_some(email)
 }
 
 pub(crate) fn ensure_char_limit(

@@ -79,6 +79,13 @@ impl ResetCreditOperations {
             .contains(&(account_id.to_owned(), credit_id.to_owned()))
     }
 
+    pub(crate) async fn clear_unknown(&self, account_id: &str, credit_id: &str) {
+        self.1
+            .lock()
+            .await
+            .remove(&(account_id.to_owned(), credit_id.to_owned()));
+    }
+
     pub(crate) async fn mark_unknown(&self, account_id: &str, credit_id: &str) {
         self.1
             .lock()

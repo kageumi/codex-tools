@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/dialog"
 import {
   Field,
+  FieldDescription,
   FieldError,
   FieldGroup,
   FieldLabel,
@@ -39,6 +40,7 @@ import { Add01Icon, Delete02Icon } from "@hugeicons/core-free-icons"
 import { toast } from "@/components/ui/toast"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
+import { sameHttpOrigin } from "@/lib/utils"
 import type { Provider } from "@/types"
 import { useAsyncAction } from "@/hooks/use-async-action"
 
@@ -188,6 +190,12 @@ export function ProviderEditorForm({
   const saving = busy === "save"
   const [modelSearch, setModelSearch] = useState("")
   const [customModelDraft, setCustomModelDraft] = useState("")
+  const [savedBaseUrl] = useState(provider.baseUrl)
+  const originChanged =
+    Boolean(provider.id) && !sameHttpOrigin(provider.baseUrl, savedBaseUrl)
+  const requiresNewKey = provider.hasApiKey && originChanged
+  const dropsSavedHeaders =
+    originChanged && Object.values(provider.headers).includes("")
   const [contextWindowOverrideDraft, setContextWindowOverrideDraft] = useState(
     () => provider.contextWindowOverride?.toString() ?? ""
   )
@@ -306,10 +314,18 @@ export function ProviderEditorForm({
             <FieldLabel htmlFor="provider-url">Base URL</FieldLabel>
             <Input
               id="provider-url"
+              aria-describedby={
+                dropsSavedHeaders ? "provider-url-headers" : undefined
+              }
               disabled={saving}
               value={provider.baseUrl}
               onChange={(event) => patch({ baseUrl: event.target.value })}
             />
+            {dropsSavedHeaders && (
+              <FieldDescription id="provider-url-headers">
+                保存后会移除旧地址的自定义请求头。
+              </FieldDescription>
+            )}
           </Field>
           <Field data-disabled={saving}>
             <FieldLabel htmlFor="provider-key">API Key</FieldLabel>
@@ -324,7 +340,13 @@ export function ProviderEditorForm({
               spellCheck={false}
               type="password"
               value={provider.apiKey ?? ""}
-              placeholder={provider.hasApiKey ? "留空以保留现有密钥" : "sk-..."}
+              placeholder={
+                requiresNewKey
+                  ? "填写新地址的 API Key"
+                  : provider.hasApiKey
+                    ? "留空以保留现有密钥"
+                    : "sk-..."
+              }
               onChange={(event) => patch({ apiKey: event.target.value })}
             />
           </Field>
@@ -490,7 +512,11 @@ export function ProviderEditorForm({
         <Button
           type="button"
           disabled={
-            saving || !provider.name || !provider.baseUrl || noneSelected
+            saving ||
+            !provider.name ||
+            !provider.baseUrl ||
+            (requiresNewKey && !provider.apiKey?.trim()) ||
+            noneSelected
           }
           onClick={() => void save()}
         >

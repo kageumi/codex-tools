@@ -253,7 +253,22 @@ pub fn run() {
                 })
                 .build(app)?;
             let handle = app.handle().clone();
+            let proxy = app.state::<ChatProxyRegistry>();
+            let store = app.state::<Store>();
+            let activation = app.state::<ActivationLock>();
+            if let Err(error) = tauri::async_runtime::block_on(async {
+                let _transaction = activation.2.lock().await;
+                let _guard = activation.0.lock().await;
+                #[cfg(target_os = "macos")]
+                activation::recover_interrupted_writes(&store).await?;
+                proxy
+                    .restore_active(&store, &app.state::<codex::ConfigManager>())
+                    .await
+            }) {
+                eprintln!("启动恢复失败：{error}");
+            }
             tauri::async_runtime::spawn(session_bridge::run(handle.clone()));
+            tauri::async_runtime::spawn(commands::providers::run_model_refresh(handle.clone()));
             tauri::async_runtime::spawn(run_credential_maintenance(handle));
             Ok(())
         })

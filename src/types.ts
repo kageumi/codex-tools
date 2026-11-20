@@ -152,6 +152,7 @@ export type UsageTrendPoint = {
 }
 
 export type OfficialPricingCatalog = {
+  usageRepriced: boolean
   status: "waiting" | "cached"
   sourceUrl: string
   version?: number
@@ -174,6 +175,7 @@ export type TokenRates = {
   input?: number
   cachedInput?: number
   cacheWrite?: number
+  cacheWrite12h?: number
   output?: number
 }
 
@@ -444,6 +446,8 @@ export type CredentialMaintenanceResult = {
 
 export type ProxyImportResult = {
   accounts: OfficialAccountView[]
+  savedCount: number
+  partial?: { message: string; retryFrom: number } | null
   detectedFormats: string[]
 }
 

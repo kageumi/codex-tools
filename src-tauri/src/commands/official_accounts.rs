@@ -2,7 +2,7 @@ use crate::{
     activation::{
         activate_openai_record_with_paths, ensure_codex_stopped, sync_active_openai_credential,
     },
-    auth_center::{AuthCenter, DevicePollResult},
+    auth_center::{AuthCenter, DevicePollResult, ImportExchangeError},
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
     local_usage::UsageLedger,
@@ -10,7 +10,7 @@ use crate::{
     official_quota, official_reset_credits, proxy_import, record_current_activation,
     session_index::SessionIndex,
     state::{ActivationLock, ApiClient, ResetCreditOperations},
-    storage::Store,
+    storage::{RotatedOfficialImportError, Store},
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
@@ -107,7 +107,16 @@ fn apply_successful_quota_snapshot(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProxyImportResult {
     pub accounts: Vec<OfficialAccountView>,
+    pub saved_count: usize,
+    pub partial: Option<PartialImport>,
     pub detected_formats: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PartialImport {
+    message: String,
+    retry_from: usize,
 }
 
 #[tauri::command]
@@ -116,9 +125,13 @@ pub(crate) async fn connections_import_cookie(
     center: State<'_, AuthCenter>,
     activation: State<'_, ActivationLock>,
     name: Option<String>,
+    name_offset: Option<u32>,
     account_id: Option<String>,
     content: String,
 ) -> Result<ProxyImportResult, AppError> {
+    let name = name
+        .as_deref()
+        .map(|label| (label, name_offset.unwrap_or(0)));
     connections_import_cookie_in_store(&store, &center, &activation, name, account_id, content)
         .await
 }
@@ -127,7 +140,7 @@ async fn connections_import_cookie_in_store(
     store: &Store,
     center: &AuthCenter,
     activation: &ActivationLock,
-    name: Option<String>,
+    name: Option<(&str, u32)>,
     account_id: Option<String>,
     content: String,
 ) -> Result<ProxyImportResult, AppError> {
@@ -149,18 +162,6 @@ async fn connections_import_cookie_in_store(
     let _guard = activation.0.lock().await;
     let home = codex::home(&store.codex_home_setting()?);
     sync_active_openai_credential(store, &home)?;
-    let total = imported.len();
-    if imported
-        .iter()
-        .any(|credential| credential.access_token.is_none())
-    {
-        let existing_count = store.read(|state| state.official_accounts.len())?;
-        if existing_count.saturating_add(total) > crate::storage::MAX_SAVED_OPENAI_ACCOUNTS {
-            return Err(AppError::InvalidConfig(
-                "导入后可能超过 500 个 OpenAI 账号的保存上限，请先删除不再使用的账号。".into(),
-            ));
-        }
-    }
     let detected_formats = imported
         .iter()
         .map(|item| item.source_format.label().to_string())
@@ -170,34 +171,195 @@ async fn connections_import_cookie_in_store(
             }
             formats
         });
-    let mut accounts = Vec::with_capacity(total);
-    let mut resolved_accounts = Vec::with_capacity(total);
-    for (index, credential) in imported.into_iter().enumerate() {
-        let requested_name = name.as_deref().map(|value| {
-            if total <= 1 {
-                value.to_owned()
-            } else {
-                format!("{} #{}", value, index + 1)
-            }
-        });
-        resolved_accounts.push(
-            center
-                .connections_import_cookie(credential, requested_name)
-                .await?,
-        );
-    }
-    // Identity-aware storage treats a reimport as a credential update without
-    // changing the active Codex files. Capacity is checked conservatively both
-    // before and inside the atomic save transaction.
-    store.ensure_official_account_capacity(&resolved_accounts)?;
-    let saved_accounts = store.save_official_accounts(&resolved_accounts)?;
-    for account in saved_accounts {
-        accounts.push(store.official_account_view(&account.id)?);
-    }
+    let (saved, mut partial) = import_credential_rows(store, imported, name, |credential, name| {
+        center.exchange_imported_credential(credential, name)
+    })
+    .await?;
+    let views = if saved.is_empty() {
+        Ok(vec![])
+    } else {
+        store.saved_account_views(&saved)
+    };
+    let accounts = match views {
+        Ok(views) => views,
+        Err(error) => {
+            let recovery = partial.get_or_insert_with(|| PartialImport {
+                message: format!("已保存 {} 项。", saved.len()),
+                retry_from: saved.len(),
+            });
+            recovery
+                .message
+                .push_str(&format!(" 无法读取账号列表：{error}"));
+            Vec::new()
+        }
+    };
     Ok(ProxyImportResult {
         accounts,
+        saved_count: saved.len(),
         detected_formats,
+        partial,
     })
+}
+
+async fn import_credential_rows<F, Fut>(
+    store: &Store,
+    rows: Vec<proxy_import::ImportedProxyCredential>,
+    name: Option<(&str, u32)>,
+    mut exchange: F,
+) -> Result<(Vec<StoredOfficialAccount>, Option<PartialImport>), AppError>
+where
+    F: FnMut(proxy_import::ImportedProxyCredential, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<StoredOfficialAccount, ImportExchangeError>>,
+{
+    let total = rows.len();
+    let mut local = Vec::new();
+    let mut exchanges = Vec::new();
+    let mut seen = std::collections::HashMap::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        let name = name.map(|(name, offset)| {
+            if total == 1 && offset == 0 {
+                name.to_owned()
+            } else {
+                format!("{name} #{}", u64::from(offset) + index as u64 + 1)
+            }
+        });
+        crate::auth_center::validate_import_fields(&row, name.as_deref())?;
+        let rotates = row.access_token.is_none();
+        if let Some(token) = row.refresh_token.as_ref() {
+            if seen
+                .insert(token.clone(), rotates)
+                .is_some_and(|previous| previous || rotates)
+            {
+                return Err(AppError::InvalidConfig(format!(
+                    "第 {} 项重复使用同一个待换发凭据，请移除重复项。",
+                    index + 1
+                )));
+            }
+        }
+        if rotates {
+            exchanges.push((index, row, name));
+        } else {
+            local.push(crate::auth_center::account_from_imported_tokens(row, name)?);
+        }
+    }
+    if exchanges.is_empty() {
+        return Ok((store.save_official_accounts(&local)?, None));
+    }
+    store.retry_pending_official_import()?;
+    store.ensure_official_account_capacity(&local, exchanges.len())?;
+    let mut local = local.into_iter();
+    let mut saved = Vec::with_capacity(total);
+    for (index, row, name) in exchanges {
+        let preceding: Vec<_> = local.by_ref().take(index - saved.len()).collect();
+        if !preceding.is_empty() {
+            match store.save_official_accounts(&preceding) {
+                Ok(records) => saved.extend(records),
+                Err(error) => {
+                    let count = saved.len();
+                    return Ok((
+                        saved,
+                        Some(PartialImport {
+                            retry_from: count,
+                            message: format!("前 {count} 项已保存，后续账号保存失败：{error}"),
+                        }),
+                    ));
+                }
+            }
+        }
+        let refresh_token = row
+            .refresh_token
+            .as_deref()
+            .ok_or_else(|| AppError::InvalidConfig("Cookie 登录数据缺少 Refresh Token。".into()))?;
+        let fingerprint = match store.record_import_refresh_attempt(refresh_token) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                let previous_attempt = matches!(error, AppError::InvalidConfig(_));
+                return Ok((
+                    saved,
+                    Some(PartialImport {
+                        retry_from: index + usize::from(previous_attempt),
+                        message: format!("第 {} 项未提交，前 {index} 项已保存。{error}", index + 1),
+                    }),
+                ));
+            }
+        };
+        let rotated = match exchange(row, name).await {
+            Ok(rotated) => rotated,
+            Err(ImportExchangeError::MayHaveRotated) => {
+                return Ok((
+                    saved,
+                    Some(PartialImport {
+                        retry_from: index + 1,
+                        message: format!(
+                            "第 {} 项的换发结果无法确认，请为该账号重新授权。前 {index} 项已保存。",
+                            index + 1
+                        ),
+                    }),
+                ));
+            }
+            Err(ImportExchangeError::Rejected(error)) => {
+                let error = store
+                    .clear_import_refresh_attempt(&fingerprint)
+                    .err()
+                    .unwrap_or(error);
+                return Ok((
+                    saved,
+                    Some(PartialImport {
+                        retry_from: index,
+                        message: format!(
+                            "第 {} 项导入失败，前 {index} 项已保存。请核对剩余凭据后重试：{error}",
+                            index + 1
+                        ),
+                    }),
+                ));
+            }
+        };
+        let record = match store.save_rotated_official_import(rotated, Some(fingerprint)) {
+            Ok(record) => record,
+            Err(error) => {
+                let action = match error {
+                    RotatedOfficialImportError::Pending { on_disk: true } => {
+                        "新凭据已暂存。恢复数据目录写入后，刷新账号列表即可补存。".into()
+                    }
+                    RotatedOfficialImportError::Pending { on_disk: false } => {
+                        "新凭据暂存在当前应用。请保持应用打开，恢复数据目录写入后刷新账号列表。"
+                            .into()
+                    }
+                    RotatedOfficialImportError::Invalid(error) => {
+                        format!("新凭据无法保存，请为该账号重新授权：{error}")
+                    }
+                };
+                return Ok((
+                    saved,
+                    Some(PartialImport {
+                        retry_from: index + 1,
+                        message: format!(
+                            "第 {} 项凭据已换发。{action} 前 {index} 项已保存。",
+                            index + 1
+                        ),
+                    }),
+                ));
+            }
+        };
+        saved.push(record);
+    }
+    if local.len() > 0 {
+        let remaining: Vec<_> = local.collect();
+        match store.save_official_accounts(&remaining) {
+            Ok(records) => saved.extend(records),
+            Err(error) => {
+                let count = saved.len();
+                return Ok((
+                    saved,
+                    Some(PartialImport {
+                        retry_from: count,
+                        message: format!("前 {count} 项已保存，其余账号保存失败：{error}"),
+                    }),
+                ));
+            }
+        }
+    }
+    Ok((saved, None))
 }
 
 #[tauri::command]
@@ -223,10 +385,7 @@ fn connections_update_account_remarks_in_store(
     updates: Vec<AccountRemarkUpdate>,
 ) -> Result<Vec<OfficialAccountView>, AppError> {
     let saved = store.update_official_account_remarks(updates)?;
-    saved
-        .into_iter()
-        .map(|account| store.official_account_view(&account.id))
-        .collect()
+    store.saved_account_views(&saved)
 }
 
 #[tauri::command]
@@ -400,6 +559,19 @@ pub(crate) async fn connections_get_reset_credits(
     load_reset_credits(&store, &center, &client, &activation, &account_id).await
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "stage", content = "message", rename_all = "snake_case")]
+pub(crate) enum ResetCreditError {
+    NotSubmitted(String),
+    Unknown(String),
+}
+
+impl From<AppError> for ResetCreditError {
+    fn from(value: AppError) -> Self {
+        Self::NotSubmitted(value.to_string())
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
 pub(crate) async fn connections_consume_reset_credit(
@@ -411,47 +583,32 @@ pub(crate) async fn connections_consume_reset_credit(
     account_id: String,
     credit_id: String,
     idempotency_key: String,
-) -> Result<ResetCreditConsumeResult, AppError> {
+) -> Result<ResetCreditConsumeResult, ResetCreditError> {
     validate_idempotency_key(&idempotency_key)?;
     let _operation_guard = operations.lock(&account_id).await;
-    // 先从该账号自己的服务端详情确认归属和可用性；不依据客户端传入的标题或数量。
-    let account = account_for_quota(&store, &center, &activation, &account_id).await?;
-    let before = {
-        let _network_guard = client.1.lock().await;
-        let http = client.current()?;
-        official_reset_credits::fetch_reset_credits(&http, &account)
-            .await
-            .map_err(|error| AppError::InvalidConfig(error.message))?
-    };
-    let credit = before
-        .credits
-        .iter()
-        .find(|credit| credit.id == credit_id)
-        .ok_or_else(|| {
-            AppError::InvalidConfig("重置卡不存在、已不属于该账号，或详情尚未完整提供该卡。".into())
-        })?;
-    if !credit_is_usable(credit, chrono::Utc::now().timestamp()) {
-        return Err(AppError::InvalidConfig(
-            "该重置卡已过期、正在使用、已使用或状态未知，不能再次提交。".into(),
-        ));
-    }
     if operations.is_unknown(&account_id, &credit_id).await {
-        return Err(AppError::InvalidConfig(
+        return Err(ResetCreditError::Unknown(
             "该重置卡此前结果未知；为避免重复消费，本会话不会再次提交。".into(),
         ));
     }
-    let consume_result = {
+    // 先从该账号自己的服务端详情确认归属和可用性；不依据客户端传入的标题或数量。
+    let account = account_for_quota(&store, &center, &activation, &account_id).await?;
+    let outcome = {
         let _network_guard = client.1.lock().await;
         let http = client.current()?;
-        official_reset_credits::consume_reset_credit(&http, &account, &credit_id, &idempotency_key)
-            .await
-    };
-    let outcome = match consume_result {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            operations.mark_unknown(&account_id, &credit_id).await;
-            return Err(AppError::InvalidConfig(error.message));
-        }
+        submit_verified_credit(
+            &operations,
+            &account_id,
+            &credit_id,
+            official_reset_credits::fetch_reset_credits(&http, &account).await,
+            official_reset_credits::consume_reset_credit(
+                &http,
+                &account,
+                &credit_id,
+                &idempotency_key,
+            ),
+        )
+        .await?
     };
 
     let mut refresh_errors = Vec::new();
@@ -469,9 +626,6 @@ pub(crate) async fn connections_consume_reset_credit(
             }
             Err(error) => refresh_errors.push(format!("旧额度估算读取失败：{error}")),
         }
-    }
-    if outcome == ResetCreditConsumeOutcome::Unknown {
-        operations.mark_unknown(&account_id, &credit_id).await;
     }
 
     // 消费已由服务端确认；后续详情或额度刷新失败只能作为附带告警，不能改写消费结果。
@@ -510,6 +664,39 @@ pub(crate) async fn connections_consume_reset_credit(
         quota,
         refresh_error: (!refresh_errors.is_empty()).then(|| refresh_errors.join("；")),
     })
+}
+
+async fn submit_verified_credit(
+    operations: &ResetCreditOperations,
+    account_id: &str,
+    credit_id: &str,
+    before: Result<ResetCreditDetails, official_quota::QuotaFetchError>,
+    submit: impl std::future::Future<
+        Output = Result<ResetCreditConsumeOutcome, official_quota::QuotaFetchError>,
+    >,
+) -> Result<ResetCreditConsumeOutcome, ResetCreditError> {
+    let before = before.map_err(|error| ResetCreditError::NotSubmitted(error.message))?;
+    let credit = before
+        .credits
+        .iter()
+        .find(|credit| credit.id == credit_id)
+        .ok_or_else(|| {
+            AppError::InvalidConfig("重置卡不存在、已不属于该账号，或详情尚未完整提供该卡。".into())
+        })?;
+    if !credit_is_usable(credit, chrono::Utc::now().timestamp()) {
+        return Err(ResetCreditError::NotSubmitted(
+            "该重置卡已过期、正在使用、已使用或状态未知，不能再次提交。".into(),
+        ));
+    }
+    // Mark before awaiting the POST so cancellation also leaves an uncertain operation locked.
+    operations.mark_unknown(account_id, credit_id).await;
+    let outcome = submit
+        .await
+        .map_err(|error| ResetCreditError::Unknown(error.message))?;
+    if outcome != ResetCreditConsumeOutcome::Unknown {
+        operations.clear_unknown(account_id, credit_id).await;
+    }
+    Ok(outcome)
 }
 
 #[tauri::command]
@@ -845,6 +1032,41 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
+
+    #[tokio::test]
+    async fn reset_preflight_can_retry_but_an_uncertain_post_stays_locked() {
+        let operations = ResetCreditOperations::default();
+        let network_error = || official_quota::QuotaFetchError::retryable("模拟超时");
+        let details = || ResetCreditDetails {
+            account_id: "account".into(),
+            summary: Default::default(),
+            credits: vec![
+                serde_json::from_value(serde_json::json!({"id":"card","status":"available"}))
+                    .unwrap(),
+            ],
+        };
+        let first = submit_verified_credit(
+            &operations,
+            "account",
+            "card",
+            Err(network_error()),
+            async { panic!("preflight must never send") },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(first).unwrap()["stage"],
+            "not_submitted"
+        );
+        assert!(!operations.is_unknown("account", "card").await);
+        let error = submit_verified_credit(&operations, "account", "card", Ok(details()), async {
+            Err(network_error())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(serde_json::to_value(error).unwrap()["stage"], "unknown");
+        assert!(operations.is_unknown("account", "card").await);
+    }
 
     #[test]
     fn stale_account_switch_is_rejected_after_an_async_boundary() {
@@ -1395,6 +1617,271 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_rotation_is_durable_before_the_next_exchange() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let rows = proxy_import::parse_proxy_credentials(r#"[{"refresh_token":"rt-one"},{"refresh_token":"rt-two"},{"refresh_token":"rt-three"}]"#).unwrap();
+        let mut calls = 0;
+        let (saved, partial) = import_credential_rows(&store, rows, None, |_, _| {
+            calls += 1;
+            let result = if calls == 1 {
+                Ok(oauth_account("workspace", "first", "first@example.test"))
+            } else {
+                let reopened = Store::open(store.root().to_owned()).unwrap();
+                assert_eq!(
+                    reopened.snapshot().unwrap().official_accounts[0]
+                        .credential
+                        .tokens
+                        .refresh_token,
+                    "refresh-first"
+                );
+                Err(ImportExchangeError::Rejected(AppError::Internal(
+                    "模拟换发失败".into(),
+                )))
+            };
+            std::future::ready(result)
+        })
+        .await
+        .unwrap();
+        let partial = partial.unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(calls, 2);
+        assert_eq!(partial.retry_from, 1);
+        assert!(partial.message.contains("第 2 项导入失败，前 1 项已保存"));
+        assert!(!partial.message.contains("rt-"));
+    }
+
+    #[tokio::test]
+    async fn rotated_import_survives_failure_before_the_state_journal() {
+        for on_disk in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("fixture-data");
+            let store = Store::open(root.clone()).unwrap();
+            let journal = root.join("state-transaction.json");
+            let recovery = root.join("pending-official-import.json");
+            let rows = proxy_import::parse_proxy_credentials(
+                r#"[{"refresh_token":"rt-first"},{"refresh_token":"rt-second"},{"refresh_token":"rt-third"}]"#,
+            )
+            .unwrap();
+            let mut exchanges = 0;
+            let (saved, partial) =
+                import_credential_rows(&store, rows, Some(("Team", 0)), |_, name| {
+                    exchanges += 1;
+                    let mut account = match exchanges {
+                        1 => oauth_account("workspace", "first", "first@example.test"),
+                        2 => {
+                            // The rotation succeeded before any main journal could be written.
+                            fs::create_dir(&journal).unwrap();
+                            if !on_disk {
+                                fs::create_dir(&recovery).unwrap();
+                            }
+                            oauth_account("workspace", "second", "second@example.test")
+                        }
+                        _ => panic!("the next token must wait while a local save is pending"),
+                    };
+                    account.name = name.unwrap();
+                    std::future::ready(Ok(account))
+                })
+                .await
+                .unwrap();
+            assert_eq!(exchanges, 2);
+            assert_eq!(saved.len(), 1);
+            let partial = partial.unwrap();
+            assert_eq!(partial.retry_from, 2);
+            assert!(partial.message.contains("暂存"));
+            assert!(!partial.message.contains("refresh-second"));
+            assert_eq!(recovery.is_file(), on_disk);
+            fs::remove_dir(journal).unwrap();
+
+            let recovered = if on_disk {
+                drop(store);
+                Store::open(root.clone()).unwrap()
+            } else {
+                fs::remove_dir(&recovery).unwrap();
+                store.retry_pending_official_import().unwrap();
+                store
+            };
+            let accounts = recovered.snapshot().unwrap().official_accounts;
+            assert_eq!(accounts.len(), 2);
+            assert_eq!(accounts[0].credential.tokens.refresh_token, "refresh-first");
+            assert_eq!(
+                accounts[1].credential.tokens.refresh_token,
+                "refresh-second"
+            );
+            assert_eq!(accounts[1].name, "Team #2");
+            assert!(!recovery.exists());
+
+            let remaining = proxy_import::parse_proxy_credentials("rt-third").unwrap();
+            let (saved, partial) =
+                import_credential_rows(&recovered, remaining, Some(("Team", 2)), |row, name| {
+                    assert_eq!(row.refresh_token.as_deref(), Some("rt-third"));
+                    assert_eq!(name.as_deref(), Some("Team #3"));
+                    std::future::ready(Ok(oauth_account(
+                        "workspace",
+                        "third",
+                        "third@example.test",
+                    )))
+                })
+                .await
+                .unwrap();
+            assert_eq!(saved.len(), 1);
+            assert!(partial.is_none());
+            assert_eq!(
+                Store::open(root)
+                    .unwrap()
+                    .snapshot()
+                    .unwrap()
+                    .official_accounts
+                    .len(),
+                3
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotated_import_persists_a_valid_email_longer_than_the_display_name_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fixture-data");
+        let store = Store::open(root.clone()).unwrap();
+        let email = format!("{}@{}.example.test", "a".repeat(64), "b".repeat(40));
+        let minted = oauth_account("workspace", "new", &email).credential.tokens;
+        let rows = proxy_import::parse_proxy_credentials("rt-old").unwrap();
+        let (saved, partial) = import_credential_rows(&store, rows, None, |row, name| {
+            let response = axum::http::Response::builder()
+                .status(200)
+                .body(
+                    serde_json::json!({
+                        "access_token": minted.access_token,
+                        "id_token": minted.id_token,
+                        "refresh_token": minted.refresh_token,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            AuthCenter::account_from_exchange_response(response.into(), row, name)
+        })
+        .await
+        .unwrap();
+        assert!(partial.is_none());
+        assert_eq!(saved.len(), 1);
+        drop(store);
+        let stored = Store::open(root)
+            .unwrap()
+            .official_account(&saved[0].id)
+            .unwrap();
+        assert_eq!(stored.email, email);
+        assert_eq!(stored.name, "Cookie 账号");
+        assert_eq!(stored.credential.tokens.refresh_token, minted.refresh_token);
+    }
+
+    #[tokio::test]
+    async fn retry_draft_retains_rejected_credentials_and_drops_unconfirmed_rotations() {
+        let temp = tempfile::tempdir().unwrap();
+        for (status, retry_from) in [(400, 0), (408, 1), (503, 1), (200, 1)] {
+            let store = Store::open(temp.path().join(status.to_string())).unwrap();
+            let rows = proxy_import::parse_proxy_credentials(
+                r#"[{"refresh_token":"rt-first"},{"refresh_token":"rt-next"}]"#,
+            )
+            .unwrap();
+            let (saved, partial) =
+                import_credential_rows(&store, rows, None, |row, name| async move {
+                    let response = axum::http::Response::builder()
+                        .status(status)
+                        .body("incomplete reply")
+                        .unwrap();
+                    AuthCenter::account_from_exchange_response(response.into(), row, name).await
+                })
+                .await
+                .unwrap();
+            assert!(saved.is_empty());
+            let partial = partial.unwrap();
+            assert_eq!(partial.retry_from, retry_from);
+            assert_eq!(partial.message.contains("重新授权"), retry_from == 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn import_and_refresh_share_the_restart_guard_for_the_same_token() {
+        let temp = tempfile::tempdir().unwrap();
+        for first_is_import in [false, true] {
+            let root = temp
+                .path()
+                .join(format!("first-is-import-{first_is_import}"));
+            let store = Store::open(root.clone()).unwrap();
+            let mut existing = oauth_account("workspace", "fixture", "fixture@example.test");
+            existing.credential.tokens.refresh_token = "rt-guard-fixture".into();
+            let existing = store.save_official_account(&existing).unwrap();
+            let rows = || proxy_import::parse_proxy_credentials("rt-guard-fixture").unwrap();
+            if first_is_import {
+                let (_, partial) = import_credential_rows(&store, rows(), None, |_, _| async {
+                    Err(ImportExchangeError::MayHaveRotated)
+                })
+                .await
+                .unwrap();
+                assert_eq!(partial.unwrap().retry_from, 1);
+            } else {
+                store.record_official_refresh_attempt(&existing).unwrap();
+            }
+            drop(store);
+
+            let reopened = Store::open(root).unwrap();
+            assert!(matches!(
+                reopened.record_official_refresh_attempt(&existing),
+                Err(AppError::InvalidConfig(_))
+            ));
+            let (saved, partial) = import_credential_rows(&reopened, rows(), None, |_, _| async {
+                panic!("the local guard must stop a second request");
+            })
+            .await
+            .unwrap();
+            assert!(saved.is_empty());
+            assert_eq!(partial.unwrap().retry_from, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_batch_names_and_excludes_a_rotated_token_if_saving_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_owned()).unwrap();
+        let rows = proxy_import::parse_proxy_credentials("rt-fixture").unwrap();
+        let (saved, partial) =
+            import_credential_rows(&store, rows, Some(("Team", 2)), |_, name| async move {
+                assert_eq!(name.as_deref(), Some("Team #3"));
+                let mut account = oauth_account("team", "third", "test@example.test");
+                account.credential.tokens.access_token.clear();
+                Ok(account)
+            })
+            .await
+            .unwrap();
+        assert!(saved.is_empty());
+        let partial = partial.unwrap();
+        assert_eq!(partial.retry_from, 1);
+        assert!(partial.message.contains("重新授权"));
+        assert!(store.snapshot().unwrap().official_accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_rotating_token_or_invalid_local_account_aborts_before_exchange() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_owned()).unwrap();
+        for second in [
+            serde_json::json!({"refresh_token":"rt-fixture"}),
+            serde_json::json!({"access_token":"at-fixture","email":"x".repeat(321)}),
+        ] {
+            let input = serde_json::json!([{"refresh_token":"rt-fixture"}, second]).to_string();
+            let rows = proxy_import::parse_proxy_credentials(&input).unwrap();
+            assert!(
+                import_credential_rows(&store, rows, None, |_, _| async {
+                    panic!("invalid batch must never exchange a token")
+                })
+                .await
+                .is_err()
+            );
+        }
+        assert!(store.snapshot().unwrap().official_accounts.is_empty());
+    }
+
+    #[tokio::test]
     async fn cookie_import_saves_a_new_account_without_changing_active_codex_files() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -1423,7 +1910,7 @@ mod tests {
             &store,
             &AuthCenter::default(),
             &ActivationLock::default(),
-            Some("新账号".into()),
+            Some(("新账号", 0)),
             Some("shared-workspace".into()),
             "at-new-account".into(),
         )
@@ -1472,7 +1959,7 @@ mod tests {
             &store,
             &AuthCenter::default(),
             &ActivationLock::default(),
-            Some("更新后的名称".into()),
+            Some(("更新后的名称", 0)),
             Some("cookie-account".into()),
             "at-cookie-reimported".into(),
         )

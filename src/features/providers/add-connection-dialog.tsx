@@ -46,6 +46,32 @@ const MAX_COOKIE_CREDENTIAL_LENGTH = 262_144
 
 export type AddConnectionMode = "browser" | "cookie" | "api"
 
+// Keep the source format and its account metadata when retrying a partial import.
+function remainingCookieDraft(content: string, skip: number) {
+  const input = content.trim()
+  if (!input.startsWith("{") && !input.startsWith("[")) return ""
+  function remaining(node: unknown): unknown {
+    if (skip === 0) return node
+    if (Array.isArray(node)) {
+      const items = node.map(remaining).filter((item) => item !== undefined)
+      return items.length ? items : undefined
+    }
+    if (
+      node &&
+      typeof node === "object" &&
+      "accounts" in node &&
+      Array.isArray(node.accounts)
+    ) {
+      const items = node.accounts.slice(skip)
+      skip -= Math.min(skip, node.accounts.length)
+      return items.length ? { ...node, accounts: items } : undefined
+    }
+    skip--
+    return undefined
+  }
+  return JSON.stringify(remaining(JSON.parse(input))) ?? ""
+}
+
 export function AddConnectionDialog({
   open,
   mode,
@@ -78,13 +104,15 @@ export function AddConnectionDialog({
   onImport: (
     name: string | undefined,
     accountId: string | undefined,
-    content: string
-  ) => void
+    content: string,
+    nameOffset: number
+  ) => Promise<number | undefined>
 }) {
   const [name, setName] = useState("")
   const [accountId, setAccountId] = useState("")
   const [hasContent, setHasContent] = useState(false)
   const contentRef = useRef<HTMLTextAreaElement>(null)
+  const retryNameOffset = useRef(0)
   const [provider, setProvider] = useState<Provider>(emptyProvider)
   const [saving, setSaving] = useState(false)
   const busy = starting || polling || importing || saving
@@ -257,7 +285,10 @@ export function AddConnectionDialog({
                     maxLength={MAX_DISPLAY_NAME_LENGTH}
                     placeholder="例如：工作账号"
                     value={name}
-                    onChange={(event) => setName(event.target.value)}
+                    onChange={(event) => {
+                      retryNameOffset.current = 0
+                      setName(event.target.value)
+                    }}
                   />
                 </Field>
                 <Field data-disabled={busy}>
@@ -294,9 +325,28 @@ export function AddConnectionDialog({
                     placeholder={
                       "粘贴 Refresh Token、Access Token，或账号工具导出的 JSON"
                     }
-                    onInput={(event) =>
-                      setHasContent(/\S/.test(event.currentTarget.value))
-                    }
+                    onPaste={({ currentTarget, clipboardData }) => {
+                      if (
+                        retryNameOffset.current &&
+                        currentTarget.selectionStart === 0 &&
+                        currentTarget.selectionEnd ===
+                          currentTarget.value.length &&
+                        clipboardData.getData("text/plain")
+                      ) {
+                        retryNameOffset.current = 0
+                      }
+                    }}
+                    onInput={({ currentTarget, nativeEvent }) => {
+                      const value = currentTarget.value
+                      const hasText = /\S/.test(value)
+                      // The app's edit menu sends an input event after pasting.
+                      const replacedDraft =
+                        nativeEvent instanceof InputEvent &&
+                        nativeEvent.inputType === "insertFromPaste" &&
+                        nativeEvent.data?.replace(/\r\n?/g, "\n") === value
+                      if (!hasText || replacedDraft) retryNameOffset.current = 0
+                      setHasContent(hasText)
+                    }}
                   />
                 </Field>
               </FieldGroup>
@@ -331,14 +381,27 @@ export function AddConnectionDialog({
               <Button
                 type="button"
                 disabled={busy || !hasContent}
-                onClick={() => {
-                  const content = contentRef.current?.value ?? ""
-                  if (!content.trim()) return
-                  onImport(
+                onClick={async () => {
+                  const field = contentRef.current
+                  if (!field || !field.value.trim()) return
+                  const content = field.value
+                  const offset = retryNameOffset.current
+                  const skipped = await onImport(
                     name.trim() || undefined,
                     accountId.trim() || undefined,
-                    content
+                    content,
+                    offset
                   )
+                  if (
+                    skipped &&
+                    contentRef.current === field &&
+                    field.value === content
+                  ) {
+                    const remaining = remainingCookieDraft(content, skipped)
+                    field.value = remaining
+                    retryNameOffset.current = remaining ? offset + skipped : 0
+                    setHasContent(Boolean(remaining))
+                  }
                 }}
               >
                 {importing ? (

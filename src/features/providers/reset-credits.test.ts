@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import type { OfficialAccountView } from "@/types"
 
-import { resetCreditCountText } from "./reset-credits"
+import { resetCreditCountText, resetCreditFailure } from "./reset-credits"
 
 const account = (availableCount?: number): OfficialAccountView => ({
   id: "account-1",
@@ -34,4 +34,18 @@ describe("resetCreditCountText", () => {
     expect(resetCreditCountText(account(0))).toBe("重置卡 0 张")
     expect(resetCreditCountText(account(3))).toBe("重置卡 3 张")
   })
+})
+
+it("仅在后端确认未提交时允许用户重试", () => {
+  const failure = (stage: string) =>
+    new Error("IPC", { cause: { stage, message: "网络中断" } })
+  expect(resetCreditFailure(failure("not_submitted"))).toEqual({
+    unknown: false,
+    message: "未提交使用请求。网络中断",
+  })
+  expect(resetCreditFailure(failure("unknown"))).toEqual({
+    unknown: true,
+    message: "网络中断 结果可能未知，未自动重试。",
+  })
+  expect(resetCreditFailure(new Error("IPC disconnected")).unknown).toBe(true)
 })

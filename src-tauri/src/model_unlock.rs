@@ -268,7 +268,7 @@ pub(crate) fn write_model_catalog(
     let mut json = serde_json::to_vec_pretty(&json!({ "models": catalog }))
         .map_err(|error| AppError::Internal(error.to_string()))?;
     json.push(b'\n');
-    crate::storage::atomic_write(&path, &json).map_err(AppError::from)?;
+    crate::storage::atomic_publish(&path, &json)?.warn_if_unsynced(&path);
     Ok(format!("{MODEL_CATALOG_DIR}/{MODEL_CATALOG_FILE}"))
 }
 
@@ -379,8 +379,13 @@ async fn unlock_on(
 pub(crate) async fn launch_with_debug(
     store: &Store,
     activation: &ActivationLock,
+    proxy: &crate::chat_proxy::ChatProxyRegistry,
+    manager: &crate::codex::ConfigManager,
 ) -> Result<ModelUnlockResult, AppError> {
     let context = model_catalog_write_context(store, activation).await?;
+    #[cfg(target_os = "macos")]
+    crate::activation::recover_interrupted_writes(store).await?;
+    proxy.restore_active(store, manager).await?;
     let active_kind = context.active_kind;
     ensure_active_official_account_usable(store, active_kind)?;
     let catalog = context.catalog;
@@ -870,15 +875,26 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
   // ---- 安装 ----
   installStatsigRootSetter();
   patchStatsigRoot(window.__STATSIG__ || globalThis.__STATSIG__);
-  // Response.json 补丁
-  if (typeof Response !== "undefined" && Response.prototype && Response.prototype.json.__CODEX_TOOLS_PATCHED__ !== 2) {
-    var originalJson = Response.prototype.json;
+  // Only known catalog URLs may change a JSON response. A running older installation
+  // did not expose its original json method, so read the untouched body in that case.
+  if (typeof Response !== "undefined" && Response.prototype && Response.prototype.json.__CODEX_TOOLS_PATCHED__ !== 3) {
+    var previousJson = Response.prototype.json;
+    var originalJson = previousJson.__CODEX_TOOLS_PATCHED__ === 2
+      ? async function () { return JSON.parse(await this.text()); }
+      : previousJson;
     var wrapped = async function () {
       var payload = await originalJson.apply(this, arguments);
-      try { patchContainer(payload); } catch (e) {}
+      if (!this.url || this.ok === false || !payload || payload.error) return payload;
+      try {
+        var url = new URL(this.url);
+        if ((url.protocol === "https:" || url.protocol === "http:")
+            && /^\/(?:v1\/models|backend-api\/(?:codex\/)?models)\/?$/.test(url.pathname)) {
+          patchContainer(payload);
+        }
+      } catch (e) {}
       return payload;
     };
-    wrapped.__CODEX_TOOLS_PATCHED__ = 2;
+    wrapped.__CODEX_TOOLS_PATCHED__ = 3;
     Response.prototype.json = wrapped;
   }
   // 周期重试：等 Statsig SDK 初始化、React Query 就绪
@@ -1503,6 +1519,7 @@ mod tests {
                     kind: ActiveKind::Official,
                     provider_id: None,
                     account_id: None,
+                    ..ActiveState::default()
                 };
                 Ok(())
             })

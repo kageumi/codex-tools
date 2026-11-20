@@ -78,9 +78,18 @@ const MAX_STREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 // 只存在一个监听 `127.0.0.1:27777` 的代理。上游指向当前激活的 Chat 类型服务：
 // 切换服务时只原地替换共享配置，Codex 缓存的地址永远不变。
 
-#[derive(Default)]
 pub(crate) struct ChatProxyRegistry {
     single: Mutex<Option<RunningProxy>>,
+    port: u16,
+}
+
+impl Default for ChatProxyRegistry {
+    fn default() -> Self {
+        Self {
+            single: Mutex::new(None),
+            port: bind_port(),
+        }
+    }
 }
 
 struct RunningProxy {
@@ -102,34 +111,30 @@ pub(crate) struct ActivationTarget {
 }
 
 impl ChatProxyRegistry {
-    /// 确保转换代理正在运行，并把上游配置切换到 `provider`。
-    /// 监听地址固定为 `http://127.0.0.1:27777/v1`。
-    async fn ensure(&self, provider: &ProviderProfile) -> Result<(u16, String), AppError> {
-        let fingerprint = proxy_fingerprint(provider);
-        let config = ProxyConfig::from_provider(provider);
+    pub(crate) fn base_url(&self) -> String {
+        proxy_base_url(self.port)
+    }
+
+    /// 预留监听地址。配置预览或后续提交失败时，现有请求仍使用已提交的上游。
+    async fn prepare_listener(&self, saved_key: Option<String>) -> Result<(u16, String), AppError> {
         let mut single = self.single.lock().await;
-        if let Some(running) = single.as_mut() {
-            let owner_changed = running.owner != provider.id;
-            let config_changed = running.fingerprint != fingerprint;
-            if owner_changed || config_changed {
-                let mut snapshot = running.config.current.write().await;
-                if config_changed {
-                    snapshot.config = Arc::new(config);
-                    snapshot.prompt_structured_output_models =
-                        Arc::new(std::sync::Mutex::new(HashSet::new()));
-                    running.fingerprint = fingerprint;
-                }
-                snapshot.reasoning_store =
-                    Arc::new(std::sync::Mutex::new(ReasoningStore::default()));
+        if let Some(running) = single.as_ref() {
+            if saved_key
+                .as_ref()
+                .is_some_and(|key| key != &running.proxy_api_key)
+            {
+                return Err(AppError::InvalidConfig(
+                    "本机代理凭据已变化，请重新应用当前服务配置。".into(),
+                ));
             }
-            running.owner = provider.id.clone();
             return Ok((running.port, running.proxy_api_key.clone()));
         }
-        let (port, shutdown, config_slot, proxy_api_key) = start_proxy(config).await?;
+        let (port, shutdown, config_slot, proxy_api_key) =
+            start_proxy_at(ProxyConfig::disabled(), self.port, saved_key).await?;
         *single = Some(RunningProxy {
             port,
-            fingerprint,
-            owner: provider.id.clone(),
+            fingerprint: String::new(),
+            owner: String::new(),
             shutdown,
             config: config_slot,
             proxy_api_key: proxy_api_key.clone(),
@@ -137,18 +142,96 @@ impl ChatProxyRegistry {
         Ok((port, proxy_api_key))
     }
 
+    /// Called under the activation lock after all fallible activation steps have succeeded.
+    pub(crate) async fn publish(&self, provider: Option<&ProviderProfile>) {
+        let mut single = self.single.lock().await;
+        let Some(running) = single.as_mut() else {
+            return;
+        };
+        let provider = provider.filter(|provider| provider.api_type == ProviderApiType::Chat);
+        let owner = provider.map_or("", |provider| provider.id.as_str());
+        let fingerprint = provider.map(proxy_fingerprint).unwrap_or_default();
+        if running.owner == owner && running.fingerprint == fingerprint {
+            return;
+        }
+        let config = provider.map_or_else(ProxyConfig::disabled, ProxyConfig::from_provider);
+        *running.config.current.write().await = ProxyRuntimeSnapshot::new(config);
+        running.owner = owner.to_owned();
+        running.fingerprint = fingerprint;
+    }
+
+    pub(crate) async fn restore_active(
+        &self,
+        store: &crate::storage::Store,
+        manager: &crate::codex::ConfigManager,
+    ) -> Result<(), AppError> {
+        let (home, provider) = store.active_provider_and_home()?;
+        let Some(mut provider) = provider.filter(|p| p.api_type == ProviderApiType::Chat) else {
+            self.publish(None).await;
+            return Ok(());
+        };
+        provider.normalize_and_validate()?;
+        if !provider.enabled || provider.api_key.is_none() {
+            return Err(AppError::InvalidConfig(
+                "当前 Chat 服务不可用，请重新选择服务。".into(),
+            ));
+        }
+        let base_url = self.base_url();
+        let binding = store.read(|state| state.active.chat_route_binding.clone())?;
+        let key = match crate::codex::saved_chat_proxy_key(&home, &provider, &base_url, &binding)? {
+            crate::codex::SavedChatProxyKey::Confirmed(key) => key,
+            crate::codex::SavedChatProxyKey::RequiresRotation(old_key) => {
+                // Cold upgrade: prove the configuration by applying and repairing it
+                // with a fresh local key. An old client's key never gets rebound.
+                if self
+                    .single
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|listener| listener.proxy_api_key == old_key)
+                {
+                    return Err(AppError::InvalidConfig(
+                        "旧本机代理凭据仍在使用，请重启 Codex Tools 以更换凭据。".into(),
+                    ));
+                }
+                return crate::activation::sync_active_codex_configuration(store, manager, self)
+                    .await;
+            }
+        };
+        self.prepare_listener(Some(key)).await?;
+        self.publish(Some(&provider)).await;
+        Ok(())
+    }
+
+    pub(crate) async fn binding_for_provider(
+        &self,
+        provider: &ProviderProfile,
+    ) -> Result<Option<String>, AppError> {
+        if provider.api_type != ProviderApiType::Chat {
+            return Ok(None);
+        }
+        let single = self.single.lock().await;
+        let running = single.as_ref().ok_or(AppError::StaleOperation)?;
+        crate::codex::chat_route_digest(provider, &running.proxy_api_key).map(Some)
+    }
+
+    #[cfg(test)]
+    async fn ensure(&self, provider: &ProviderProfile) -> Result<(u16, String), AppError> {
+        let address = self.prepare_listener(None).await?;
+        self.publish(Some(provider)).await;
+        Ok(address)
+    }
+
     /// 服务被删除时调用：如果它正是当前代理配置的服务，清空上游配置，
     /// 让后续请求返回明确的错误而不是转发到错误的上游。监听保持运行。
     pub(crate) async fn stop(&self, provider_id: &str) {
         let mut single = self.single.lock().await;
-        if let Some(running) = single.as_mut()
-            && running.owner == provider_id
+        if let Some(running) = single
+            .as_mut()
+            .filter(|running| running.owner == provider_id)
         {
-            *running.config.current.write().await = ProxyRuntimeSnapshot {
-                config: Arc::new(ProxyConfig::disabled()),
-                reasoning_store: Arc::new(std::sync::Mutex::new(ReasoningStore::default())),
-                prompt_structured_output_models: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            };
+            *running.config.current.write().await =
+                ProxyRuntimeSnapshot::new(ProxyConfig::disabled());
             running.fingerprint.clear();
             running.owner.clear();
         }
@@ -247,14 +330,20 @@ struct ProxyRuntimeSnapshot {
     prompt_structured_output_models: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
+impl ProxyRuntimeSnapshot {
+    fn new(config: ProxyConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+            reasoning_store: Arc::default(),
+            prompt_structured_output_models: Arc::default(),
+        }
+    }
+}
+
 impl ProxyConfigSlot {
     fn new(config: ProxyConfig) -> Arc<Self> {
         Arc::new(Self {
-            current: tokio::sync::RwLock::new(ProxyRuntimeSnapshot {
-                config: Arc::new(config),
-                reasoning_store: Arc::new(std::sync::Mutex::new(ReasoningStore::default())),
-                prompt_structured_output_models: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            }),
+            current: tokio::sync::RwLock::new(ProxyRuntimeSnapshot::new(config)),
         })
     }
 
@@ -301,9 +390,7 @@ impl ProxyClient {
             let mut cached = cached
                 .lock()
                 .map_err(|_| AppError::Internal("本机转换代理的网络客户端锁已损坏。".into()))?;
-            if let Some((cached_snapshot, client)) = cached.as_ref()
-                && cached_snapshot == &snapshot
-            {
+            if let Some((_, client)) = cached.as_ref().filter(|(key, _)| key == &snapshot) {
                 return Ok(client.clone());
             }
             let client = ClientCache::build_standalone(&snapshot, None).map_err(|error| {
@@ -339,28 +426,39 @@ fn test_port() -> u16 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+#[cfg(test)]
 async fn start_proxy(
     config: ProxyConfig,
 ) -> Result<(u16, oneshot::Sender<()>, Arc<ProxyConfigSlot>, String), AppError> {
+    start_proxy_at(config, bind_port(), None).await
+}
+
+async fn start_proxy_at(
+    config: ProxyConfig,
+    port: u16,
+    saved_key: Option<String>,
+) -> Result<(u16, oneshot::Sender<()>, Arc<ProxyConfigSlot>, String), AppError> {
     let config_slot = ProxyConfigSlot::new(config);
     // Each UUID v4 contributes 122 random bits after fixed version/variant bits.
-    let proxy_api_key = format!(
-        "{}{}{}",
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4()
-    );
+    let proxy_api_key = saved_key.unwrap_or_else(|| {
+        format!(
+            "{}{}{}",
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4()
+        )
+    });
     let state = ProxyState {
         config: config_slot.clone(),
         client: ProxyClient::default(),
         proxy_authorization: HeaderValue::from_str(&format!("Bearer {proxy_api_key}"))
             .expect("generated proxy key is a valid authorization header"),
     };
-    let listener = tokio::net::TcpListener::bind((PROXY_HOST, bind_port()))
+    let listener = tokio::net::TcpListener::bind((PROXY_HOST, port))
         .await
         .map_err(|error| {
             AppError::Internal(format!(
-                "无法在本机 {PROXY_HOST}:{PROXY_PORT} 启动转换代理（{error}）。请确认端口 27777 未被其他程序占用后重试。"
+                "无法在本机 {PROXY_HOST}:{port} 启动转换代理（{error}）。请确认端口 {port} 未被其他程序占用后重试。"
             ))
         })?;
     let address = listener
@@ -394,13 +492,17 @@ pub(crate) async fn effective_base_url(
             proxy_api_key: None,
         }),
         ProviderApiType::Chat => {
-            let (port, proxy_api_key) = registry.ensure(provider).await?;
+            let (port, proxy_api_key) = registry.prepare_listener(None).await?;
             Ok(ActivationTarget {
-                base_url: format!("http://{PROXY_HOST}:{port}{PROXY_BASE_PATH}"),
+                base_url: proxy_base_url(port),
                 proxy_api_key: Some(proxy_api_key),
             })
         }
     }
+}
+
+fn proxy_base_url(port: u16) -> String {
+    format!("http://{PROXY_HOST}:{port}{PROXY_BASE_PATH}")
 }
 
 fn apply_upstream_headers(
@@ -554,6 +656,12 @@ async fn handle_models(State(state): State<Arc<ProxyState>>, headers: HeaderMap)
             .await
             .map_err(|error| format!("无法连接上游服务获取模型列表：{error}"))?;
         let status = response.status();
+        if status.is_redirection() {
+            return Err(format!(
+                "上游服务返回 HTTP {} 重定向，请检查服务地址。",
+                status.as_u16()
+            ));
+        }
         let bytes = crate::provider_http::read_response_body_limited(
             response,
             crate::provider_http::MAX_UPSTREAM_BODY_BYTES,
@@ -910,7 +1018,7 @@ async fn fallback_non_sse_stream(
     let chunk = completion_to_chunk(&value);
     let failed = translator.push_chunk(&chunk, &mut pending).is_some();
     let completed = !failed && translator.finish(&mut pending, &context.store);
-    if completed && let Some(learning) = context.capability_learning {
+    if let Some(learning) = context.capability_learning.filter(|_| completed) {
         record_prompt_structured_output_capability(&learning.cache, learning.key);
     }
     if !completed && !translator.has_failed_event {
@@ -965,11 +1073,10 @@ fn translate_buffered_sse(text: &str, context: ResponseTranslationContext) -> Ve
             Ok(None) => {}
         }
     }
-    if !done
-        && !failed
-        && let Some(data) = parser.finish()
-    {
-        dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
+    if !done && !failed {
+        if let Some(data) = parser.finish() {
+            dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
+        }
     }
     if failed {
         if !translator.has_failed_event {
@@ -977,7 +1084,7 @@ fn translate_buffered_sse(text: &str, context: ResponseTranslationContext) -> Ve
         }
     } else {
         let completed = translator.finish(&mut pending, &context.store);
-        if completed && let Some(learning) = context.capability_learning {
+        if let Some(learning) = context.capability_learning.filter(|_| completed) {
             record_prompt_structured_output_capability(&learning.cache, learning.key);
         }
     }
@@ -1053,8 +1160,18 @@ fn completion_to_chunk(completion: &Value) -> Value {
 
 /// 上游返回非成功状态时，尽量把 Chat 风格的错误原样带回给 Codex。
 fn upstream_error_response(status: StatusCode, detail: &str) -> Response {
-    if let Ok(value) = serde_json::from_str::<Value>(detail)
-        && value.get("error").is_some()
+    if status.is_redirection() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            &format!(
+                "上游服务返回 HTTP {} 重定向，请检查服务地址。",
+                status.as_u16()
+            ),
+        );
+    }
+    if let Some(value) = serde_json::from_str::<Value>(detail)
+        .ok()
+        .filter(|v| v.get("error").is_some())
     {
         return (status, Json(value)).into_response();
     }
@@ -1239,8 +1356,10 @@ fn translate_stream(
                     Ok(None) => {}
                 }
             }
-            if !failed && let Some(data) = parser.finish() {
-                dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
+            if !failed {
+                if let Some(data) = parser.finish() {
+                    dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
+                }
             }
         }
         if failed {
@@ -1250,7 +1369,7 @@ fn translate_stream(
             }
         } else {
             let completed = translator.finish(&mut pending, &context.store);
-            if completed && let Some(learning) = context.capability_learning {
+            if let Some(learning) = context.capability_learning.filter(|_| completed) {
                 record_prompt_structured_output_capability(&learning.cache, learning.key);
             }
         }
@@ -1423,8 +1542,9 @@ fn validate_supported_responses_request(body: &Value) -> Result<(), String> {
             {
                 return Err("Responses function 工具缺少 name。".into());
             }
-            if let Some(parameters) = tool.get("parameters")
-                && !jsonschema::meta::is_valid(parameters)
+            if tool
+                .get("parameters")
+                .is_some_and(|parameters| !jsonschema::meta::is_valid(parameters))
             {
                 return Err("Responses function 工具包含无效的 parameters Schema。".into());
             }
@@ -1456,8 +1576,10 @@ fn validate_supported_responses_request(body: &Value) -> Result<(), String> {
         if choice.as_str() == Some("required") && function_names.is_empty() {
             return Err("tool_choice=required，但没有可转换的 function 工具。".into());
         }
-        if let Some(name) = choice.get("name").and_then(Value::as_str)
-            && !function_names.contains(name)
+        if choice
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !function_names.contains(name))
         {
             return Err("tool_choice 指定的 function 未出现在工具列表中。".into());
         }
@@ -1562,7 +1684,7 @@ fn responses_to_chat_body(body: &Value, store: &std::sync::Mutex<ReasoningStore>
             chat.insert("parallel_tool_calls".into(), parallel);
         }
     }
-    if has_tools && let Some(tool_choice) = body.get("tool_choice") {
+    if let Some(tool_choice) = body.get("tool_choice").filter(|_| has_tools) {
         let converted = convert_tool_choice(tool_choice);
         // 默认的 auto 不需要显式发送，部分平台对不认识的参数会直接报错。
         if converted != Value::String("auto".into()) {
@@ -1577,9 +1699,11 @@ fn responses_to_chat_body(body: &Value, store: &std::sync::Mutex<ReasoningStore>
             chat.insert(key.into(), value.clone());
         }
     }
-    if let Some(reasoning) = body.get("reasoning").and_then(Value::as_object)
-        && let Some(effort) = reasoning.get("effort").and_then(Value::as_str)
-        && !effort.is_empty()
+    if let Some(effort) = body
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .filter(|effort| !effort.is_empty())
     {
         chat.insert("reasoning_effort".into(), Value::String(effort.into()));
     }
@@ -1787,14 +1911,15 @@ fn input_to_messages(body: &Value, store: &ReasoningStore) -> Vec<Value> {
                                     map.get("role").and_then(Value::as_str).unwrap_or("user");
                                 let role = if role == "developer" { "system" } else { role };
                                 let mut message = json!({"role": role, "content": message_content_to_chat(map.get("content").unwrap_or(&Value::Null))});
-                                if role == "assistant"
-                                    && let Some(reasoning) = map
+                                if role == "assistant" {
+                                    if let Some(reasoning) = map
                                         .get("id")
                                         .and_then(Value::as_str)
                                         .and_then(|id| store.get(id))
-                                {
-                                    message["reasoning_content"] =
-                                        Value::String(reasoning.to_owned());
+                                    {
+                                        message["reasoning_content"] =
+                                            Value::String(reasoning.to_owned());
+                                    }
                                 }
                                 if let Some(tool_calls) = extract_tool_calls_from_content(
                                     map.get("content").unwrap_or(&Value::Null),
@@ -1832,8 +1957,10 @@ fn normalize_system_messages(messages: Vec<Value>) -> Vec<Value> {
     for message in messages {
         if message.get("role").and_then(Value::as_str) == Some("system") {
             had_system = true;
-            if let Some(content) = message.get("content").and_then(chat_content_to_text)
-                && !content.trim().is_empty()
+            if let Some(content) = message
+                .get("content")
+                .and_then(chat_content_to_text)
+                .filter(|content| !content.trim().is_empty())
             {
                 if !system_content.is_empty() {
                     system_content.push_str("\n\n");
@@ -1859,10 +1986,10 @@ fn flush_tool_calls(
         pending_reasoning.take();
         return;
     }
-    if let Some(message) = messages.last_mut()
-        && message.get("role").and_then(Value::as_str) == Some("assistant")
-        && message.get("tool_calls").is_none()
-    {
+    if let Some(message) = messages.last_mut().filter(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message.get("tool_calls").is_none()
+    }) {
         message["tool_calls"] = Value::Array(std::mem::take(pending_tool_calls));
         if let Some(reasoning) = pending_reasoning.take() {
             message["reasoning_content"] = Value::String(reasoning);
@@ -1927,8 +2054,11 @@ fn message_content_to_chat(content: &Value) -> Value {
                     _ => {}
                 }
             }
-            if converted.len() == 1
-                && let Some(text) = converted[0].get("text").and_then(Value::as_str)
+            if let Some(text) = converted
+                .first()
+                .filter(|_| converted.len() == 1)
+                .and_then(|item| item.get("text"))
+                .and_then(Value::as_str)
             {
                 Value::String(text.to_owned())
             } else if converted.is_empty() {
@@ -2572,11 +2702,11 @@ impl StreamTranslator {
                 let function = tool_call.get("function").unwrap_or(&Value::Null);
                 let incoming_id = tool_call.get("id").and_then(Value::as_str);
                 let incoming_name = function.get("name").and_then(Value::as_str);
-                if let Some(existing) = self.tool_calls.get(&index)
-                    && (incoming_id.is_some_and(|id| !existing.id.is_empty() && existing.id != id)
+                if self.tool_calls.get(&index).is_some_and(|existing| {
+                    incoming_id.is_some_and(|id| !existing.id.is_empty() && existing.id != id)
                         || incoming_name
-                            .is_some_and(|name| !existing.name.is_empty() && existing.name != name))
-                {
+                            .is_some_and(|name| !existing.name.is_empty() && existing.name != name)
+                }) {
                     let message = format!("上游工具调用索引 {index} 的 id 或函数名发生冲突。");
                     self.fail(out, &message);
                     return Some(message);
@@ -2778,15 +2908,15 @@ impl StreamTranslator {
         }
         // 把本响应的完整思考内容按输出条目 id 与工具 call_id 记住，
         // 供下一轮请求回传（id 被重写时 call_id 仍能匹配）。
-        if !self.reasoning_content.trim().is_empty()
-            && let Ok(mut store) = store.lock()
-        {
-            let reasoning = ReasoningStore::bounded_content(&self.reasoning_content);
-            store.insert_shared(&self.msg_item_id, reasoning.clone());
-            for acc in self.tool_calls.values() {
-                store.insert_shared(&acc.item_id, reasoning.clone());
-                if !acc.id.is_empty() {
-                    store.insert_call_alias(&acc.id, reasoning.clone());
+        if !self.reasoning_content.trim().is_empty() {
+            if let Ok(mut store) = store.lock() {
+                let reasoning = ReasoningStore::bounded_content(&self.reasoning_content);
+                store.insert_shared(&self.msg_item_id, reasoning.clone());
+                for acc in self.tool_calls.values() {
+                    store.insert_shared(&acc.item_id, reasoning.clone());
+                    if !acc.id.is_empty() {
+                        store.insert_call_alias(&acc.id, reasoning.clone());
+                    }
                 }
             }
         }
@@ -5073,6 +5203,271 @@ mod tests {
         assert_eq!(target.base_url, "https://api.deepseek.com/v1");
         assert!(target.proxy_api_key.is_none());
         registry.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn failed_chat_activation_leaves_the_previous_route_and_reasoning_intact() {
+        let registry = ChatProxyRegistry::default();
+        let first = provider("first", "https://first.example.test/v1");
+        registry.ensure(&first).await.unwrap();
+        let slot = registry
+            .single
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .config
+            .clone();
+        let (_, before, _) = slot.snapshot().await;
+        let mut second = provider("second", "https://second.example.test/v1");
+        let target = effective_base_url(&second, &registry).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let manager = crate::codex::ConfigManager::default();
+        let home = temp.path().join("codex");
+        assert!(manager.preview_custom(&home, &second, &target).is_err());
+        let store = crate::storage::Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.to_string_lossy().into_owned();
+                Ok(())
+            })
+            .unwrap();
+        let mut first = first;
+        first.available_models.push("model".into());
+        store.connections_save_provider(first.clone()).unwrap();
+        store.activate(&first.id).unwrap();
+        crate::activation::sync_active_codex_configuration(&store, &manager, &registry)
+            .await
+            .unwrap();
+        let previous_config = std::fs::read(home.join("config.toml")).unwrap();
+        second.available_models.push("model".into());
+        store.connections_save_provider(second.clone()).unwrap();
+        store.activate(&second.id).unwrap();
+        std::fs::write(home.join("state_5.sqlite"), b"invalid test database").unwrap();
+        assert!(
+            crate::activation::sync_active_codex_configuration(&store, &manager, &registry)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            previous_config
+        );
+        let (config, after, _) = slot.snapshot().await;
+        assert_eq!(config.upstream_base, first.base_url);
+        assert!(Arc::ptr_eq(&before, &after));
+        registry.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn restart_serves_the_committed_chat_configuration_with_the_existing_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let store = crate::storage::Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.to_string_lossy().into_owned();
+                Ok(())
+            })
+            .unwrap();
+        let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let mut chat = provider(
+            "chat",
+            &format!("http://{}/v1", upstream.local_addr().unwrap()),
+        );
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        );
+        let mock = tokio::spawn(async move {
+            axum::serve(upstream, app).await.unwrap();
+        });
+        chat.available_models = vec!["fixture".into()];
+        store.connections_save_provider(chat.clone()).unwrap();
+        store.activate(&chat.id).unwrap();
+        let first = ChatProxyRegistry::default();
+        let target = effective_base_url(&chat, &first).await.unwrap();
+        let manager = crate::codex::ConfigManager::default();
+        let preview = manager.preview_custom(&home, &chat, &target).unwrap();
+        manager.apply(&preview.operation_id).unwrap();
+        // Both the new active selection and matching TOML are already on disk
+        // at the point where an interrupted activation used to become routable.
+        let reopened = crate::storage::Store::open(store.root().to_owned()).unwrap();
+        let interrupted = ChatProxyRegistry {
+            port: first.port,
+            single: Mutex::default(),
+        };
+        let error = interrupted
+            .restore_active(&reopened, &manager)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("本机代理与当前 Codex 配置不匹配")
+        );
+        assert!(interrupted.single.lock().await.is_none());
+        crate::activation::sync_active_codex_configuration(&store, &manager, &first)
+            .await
+            .unwrap();
+        let auth_path = home.join("auth.json");
+        let original_auth = std::fs::read(&auth_path).unwrap();
+        first.stop_all().await;
+        tokio::task::yield_now().await;
+        let restarted = ChatProxyRegistry {
+            port: first.port,
+            single: Mutex::default(),
+        };
+        std::fs::write(&auth_path, br#"{"OPENAI_API_KEY":"other-fixture-key"}"#).unwrap();
+        assert!(restarted.restore_active(&store, &manager).await.is_err());
+        assert!(restarted.single.lock().await.is_none());
+        std::fs::write(&auth_path, &original_auth).unwrap();
+        let mut wrong_route = chat.clone();
+        wrong_route.base_url = "https://other.example.test/v1".into();
+        let committed = crate::storage::Store::open(store.root().to_owned()).unwrap();
+        let binding = committed
+            .read(|s| s.active.chat_route_binding.clone())
+            .unwrap();
+        assert!(
+            crate::codex::saved_chat_proxy_key(&home, &wrong_route, &target.base_url, &binding)
+                .is_err()
+        );
+        restarted
+            .restore_active(&committed, &manager)
+            .await
+            .unwrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}/models", target.base_url))
+            .bearer_auth(target.proxy_api_key.unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["data"][0]["id"],
+            "fixture"
+        );
+        assert_eq!(std::fs::read(auth_path).unwrap(), original_auth);
+        let config_path = home.join("config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let legacy = config
+            .lines()
+            .map(|line| {
+                line.split_once(" # codex-tools-chat ")
+                    .map_or(line, |(line, _)| line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(config_path, legacy).unwrap();
+        assert!(matches!(
+            crate::codex::saved_chat_proxy_key(&home, &chat, &target.base_url, &binding).unwrap(),
+            crate::codex::SavedChatProxyKey::Confirmed(_)
+        ));
+        assert!(matches!(
+            crate::codex::saved_chat_proxy_key(
+                &home,
+                &chat,
+                &target.base_url,
+                &crate::models::ChatRouteBinding::Legacy
+            )
+            .unwrap(),
+            crate::codex::SavedChatProxyKey::RequiresRotation(_)
+        ));
+        restarted.stop_all().await;
+        wrong_route.api_key = Some("fixture-new-upstream-key".into());
+        store.connections_save_provider(wrong_route).unwrap();
+        let interrupted_save = crate::storage::Store::open(store.root().to_owned()).unwrap();
+        assert!(
+            restarted
+                .restore_active(&interrupted_save, &manager)
+                .await
+                .is_err()
+        );
+        assert!(restarted.single.lock().await.is_none());
+        mock.abort();
+    }
+
+    #[tokio::test]
+    async fn untouched_legacy_chat_migrates_with_a_new_key_but_an_interrupted_edit_cannot() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let store = crate::storage::Store::open(temp.path().join("data")).unwrap();
+        let mut chat = provider("legacy", "http://127.0.0.1:9/v1");
+        chat.available_models = vec!["fixture".into()];
+        store.connections_save_provider(chat.clone()).unwrap();
+        store.activate(&chat.id).unwrap();
+        let legacy_state = |s: &mut crate::models::AppConfig| {
+            s.codex.home = home.display().to_string();
+            s.active.chat_route_binding = crate::models::ChatRouteBinding::Legacy;
+            Ok(())
+        };
+        store.update(legacy_state).unwrap();
+        let registry = ChatProxyRegistry::default();
+        let old_key = uuid::Uuid::new_v4().to_string().repeat(3);
+        let target = ActivationTarget {
+            base_url: proxy_base_url(registry.port),
+            proxy_api_key: Some(old_key.clone()),
+        };
+        let manager = crate::codex::ConfigManager::default();
+        let preview = manager.preview_custom(&home, &chat, &target).unwrap();
+        manager.apply(&preview.operation_id).unwrap();
+        let config = home.join("config.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        let legacy_config = text
+            .lines()
+            .map(|line| {
+                line.split_once(" # codex-tools-chat ")
+                    .map_or(line, |(old, _)| old)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&config, &legacy_config).unwrap();
+        let upgraded = crate::storage::Store::open(store.root().to_owned()).unwrap();
+        // A config preview may already have reserved a fresh, disabled listener.
+        registry.prepare_listener(None).await.unwrap();
+        registry.restore_active(&upgraded, &manager).await.unwrap();
+        let binding = upgraded
+            .read(|s| s.active.chat_route_binding.clone())
+            .unwrap();
+        let crate::codex::SavedChatProxyKey::Confirmed(new_key) =
+            crate::codex::saved_chat_proxy_key(&home, &chat, &target.base_url, &binding).unwrap()
+        else {
+            panic!("migration did not confirm the new route")
+        };
+        assert_ne!(new_key, old_key);
+        let denied = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}/models", target.base_url))
+            .bearer_auth(old_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        registry.stop_all().await;
+
+        // Second independent legacy state, stopped after writing the new
+        // provider profile, before applying its local configuration.
+        upgraded.update(legacy_state).unwrap();
+        std::fs::write(&config, &legacy_config).unwrap();
+        chat.base_url = "http://127.0.0.1:10/v1".into();
+        chat.api_key = Some("fixture-new-key".into());
+        upgraded.connections_save_provider(chat).unwrap();
+        let interrupted = crate::storage::Store::open(store.root().to_owned()).unwrap();
+        assert!(
+            registry
+                .restore_active(&interrupted, &manager)
+                .await
+                .is_err()
+        );
+        assert!(registry.single.lock().await.is_none());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), legacy_config);
     }
 
     #[tokio::test]
