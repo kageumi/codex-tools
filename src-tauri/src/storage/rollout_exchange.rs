@@ -595,7 +595,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let closed = unlink_if_closed;
         #[cfg(not(target_os = "macos"))]
-        let closed = {
+        let closed = &{
             let first = Cell::new(true);
             move |p: &Path| {
                 if first.replace(false) {
@@ -612,7 +612,7 @@ mod tests {
             b"replacement",
             swap,
             publish_without_rename,
-            |path, expected| discard_for_test(path, expected, &closed),
+            |path, expected| discard_for_test(path, expected, closed),
             sync_parent_directory,
         )
         .unwrap();
